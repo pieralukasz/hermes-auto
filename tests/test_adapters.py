@@ -87,6 +87,13 @@ def test_failed_completion_fetch_does_not_enqueue_duplicate(store):
     assert not store.rows()
 
 
+def test_mode_label_alone_opts_in(store):
+    fake = TodoistFake(task())
+    poll_todoist(CFG, store, fake)
+    query = fake.calls[0][fake.calls[0].index("--filter") + 1]
+    assert query.startswith("(@hermes | @hermes-open | @hermes-draft | @hermes-research | @hermes-agent)")
+
+
 def test_agent_label_selects_agent_mode():
     t = task()
     t["labels"] += ["hermes-agent"]

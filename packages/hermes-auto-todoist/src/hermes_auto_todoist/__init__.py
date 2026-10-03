@@ -22,8 +22,11 @@ def items(data):
     return data["results"]
 
 
+MODES = ("open", "draft", "research", "agent")
+
+
 def task_mode(task, default):
-    selected = [mode for mode in ("open", "draft", "research", "agent")
+    selected = [mode for mode in MODES
                 if f"hermes-{mode}" in task.get("labels", [])]
     if len(selected) > 1:
         raise ValueError(f"Task {task['id']} has conflicting hermes mode labels")
@@ -50,7 +53,9 @@ def due_time_reached(task, now=None):
 def poll_todoist(config, store, run=command_json, now=None):
     td = config["td_command"]
     label = config["todoist"]["label"]
-    listed = items(run([td, "task", "list", "--filter", f"@{label} & (today | overdue)", "--all", "--json"]))
+    # A mode label alone also opts a task in: adding only hermes-draft is a clear request.
+    opt_in = " | ".join(f"@{name}" for name in [label, *(f"hermes-{mode}" for mode in MODES)])
+    listed = items(run([td, "task", "list", "--filter", f"({opt_in}) & (today | overdue)", "--all", "--json"]))
     # Before its due time a task is treated like one scheduled later: not yet opted in.
     tasks = [task for task in listed if due_time_reached(task, now)]
     recurring = [t for t in tasks if (t.get("due") or {}).get("isRecurring")]
