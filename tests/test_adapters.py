@@ -94,6 +94,52 @@ def test_mode_conflict_rejected():
         task_mode(t, "draft")
 
 
+def timed_task(date, recurring=True):
+    result = task(recurring)
+    result["due"]["date"] = date
+    return result
+
+
+def test_floating_due_time_waits_until_local_time(store):
+    import datetime as dt
+    fake = TodoistFake(timed_task("2026-10-03T19:00:00"))
+    poll_todoist(CFG, store, fake, now=dt.datetime(2026, 10, 3, 7, 30))
+    assert not store.rows()
+    assert not any("activity" in command for command in fake.calls)
+    poll_todoist(CFG, store, fake, now=dt.datetime(2026, 10, 3, 19, 0))
+    assert len(store.rows()) == 1
+
+
+def test_fixed_timezone_due_time_compares_in_utc(store):
+    import datetime as dt
+    fake = TodoistFake(timed_task("2026-10-03T05:30:00Z"))
+    warsaw = dt.timezone(dt.timedelta(hours=2))
+    poll_todoist(CFG, store, fake, now=dt.datetime(2026, 10, 3, 7, 29, tzinfo=warsaw))
+    assert not store.rows()
+    poll_todoist(CFG, store, fake, now=dt.datetime(2026, 10, 3, 7, 30, tzinfo=warsaw))
+    assert len(store.rows()) == 1
+
+
+def test_date_only_and_overdue_timed_tasks_are_due(store):
+    import datetime as dt
+    fake = TodoistFake(task())
+    fake.tasks.append({**timed_task("2026-10-02T19:00:00", recurring=False), "id": "T2"})
+    poll_todoist(CFG, store, fake, now=dt.datetime(2026, 10, 3, 0, 5))
+    assert {row["external_id"] for row in store.rows()} == {"T1", "T2"}
+
+
+def test_daily_timed_occurrences_wait_and_follow_completion(store):
+    import datetime as dt
+    fake = TodoistFake(timed_task("2026-10-03T07:30:00"))
+    poll_todoist(CFG, store, fake, now=dt.datetime(2026, 10, 3, 7, 31))
+    fake.tasks[0]["due"]["date"] = "2026-10-04T07:30:00"
+    fake.events = [{"objectId": "T1", "eventDate": "2026-10-03T08:00:00Z"}]
+    poll_todoist(CFG, store, fake, now=dt.datetime(2026, 10, 4, 0, 5))
+    assert len(store.rows()) == 1
+    poll_todoist(CFG, store, fake, now=dt.datetime(2026, 10, 4, 7, 30))
+    assert len(store.rows()) == 2
+
+
 def gmail_message(mid, sender, outgoing=False):
     return {"id": mid, "labelIds": ["SENT"] if outgoing else [], "payload": {
         "mimeType": "multipart/mixed", "headers": [

@@ -54,7 +54,7 @@ Authenticate the [official Todoist CLI](https://github.com/Doist/todoist-cli), t
 hermes-auto source setup todoist
 ```
 
-This creates missing labels only; it does not select or edit any task. Add **`hermes`** to tasks you want prepared. All projects are supported; only today's and overdue tasks qualify.
+This creates missing labels only; it does not select or edit any task. Add **`hermes`** to tasks you want prepared. All projects are supported; only today's and overdue tasks qualify. A task with a due **time** waits until that time (floating times use the Mac's local clock; fixed-timezone times are compared in UTC); date-only tasks qualify all day.
 
 Optional mode labels (use at most one alongside `hermes`):
 

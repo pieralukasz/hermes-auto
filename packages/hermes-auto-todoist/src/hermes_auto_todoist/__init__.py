@@ -30,10 +30,29 @@ def task_mode(task, default):
     return selected[0] if selected else default
 
 
-def poll_todoist(config, store, run=command_json):
+def due_time_reached(task, now=None):
+    """A task with a due time waits for it; date-only tasks are due all day.
+
+    Todoist returns floating times as naive local ISO strings and fixed-timezone
+    times as UTC with a trailing Z.
+    """
+    value = (task.get("due") or {}).get("date") or ""
+    if "T" not in value:
+        return True
+    due = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if due.tzinfo is None:
+        current = now.replace(tzinfo=None) if now and now.tzinfo else (now or dt.datetime.now())
+        return current >= due
+    current = now if now and now.tzinfo else (now or dt.datetime.now()).astimezone()
+    return current >= due
+
+
+def poll_todoist(config, store, run=command_json, now=None):
     td = config["td_command"]
     label = config["todoist"]["label"]
-    tasks = items(run([td, "task", "list", "--filter", f"@{label} & (today | overdue)", "--all", "--json"]))
+    listed = items(run([td, "task", "list", "--filter", f"@{label} & (today | overdue)", "--all", "--json"]))
+    # Before its due time a task is treated like one scheduled later: not yet opted in.
+    tasks = [task for task in listed if due_time_reached(task, now)]
     recurring = [t for t in tasks if (t.get("due") or {}).get("isRecurring")]
     completions = {}
     if recurring:
