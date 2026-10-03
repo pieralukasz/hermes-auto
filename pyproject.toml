@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+pythonpath = ["packages/hermes-auto/src", "packages/hermes-auto-todoist/src", "packages/hermes-auto-gmail/src", "packages/hermes-auto-proton/src"]
+testpaths = ["tests"]
+[tool.ruff]
+line-length = 110
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]

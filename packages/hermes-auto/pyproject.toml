@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+[project]
+name = "hermes-auto"
+version = "0.1.0"
+description = "Durable opt-in Hermes automation core"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{name = "Lukasz Piera"}]
+dependencies = []
+[project.urls]
+Repository = "https://github.com/pieralukasz/hermes-auto"
+Issues = "https://github.com/pieralukasz/hermes-auto/issues"
+
+[project.scripts]
+hermes-auto = "hermes_auto.cli:main"

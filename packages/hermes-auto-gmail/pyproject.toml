@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+[project]
+name = "hermes-auto-gmail"
+version = "0.1.0"
+description = "Durable opt-in Hermes automation for gmail"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{name = "Lukasz Piera"}]
+dependencies = ["hermes-auto==0.1.0", "google-auth>=2.35,<3", "requests>=2.32,<3"]
+[project.urls]
+Repository = "https://github.com/pieralukasz/hermes-auto"
+Issues = "https://github.com/pieralukasz/hermes-auto/issues"
+
+[project.entry-points."hermes_auto.sources"]
+gmail = "hermes_auto_gmail:Source"

@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
+.env
+config.json
+*.sqlite*
+*.db*
+*.log
+*.pem
+*token*.json
+*secret*.json

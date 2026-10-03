@@ -1,0 +1,18 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+[project]
+name = "hermes-auto-proton"
+version = "0.1.0"
+description = "Durable opt-in Hermes automation for proton"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{name = "Lukasz Piera"}]
+dependencies = ["hermes-auto==0.1.0"]
+[project.urls]
+Repository = "https://github.com/pieralukasz/hermes-auto"
+Issues = "https://github.com/pieralukasz/hermes-auto/issues"
+
+[project.entry-points."hermes_auto.sources"]
+proton = "hermes_auto_proton:Source"
