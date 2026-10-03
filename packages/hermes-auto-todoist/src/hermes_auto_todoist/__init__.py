@@ -79,7 +79,15 @@ def poll_todoist(config, store, run=command_json):
             # Migration tombstones deliberately suppress a known task until explicitly reset.
             if store.get_meta(f"legacy:{task_id}", False):
                 continue
-            store.enqueue(f"todoist:{task_id}:{occurrence}", "todoist", task_id, task["content"],
+            event_key = f"todoist:{task_id}:{occurrence}"
+            if recurrence:
+                # A completed occurrence may still be queued (scan-only mode or a backlog).
+                # Do not prepare that obsolete occurrence alongside today's one.
+                store.db.execute("UPDATE jobs SET status='cancelled',error=? WHERE source='todoist' "
+                                 "AND external_id=? AND event_key<>? "
+                                 "AND status IN ('pending','deferred','created','retry_pending')",
+                                 ("Recurring occurrence was completed before preparation", task_id, event_key))
+            store.enqueue(event_key, "todoist", task_id, task["content"],
                           task_mode(task, config["default_mode"]), task)
         if recurring:
             store.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",

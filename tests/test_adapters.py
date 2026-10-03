@@ -45,6 +45,7 @@ def test_recurring_reschedule_does_not_mean_completed(store):
     poll_todoist(CFG, store, fake)
     poll_todoist(CFG, store, fake)
     assert len(store.rows()) == 2
+    assert [row["status"] for row in store.rows()] == ["cancelled", "pending"]
 
 
 def test_once_reschedule_remove_readd_no_new_session(store):
