@@ -64,7 +64,13 @@ class Hermes:
                 if action == "run":
                     results = [record for record in records if record.get("type") == "result"]
                     if not results or results[-1].get("is_error") or results[-1].get("exit_code", 0):
-                        raise RuntimeError("Hermes returned no confirmed successful result")
+                        err.seek(0)
+                        private_json(self.home / "last-error.json", {
+                            "action": action, "result": results[-1] if results else None,
+                            "record_types": [record.get("type") for record in records][-40:],
+                            "stdout_tail": "\n".join(lines)[-6000:],
+                            "stderr_tail": err.read().decode(errors="replace")[-6000:]})
+                        raise RuntimeError("Hermes returned no confirmed successful result; see local last-error.json")
                     return results[-1]
                 if not records:
                     raise RuntimeError(f"Hermes {action} returned no receipt")
