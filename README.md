@@ -61,6 +61,7 @@ Optional mode labels (use at most one alongside `hermes`):
 - `hermes-open`: create a conversation containing the task, with **no model call**.
 - `hermes-draft`: prepare a short draft/checklist using the supplied context, with **no model tools**.
 - `hermes-research`: also allow `web_search` and `web_extract` for public research.
+- `hermes-agent`: run the task as a normal Hermes agent turn (all configured toolsets, skills and project rules; 900 s / 60 turns by default via `agent_run_budget_seconds` and `agent_max_turns`). Todoist only: mail sources are refused because their content is third-party. Dangerous commands are denied because nobody can approve them.
 
 The default is `draft`. Configure `default_mode` and `language` in `config.json`.
 
@@ -145,7 +146,7 @@ Uninstall the macOS service with `launchctl bootout gui/$(id -u)/io.github.herme
 - Session creation uses Hermes' session API and is separate from agent execution. Results use structured JSON. Timeout does not lose the reserved session ID.
 - A stopped `creating`/`running` job becomes `needs_attention`. It is never silently delivered again. This is conservative crash recovery, not a claim of exactly-once model execution.
 - All state-changing commands share a process lock. Source cursors and their enqueued events commit together. Missing or damaged state stops execution; it is not silently replaced. A deleted whole configuration directory cannot be distinguished from a new installation.
-- Preparation runs have a tool allowlist at both schema and execution-batch boundaries. Drafts have no tools; research has only the two web tools. No terminal, code execution, delegation, mailbox-writing or task-writing tools are allowed. Interactive continuation uses your normal Hermes configuration.
+- Preparation runs have a tool allowlist at both schema and execution-batch boundaries. Drafts have no tools; research has only the two web tools. The opt-in `hermes-agent` Todoist mode is the exception and runs with the normal Hermes toolsets. No terminal, code execution, delegation, mailbox-writing or task-writing tools are allowed. Interactive continuation uses your normal Hermes configuration.
 - Task and mail content are untrusted data. Private context is fetched by deterministic adapters; the unattended model does not search your whole inbox, vault or filesystem. Trusted local Hermes plugins and the operating system remain outside this guard's threat model.
 - State access is profile-specific. The package needs access to your configured Hermes installation; it is not a hosted connector and does not copy or distribute authentication.
 

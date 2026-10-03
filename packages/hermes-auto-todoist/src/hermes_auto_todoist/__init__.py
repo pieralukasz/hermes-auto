@@ -23,7 +23,7 @@ def items(data):
 
 
 def task_mode(task, default):
-    selected = [mode for mode in ("open", "draft", "research")
+    selected = [mode for mode in ("open", "draft", "research", "agent")
                 if f"hermes-{mode}" in task.get("labels", [])]
     if len(selected) > 1:
         raise ValueError(f"Task {task['id']} has conflicting hermes mode labels")
@@ -126,6 +126,6 @@ class Source:
         source = config["sources"]["todoist"]
         command = source["command"]
         existing = {label["name"] for label in items(command_json([command, "label", "list", "--json"]))}
-        for label in [source["label"], "hermes-open", "hermes-draft", "hermes-research"]:
+        for label in [source["label"], "hermes-open", "hermes-draft", "hermes-research", "hermes-agent"]:
             if label not in existing:
                 command_json([command, "label", "create", "--name", label, "--json"])

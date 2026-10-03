@@ -30,7 +30,7 @@ class Hermes:
             with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
                 process = subprocess.Popen(command, stdout=out, stderr=err, start_new_session=True)
                 try:
-                    process.wait(timeout=self.config["run_budget_seconds"] + 30 if action == "run" else 90)
+                    process.wait(timeout=self.budget(job) + 30 if action == "run" else 90)
                 except (subprocess.TimeoutExpired, KeyboardInterrupt):
                     os.killpg(process.pid, signal.SIGTERM)
                     try:
@@ -68,6 +68,10 @@ class Hermes:
                 if not records:
                     raise RuntimeError(f"Hermes {action} returned no receipt")
                 return records[-1]
+
+    def budget(self, job):
+        key = "agent_run_budget_seconds" if (job or {}).get("mode") == "agent" else "run_budget_seconds"
+        return self.config[key]
 
     def exists(self, job):
         return self.invoke("inspect", job)["exists"]

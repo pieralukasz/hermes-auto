@@ -24,6 +24,9 @@ def defaults() -> dict:
         "max_jobs_per_run": 5,
         "run_budget_seconds": 180,
         "max_turns": 8,
+        # Agent mode: the user's own Todoist task runs with the normal Hermes tools and skills.
+        "agent_run_budget_seconds": 900,
+        "agent_max_turns": 60,
         "poll_seconds": 300,
         "desktop_only": True,
         "desktop_process": "Hermes",
@@ -37,7 +40,8 @@ def read_config(home: Path) -> dict:
     config.update(raw)
     if config["default_mode"] not in ("open", "draft", "research"):
         raise ValueError("default_mode must be open, draft or research")
-    for key in ("max_jobs_per_run", "run_budget_seconds", "max_turns", "poll_seconds"):
+    for key in ("max_jobs_per_run", "run_budget_seconds", "max_turns", "poll_seconds",
+                "agent_run_budget_seconds", "agent_max_turns"):
         if not isinstance(config[key], int) or isinstance(config[key], bool) or config[key] < 1:
             raise ValueError(f"{key} must be a positive integer")
     return config

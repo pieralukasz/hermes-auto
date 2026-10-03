@@ -87,6 +87,12 @@ def test_failed_completion_fetch_does_not_enqueue_duplicate(store):
     assert not store.rows()
 
 
+def test_agent_label_selects_agent_mode():
+    t = task()
+    t["labels"] += ["hermes-agent"]
+    assert task_mode(t, "draft") == "agent"
+
+
 def test_mode_conflict_rejected():
     t = task()
     t["labels"] += ["hermes-open", "hermes-research"]
