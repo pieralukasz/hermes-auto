@@ -26,6 +26,19 @@ def prompt_for(job, config, retry=False):
                  "approval (sending, paying, filing, writing to records) you prepare ready to approve, then stop.",
     }
     data = json.dumps({"source": job["source"], "data": json.loads(job["payload"])}, ensure_ascii=False)
+    if job["source"] == "todoist":
+        # Written like the user typing the task into a new Desktop session, plus one unattended note.
+        task = json.loads(job["payload"])
+        polish = config["language"].lower() in ("polish", "polski", "pl")
+        note = ("(Uruchomione automatycznie z mojego zadania w Todoist; nie ma mnie przy komputerze, więc nie "
+                "zadawaj pytań, tylko podejmij rozsądne decyzje i je zaznacz. Niczego nie wysyłaj, nie płać, "
+                "nie zamawiaj i nie zmieniaj zadań ani innych rekordów: przygotuj to do mojej akceptacji.)"
+                if polish else
+                "(Started automatically from my Todoist task; I'm away, so don't ask questions: make reasonable "
+                "decisions and say so. Don't send, pay, order or change tasks or other records: prepare them "
+                "for my approval.)")
+        parts = [task.get("content") or job.get("title", ""), task.get("description") or "", note]
+        return "\n\n".join(part.strip() for part in parts if part and part.strip())
     if full:
         origin = ("The task title and description below are the user's own assignment; follow its rules."
                   if job["source"] == "todoist" else

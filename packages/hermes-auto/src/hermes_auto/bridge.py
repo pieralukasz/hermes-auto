@@ -34,6 +34,28 @@ def guard_agent(agent_class, allowed):
     agent_class.__init__ = restricted_init
 
 
+def desktop_parity(agent_class):
+    """Make an unattended full-tools run indistinguishable from a new Desktop session.
+
+    `cli.main(oneshot=True)` marks the process as a finite one-shot run, which Hermes uses to (a) render
+    the prompt for a plain terminal ("Markdown does NOT render"), (b) drop the skill-loading guidance and
+    skill_manage, and (c) cap delegation at delegation.oneshot_max_children. The result is read in the
+    Desktop app, so the agent gets the desktop platform prompt and the interactive skill/delegation rules.
+    The approval gate keeps reading the env marker directly, so dangerous commands are still denied.
+    """
+    import agent.oneshot_footprint as footprint
+    footprint.is_single_query_session = lambda: False
+    footprint.prune_oneshot_tools = lambda tools: list(tools)
+    init = agent_class.__init__
+
+    def desktop_init(self, *args, **kwargs):
+        if kwargs.get("platform") in (None, "cli"):
+            kwargs["platform"] = "desktop"
+        init(self, *args, **kwargs)
+
+    agent_class.__init__ = desktop_init
+
+
 def main():
     request = json.loads(Path(sys.argv[1]).read_text())
     config = request["config"]
@@ -85,6 +107,7 @@ def main():
     cli.CLI_CONFIG["approvals"] = {"mode": "manual", "single_query_mode": "deny"}
     if request.get("full_tools"):
         # Todoist tasks and mail the user labelled for the agent: normal toolsets, skills and project rules.
+        desktop_parity(AIAgent)
         cli.main(query=request["prompt"], resume=sid, quiet=True, oneshot=True, output_format="stream-json",
                  max_turns=config["agent_max_turns"], run_budget=config["agent_run_budget_seconds"])
         return
