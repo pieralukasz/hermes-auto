@@ -25,7 +25,7 @@ def poll(config, store):
         try:
             if name not in installed:
                 raise RuntimeError(f"Install hermes-auto-{name}")
-            if settings.get("mode", config["default_mode"]) not in ("open", "draft", "research"):
+            if settings.get("mode", config["default_mode"]) not in ("open", "draft", "research", "agent"):
                 raise ValueError("Unknown source mode")
             installed[name]().poll(config, store)
         except Exception as exc:

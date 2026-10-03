@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 
 from .config import private_json
+from .runner import full_tools
 
 
 class Hermes:
@@ -70,7 +71,7 @@ class Hermes:
                 return records[-1]
 
     def budget(self, job):
-        key = "agent_run_budget_seconds" if (job or {}).get("mode") == "agent" else "run_budget_seconds"
+        key = "agent_run_budget_seconds" if job and full_tools(job) else "run_budget_seconds"
         return self.config[key]
 
     def exists(self, job):
@@ -87,4 +88,4 @@ class Hermes:
         return self.invoke("create", job, title=title, prompt=prompt, open_message=message)
 
     def run(self, job, prompt):
-        return self.invoke("run", job, prompt=prompt)
+        return self.invoke("run", job, prompt=prompt, full_tools=full_tools(job))

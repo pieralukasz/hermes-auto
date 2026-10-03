@@ -174,6 +174,25 @@ def test_gmail_reads_unlabelled_reply_in_labelled_thread(store):
     assert "Reply text" in store.rows()[0]["payload"]
 
 
+def test_gmail_agent_label_sets_agent_mode(store):
+    gmail = object.__new__(Gmail)
+    data = {"profile": {"emailAddress": "me@example.test"},
+            "labels": {"labels": [{"id": "watch", "name": "Hermes/Watch"}, {"id": "agent", "name": "Hermes/Agent"}]},
+            "threads?watch": {"threads": [{"id": "W"}]}, "threads?agent": {"threads": [{"id": "A"}]},
+            "threads/W": {"messages": [gmail_message("w0", "other@example.test")]},
+            "threads/A": {"messages": [gmail_message("a0", "other@example.test")]}}
+    def get(path, **kwargs):
+        key = f"threads?{kwargs['labelIds']}" if path == "threads" else path
+        return copy.deepcopy(data[key])
+    gmail.get = get
+    settings = {"label": "Hermes/Watch", "agent_label": "Hermes/Agent"}
+    gmail.poll(settings, store)
+    data["threads/W"]["messages"].append(gmail_message("w1", "other@example.test"))
+    data["threads/A"]["messages"].append(gmail_message("a1", "other@example.test"))
+    gmail.poll(settings, store)
+    assert {row["external_id"]: row["mode"] for row in store.rows()} == {"w1": "draft", "a1": "agent"}
+
+
 def test_proton_rfc_ids_and_own_alias_exclusion():
     from email.parser import BytesParser
     raw = b'From: Other <other@example.test>\r\nSubject: Reply\r\nMessage-ID: <reply@example.test>\r\nReferences: <root@example.test> <parent@example.test>\r\nIn-Reply-To: <parent@example.test>\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHello'

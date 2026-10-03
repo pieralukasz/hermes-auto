@@ -31,13 +31,7 @@ class Gmail:
             raise RuntimeError(f"Gmail read failed ({response.status_code}); check OAuth access")
         return response.json()
 
-    def poll(self, config, store):
-        account = self.get("profile")["emailAddress"]
-        own = [account, *config.get("own_addresses", [])]
-        labels = self.get("labels").get("labels", [])
-        label = next((item["id"] for item in labels if item["name"] == config["label"]), None)
-        if label is None:
-            raise RuntimeError(f"Create Gmail label {config['label']!r} and apply it to threads to watch")
+    def thread_ids(self, label):
         threads = []
         cursor = None
         while True:
@@ -48,7 +42,23 @@ class Gmail:
             threads.extend(item["id"] for item in page.get("threads", []))
             cursor = page.get("nextPageToken")
             if not cursor:
-                break
+                return threads
+
+    def poll(self, config, store):
+        account = self.get("profile")["emailAddress"]
+        own = [account, *config.get("own_addresses", [])]
+        labels = {item["name"]: item["id"] for item in self.get("labels").get("labels", [])}
+        if config["label"] not in labels:
+            raise RuntimeError(f"Create Gmail label {config['label']!r} and apply it to threads to watch")
+        # The agent label is optional; a thread carrying it gets full tools, otherwise the watch mode.
+        modes = {}
+        for name, mode in ((config["label"], config.get("mode", "draft")),
+                           (config.get("agent_label", ""), "agent")):
+            if name not in labels:
+                continue
+            for thread_id in self.thread_ids(labels[name]):
+                modes[thread_id] = mode
+        threads = list(modes)
         for thread_id in threads:
             thread = self.get(f"threads/{thread_id}", format="full")
             messages = []
@@ -71,14 +81,14 @@ class Gmail:
                                "payload": message, "eligible": bool(sender) and sender not in own_lower
                                and not message["outgoing"] and message["is_reply"]})
             observe_stream(store, source="gmail", account=account, stream_id=thread_id,
-                           events=events, mode=config.get("mode", "draft"))
+                           events=events, mode=modes[thread_id])
         deactivate_missing(store, f"gmail:{account}", set(threads))
 
 
 class Source:
     @staticmethod
     def defaults():
-        return {"enabled": True, "label": "Hermes/Watch", "mode": "draft",
+        return {"enabled": True, "label": "Hermes/Watch", "agent_label": "Hermes/Agent", "mode": "draft",
                 "token_file": str(Path.home() / ".hermes/google_token.json"), "own_addresses": []}
 
     def poll(self, config, store):
@@ -88,10 +98,12 @@ class Source:
     def setup(self, config):
         settings = config["sources"]["gmail"]
         gmail = Gmail(settings)
-        if any(label["name"] == settings["label"] for label in gmail.get("labels").get("labels", [])):
-            return
-        response = gmail.http.post("https://gmail.googleapis.com/gmail/v1/users/me/labels",
-                                   json={"name": settings["label"], "labelListVisibility": "labelShow",
-                                         "messageListVisibility": "show"}, timeout=45)
-        if not response.ok:
-            raise RuntimeError(f"Could not create Gmail label ({response.status_code}); create it in Gmail")
+        existing = {label["name"] for label in gmail.get("labels").get("labels", [])}
+        for name in (settings["label"], settings.get("agent_label", "")):
+            if not name or name in existing:
+                continue
+            response = gmail.http.post("https://gmail.googleapis.com/gmail/v1/users/me/labels",
+                                       json={"name": name, "labelListVisibility": "labelShow",
+                                             "messageListVisibility": "show"}, timeout=45)
+            if not response.ok:
+                raise RuntimeError(f"Could not create Gmail label ({response.status_code}); create it in Gmail")

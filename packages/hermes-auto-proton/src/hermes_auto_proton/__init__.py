@@ -79,13 +79,24 @@ class Proton:
     def poll(self, config, store):
         account = config["username"]
         own = [account, *config.get("own_addresses", [])]
-        self.select(config["watch_mailbox"])
-        roots = set()
-        for uid in self.search("ALL"):
-            message = BytesParser(policy=email.policy.default).parsebytes(self.fetch(uid, headers=True))
-            root = root_id(message)
-            if root:
-                roots.add(root)
+        # The agent mailbox is optional; a thread found there gets full tools, otherwise the watch mode.
+        modes = {}
+        for mailbox, mode, required in ((config["watch_mailbox"], config.get("mode", "draft"), True),
+                                        (config.get("agent_mailbox", ""), "agent", False)):
+            if not mailbox:
+                continue
+            try:
+                self.select(mailbox)
+            except RuntimeError:
+                if required:
+                    raise
+                continue
+            for uid in self.search("ALL"):
+                message = BytesParser(policy=email.policy.default).parsebytes(self.fetch(uid, headers=True))
+                root = root_id(message)
+                if root:
+                    modes[root] = mode
+        roots = set(modes)
         self.select(config["all_mailbox"])
         for root in sorted(roots):
             # RFC IDs are data, escaped as an IMAP quoted string, never commands.
@@ -97,7 +108,7 @@ class Proton:
                 if event:
                     events.append(event)
             observe_stream(store, source="proton", account=account, stream_id=root,
-                           events=events, mode=config.get("mode", "draft"))
+                           events=events, mode=modes[root])
         deactivate_missing(store, f"proton:{account}", roots)
 
     def close(self):
@@ -112,7 +123,8 @@ class Source:
     def defaults():
         return {"enabled": True, "host": "127.0.0.1", "port": 1143, "username": "",
                 "certificate": "", "password_command": [], "own_addresses": [],
-                "watch_mailbox": "Labels/Hermes Watch", "all_mailbox": "All Mail", "mode": "draft"}
+                "watch_mailbox": "Labels/Hermes Watch", "agent_mailbox": "Labels/Hermes Agent",
+                "all_mailbox": "All Mail", "mode": "draft"}
 
     def poll(self, config, store):
         settings = config["sources"]["proton"]
@@ -126,14 +138,17 @@ class Source:
         settings = config["sources"]["proton"]
         client = Proton(settings)
         try:
-            try:
-                client.select(settings["watch_mailbox"])
-                return
-            except RuntimeError:
-                pass
-            mailbox = '"' + settings["watch_mailbox"].replace('"', '\\"') + '"'
-            kind, _ = client.client.create(mailbox)
-            if kind != "OK":
-                raise RuntimeError("Create the Hermes Watch label in Proton Mail")
+            for name in (settings["watch_mailbox"], settings.get("agent_mailbox", "")):
+                if not name:
+                    continue
+                try:
+                    client.select(name)
+                    continue
+                except RuntimeError:
+                    pass
+                mailbox = '"' + name.replace('"', '\\"') + '"'
+                kind, _ = client.client.create(mailbox)
+                if kind != "OK":
+                    raise RuntimeError(f"Create the {name.split('/')[-1]} label in Proton Mail")
         finally:
             client.close()

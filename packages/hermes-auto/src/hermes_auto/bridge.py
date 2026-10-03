@@ -83,12 +83,12 @@ def main():
     # Only this worker's in-memory configuration changes. Interactive Hermes keeps its settings.
     # Unattended runs never get interactive approval: dangerous commands are denied.
     cli.CLI_CONFIG["approvals"] = {"mode": "manual", "single_query_mode": "deny"}
-    if job["mode"] == "agent":
-        # The user's own Todoist task: normal toolsets, skills and project rules.
+    if request.get("full_tools"):
+        # Todoist tasks and mail the user labelled for the agent: normal toolsets, skills and project rules.
         cli.main(query=request["prompt"], resume=sid, quiet=True, oneshot=True, output_format="stream-json",
                  max_turns=config["agent_max_turns"], run_budget=config["agent_run_budget_seconds"])
         return
-    allowed = {"web_search", "web_extract"} if job["mode"] == "research" else set()
+    allowed = {"web_search", "web_extract"} if job["mode"] in ("research", "agent") else set()
     guard_agent(AIAgent, allowed)
     toolsets.TOOLSETS["hermes-auto-preparation"] = {
         "description": "Hermes Auto bounded preparation", "tools": sorted(allowed), "includes": [],
