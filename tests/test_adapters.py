@@ -94,6 +94,11 @@ def test_mode_label_alone_opts_in(store):
     assert query.startswith("(@hermes | @hermes-open | @hermes-draft | @hermes-research | @hermes-agent)")
 
 
+def test_plain_hermes_label_runs_agent(store):
+    poll_todoist(CFG, store, TodoistFake(task()))
+    assert store.rows()[0]["mode"] == "agent"
+
+
 def test_agent_label_selects_agent_mode():
     t = task()
     t["labels"] += ["hermes-agent"]

@@ -54,7 +54,7 @@ Authenticate the [official Todoist CLI](https://github.com/Doist/todoist-cli), t
 hermes-auto source setup todoist
 ```
 
-This creates missing labels only; it does not select or edit any task. Add **`hermes`** (or just a mode label such as `hermes-draft`) to tasks you want prepared. All projects are supported; only today's and overdue tasks qualify. A task with a due **time** waits until that time (floating times use the Mac's local clock; fixed-timezone times are compared in UTC); date-only tasks qualify all day.
+This creates missing labels only; it does not select or edit any task. Add **`hermes`** to a task: Hermes runs it as a normal agent turn and does what the title and description ask, preparing anything that needs your approval (sending, paying, filing) and stopping there. Write the goal and limits in the description. Legacy mode labels (`hermes-open`, `hermes-draft`, `hermes-research`, `hermes-agent`) still work but are no longer created. All projects are supported; only today's and overdue tasks qualify. A task with a due **time** waits until that time (floating times use the Mac's local clock; fixed-timezone times are compared in UTC); date-only tasks qualify all day.
 
 Optional mode labels (use at most one alongside `hermes`):
 

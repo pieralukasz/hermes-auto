@@ -22,7 +22,8 @@ def prompt_for(job, config, retry=False):
         "draft": "Prepare a concise useful draft or checklist. Do not invent facts."
                  + ("" if full else " Use only the supplied context."),
         "research": "Research sources relevant to this task; cite them and prepare a concise draft or checklist.",
-        "agent": "Complete the request now and end with the result, not a plan.",
+        "agent": "Do what the task asks now and end with the result, not a plan. Anything that needs the user's "
+                 "approval (sending, paying, filing, writing to records) you prepare ready to approve, then stop.",
     }
     data = json.dumps({"source": job["source"], "data": json.loads(job["payload"])}, ensure_ascii=False)
     if full:

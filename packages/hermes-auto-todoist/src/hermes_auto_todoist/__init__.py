@@ -53,7 +53,7 @@ def due_time_reached(task, now=None):
 def poll_todoist(config, store, run=command_json, now=None):
     td = config["td_command"]
     label = config["todoist"]["label"]
-    # A mode label alone also opts a task in: adding only hermes-draft is a clear request.
+    # One label (hermes) runs the full agent. Legacy mode labels still opt in and pick their mode.
     opt_in = " | ".join(f"@{name}" for name in [label, *(f"hermes-{mode}" for mode in MODES)])
     listed = items(run([td, "task", "list", "--filter", f"({opt_in}) & (today | overdue)", "--all", "--json"]))
     # Before its due time a task is treated like one scheduled later: not yet opted in.
@@ -112,7 +112,7 @@ def poll_todoist(config, store, run=command_json, now=None):
                                  "AND status IN ('pending','deferred','created','retry_pending')",
                                  ("Recurring occurrence was completed before preparation", task_id, event_key))
             store.enqueue(event_key, "todoist", task_id, task["content"],
-                          task_mode(task, config["default_mode"]), task)
+                          task_mode(task, config["todoist"].get("mode", "agent")), task)
         if recurring:
             store.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",
                              ("todoist_since", json.dumps((dt.date.today() - dt.timedelta(days=1)).isoformat())))
@@ -121,7 +121,7 @@ def poll_todoist(config, store, run=command_json, now=None):
 class Source:
     @staticmethod
     def defaults():
-        return {"enabled": True, "label": "hermes", "command": shutil.which("td") or "td"}
+        return {"enabled": True, "label": "hermes", "mode": "agent", "command": shutil.which("td") or "td"}
 
     def poll(self, config, store):
         source = config["sources"]["todoist"]
@@ -131,6 +131,6 @@ class Source:
         source = config["sources"]["todoist"]
         command = source["command"]
         existing = {label["name"] for label in items(command_json([command, "label", "list", "--json"]))}
-        for label in [source["label"], "hermes-open", "hermes-draft", "hermes-research", "hermes-agent"]:
+        for label in [source["label"]]:
             if label not in existing:
                 command_json([command, "label", "create", "--name", label, "--json"])

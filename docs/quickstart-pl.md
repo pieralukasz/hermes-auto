@@ -2,7 +2,7 @@
 
 Instaluj rdzeń `hermes-auto` i tylko potrzebne adaptery. Instrukcja instalacji jest w głównym README.
 
-**Todoist:** etykieta `hermes` albo sama etykieta trybu (`hermes-draft` itd.) uruchamia automat dla zadania na dziś lub zaległego. Opcjonalnie dodaj jedną etykietę: `hermes-open` (sama rozmowa), `hermes-draft` (krótki szkic), `hermes-research` (research publicznych źródeł), `hermes-agent` (wykonaj zadanie). Zadania z Todoista zawsze działają jako pełny agent Hermes z narzędziami i skillami; tryb zmienia tylko polecenie. Maile są okrojone, chyba że dodasz wątkowi etykietę Gmail `Hermes/Agent` albo Proton `Hermes Agent`. Bez dodatkowej etykiety powstaje szkic. Zadanie z godziną czeka do tej godziny; zadanie z samą datą jest gotowe przez cały dzień. Przesunięcie terminu nie tworzy nowej rozmowy. Dla rutyny kolejne ukończenie wyznacza nowe wystąpienie.
+**Todoist:** etykieta `hermes` przy zadaniu na dziś lub zaległym uruchamia pełnego agenta Hermes (narzędzia, skille, reguły). Agent robi to, co mówi tytuł i opis; rzeczy wymagające Twojej zgody (wysyłka, płatność, KSeF) przygotowuje i czeka. Cel i granice wpisz w opis. Zadanie z godziną czeka do tej godziny. Przesunięcie terminu nie tworzy nowej rozmowy; w rutynie nowe wystąpienie zaczyna się po ukończeniu poprzedniego. Maile: `Hermes/Watch` to okrojony szkic, `Hermes/Agent` (Proton `Hermes Agent`) daje wątkowi pełnego agenta.
 
 **Gmail:** oznacz wybrany wątek etykietą `Hermes/Watch`.
 
