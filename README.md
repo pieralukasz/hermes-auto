@@ -64,7 +64,7 @@ Optional mode labels (use at most one alongside `hermes`):
 
 The default is `draft`. Configure `default_mode` and `language` in `config.json`.
 
-One-off tasks keep one event regardless of rescheduling. A recurring task starts a new occurrence only after a Todoist **completion event**, not because its due date changed. Activity pages are fetched completely with an overlap window. Failed reads do not advance the cursor. Tasks removed from the due/opt-in filter have pending work cancelled; re-adding the label does not erase their deduplication record. Explicit `new-session` is available when you want another preparation.
+One-off tasks keep one event regardless of rescheduling. A recurring task starts a new occurrence only after a Todoist **completion event**, not because its due date changed. Activity pages are fetched completely with an overlap window. Failed reads do not advance the cursor. Tasks removed from the due/opt-in filter have unstarted work deferred; when eligible again, the same reserved job can proceed. Already prepared tasks never automatically repeat. Explicit `new-session` is available when you want another preparation.
 
 The Todoist activity API's available history limits recovery after a long period offline. This version does not backfill every missed occurrence: it prepares the current eligible occurrence and relies on available completion history. It will not promise historical reconstruction beyond the provider's retention.
 
@@ -109,7 +109,7 @@ Example `sources.proton` configuration (fill in your own values):
 hermes-auto source setup proton
 ```
 
-Apply **`Hermes Watch`** to a message in a conversation. Replies are matched through RFC `Message-ID`, `In-Reply-To` and `References`, not subject similarity. As with Gmail, the first poll establishes a baseline. Missing/broken threading headers cannot be reliably matched; those messages will not trigger automatically. MIME text is bounded; attachments are not downloaded. The adapter uses read-only mailboxes and `BODY.PEEK`, preserving read flags.
+Apply **`Hermes Watch`** to a message in a conversation. Replies are matched through RFC `Message-ID`, `In-Reply-To` and `References`, not subject similarity. As with Gmail, the first poll establishes a baseline. Missing/broken threading headers cannot be reliably matched; those messages will not trigger automatically. The adapter reads up to 256 KiB of raw MIME per reply and supplies at most 20,000 text characters to Hermes. MIME may contain attachment bytes, but attachments are not extracted or supplied to the model. Read-only mailboxes and `BODY.PEEK` preserve read flags.
 
 ## Operate
 

@@ -13,7 +13,7 @@ Adapter API: export a `Source` class with `defaults() -> dict`, `poll(config, st
 
 Events use unique `(event_key, generation)` records. Normal polling uses generation zero. Only `new-session` allocates another generation and a new session ID. The title is presentation only. A user may rename or delete a Hermes conversation without changing event identity.
 
-Lifecycle: `pending -> creating -> created -> running -> ready`. Open-only jobs go `created -> ready`. Errors become `needs_attention`; recovery converts abandoned `creating` and `running` states to the same status. Explicit retry uses `retry_pending` and the existing ID. A missing session becomes `deleted`; removed opt-ins can cancel pending work. No automatic model retry follows ambiguous completion.
+Lifecycle: `pending -> creating -> created -> running -> ready`. Open-only jobs go `created -> ready`. Errors become `needs_attention`; recovery converts abandoned `creating` and `running` states to the same status. Explicit retry uses `retry_pending` and the existing ID. A missing session becomes `deleted`; mail opt-out cancels pending work. A not-yet-created Todoist job can be `deferred` until its task qualifies again, preserving its reserved ID. No automatic model retry follows ambiguous completion.
 
 The bridge runs in a child process with Hermes' dependencies. Runtime home (dependency activation) and session home (database/config) are separate, to support profile isolation. It uses `hermes_state_registry.acquire`, `create_session`, `append_message` and Hermes' single-query CLI implementation. An in-process preparation guard narrows the model's tools and blocks any disallowed batch before inline or registry dispatch. No installed Hermes source is patched.
 

@@ -75,8 +75,10 @@ class Store:
 
     def enqueue(self, event_key, source, external_id, title, mode, payload):
         self.db.execute(
-            "INSERT OR IGNORE INTO jobs(event_key,source,external_id,title,mode,payload,session_id) "
-            "VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO jobs(event_key,source,external_id,title,mode,payload,session_id) "
+            "VALUES (?,?,?,?,?,?,?) ON CONFLICT(event_key,generation) DO UPDATE SET "
+            "status='pending',title=excluded.title,mode=excluded.mode,payload=excluded.payload,error='' "
+            "WHERE jobs.status='deferred'",
             (event_key, source, external_id, title, mode, json.dumps(payload, ensure_ascii=False), session_id()),
         )
         # Caller commits the event and its cursor together.

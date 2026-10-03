@@ -52,10 +52,14 @@ def test_once_reschedule_remove_readd_no_new_session(store):
     poll_todoist(CFG, store, fake)
     fake.tasks = []
     poll_todoist(CFG, store, fake)
+    assert store.rows()[0]["status"] == "deferred"
+    reserved_id = store.rows()[0]["session_id"]
     fake.tasks = [task()]
     fake.tasks[0]["due"]["date"] = "2027-10-04"
     poll_todoist(CFG, store, fake)
     assert len(store.rows()) == 1
+    assert store.rows()[0]["status"] == "pending"
+    assert store.rows()[0]["session_id"] == reserved_id
     assert not any("activity" in command for command in fake.calls)
 
 

@@ -60,11 +60,12 @@ def poll_todoist(config, store, run=command_json):
             seen_cursors.add(cursor)
     with store.db:
         live_ids = {str(task["id"]) for task in tasks}
-        for row in store.db.execute("SELECT id,external_id FROM jobs WHERE source='todoist' "
+        for row in store.db.execute("SELECT id,external_id,status FROM jobs WHERE source='todoist' "
                                     "AND status IN ('pending','created','retry_pending')").fetchall():
             if row["external_id"] not in live_ids:
-                store.db.execute("UPDATE jobs SET status='cancelled',error=? WHERE id=?",
-                                 ("Task is no longer opted in and due", row["id"]))
+                status = "deferred" if row["status"] == "pending" else "needs_attention"
+                store.db.execute("UPDATE jobs SET status=?,error=? WHERE id=?",
+                                 (status, "Task is no longer opted in and due", row["id"]))
         for task in tasks:
             task_id = str(task["id"])
             recurrence = bool((task.get("due") or {}).get("isRecurring"))
