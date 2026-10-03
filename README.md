@@ -54,18 +54,15 @@ Authenticate the [official Todoist CLI](https://github.com/Doist/todoist-cli), t
 hermes-auto source setup todoist
 ```
 
-This creates missing labels only; it does not select or edit any task. Add **`hermes`** to a task: Hermes runs it as a normal agent turn and does what the title and description ask, preparing anything that needs your approval (sending, paying, filing) and stopping there. Write the goal and limits in the description. Legacy mode labels (`hermes-open`, `hermes-draft`, `hermes-research`, `hermes-agent`) still work but are no longer created. All projects are supported; only today's and overdue tasks qualify. A task with a due **time** waits until that time (floating times use the Mac's local clock; fixed-timezone times are compared in UTC); date-only tasks qualify all day.
+This creates the `hermes` label only; it does not select or edit any task. All projects are supported; only today's and overdue tasks qualify. A task with a due **time** waits until that time (floating times use the Mac's local clock; fixed-timezone times are compared in UTC); date-only tasks qualify all day.
 
-Optional mode labels (use at most one alongside `hermes`):
+Add **`hermes`** to a task and the run behaves like opening a new Hermes Desktop session and typing the task yourself:
 
-- `hermes-open`: create a conversation containing the task, with **no model call**.
-- `hermes-draft`: prepare a short draft/checklist using the supplied context, with **no model tools**.
-- `hermes-research`: also allow `web_search` and `web_extract` for public research.
-- `hermes-agent`: complete the task, not just prepare it.
+- The first message is the task title and description, plus one note that you are away: no questions, and nothing is sent, paid, ordered or changed; it is prepared for your approval instead.
+- The agent gets your normal Hermes setup: all configured toolsets, skills, memory, project rules and subagents, with the Desktop platform prompt (Markdown, tables, links). Hermes' one-shot limits (plain-terminal prompt, reduced skill guidance, `delegation.oneshot_max_children`) are lifted for these runs.
+- Budget: 900 s / 60 turns by default (`agent_run_budget_seconds`, `agent_max_turns`). Commands that would need approval are denied, because nobody can approve them.
 
-Todoist tasks are written by you, so every Todoist mode except `open` runs as a normal Hermes agent turn (all configured toolsets, skills and project rules; 900 s / 60 turns by default via `agent_run_budget_seconds` and `agent_max_turns`). The mode only changes the instruction. Mail is written by third parties: a watched thread keeps the restricted draft/research toolsets unless you also put it under the agent label (Gmail `Hermes/Agent`, Proton `Labels/Hermes Agent`), which grants full tools for that thread. Dangerous commands are denied because nobody can approve them.
-
-The default is `draft`. Configure `default_mode` and `language` in `config.json`.
+Write the goal, the skill to use and the limits ("don't send without my OK") in the description. `language` in `config.json` sets the answer language. Legacy mode labels (`hermes-open`, `hermes-draft`, `hermes-research`, `hermes-agent`) are still recognised for existing tasks; `hermes-open` creates the conversation without a model call. They are no longer created.
 
 One-off tasks keep one event regardless of rescheduling. A recurring task starts a new occurrence only after a Todoist **completion event**, not because its due date changed. Activity pages are fetched completely with an overlap window. Failed reads do not advance the cursor. Tasks removed from the due/opt-in filter have unstarted work deferred; when eligible again, the same reserved job can proceed. Already prepared tasks never automatically repeat. Explicit `new-session` is available when you want another preparation.
 
@@ -79,7 +76,7 @@ Configure `sources.gmail.token_file` to an existing Google authorized-user OAuth
 hermes-auto source setup gmail
 ```
 
-Apply `Hermes/Watch` to a conversation you want to follow. The first poll records a baseline without creating sessions for old mail. Each later incoming reply creates one event keyed by account and Gmail message ID. Reading/unreading messages does not retrigger it. Own sent messages and drafts are excluded; configure `own_addresses` for additional aliases.
+Apply `Hermes/Watch` to a conversation you want to follow. Mail is written by third parties, so these runs stay restricted: the configured `mode` (`draft` by default: no tools; `research`: only `web_search`/`web_extract`), 180 s / 8 turns, no memory or project rules. To give one thread the full agent described under Todoist, also apply **`Hermes/Agent`** (`agent_label`); the message body is still marked as third-party content, never as instructions. The first poll records a baseline without creating sessions for old mail. Each later incoming reply creates one event keyed by account and Gmail message ID. Reading/unreading messages does not retrigger it. Own sent messages and drafts are excluded; configure `own_addresses` for additional aliases.
 
 The adapter reads all messages of each labelled thread: [new Gmail replies do not inherit the thread's old labels](https://developers.google.com/workspace/gmail/api/guides/labels). Removing the label stops watching and cancels pending work. Re-enabling establishes a fresh baseline. A reply arriving before the first poll after labelling is part of that baseline; use `hermes-auto scan` immediately after labelling to arm the watch.
 
@@ -101,6 +98,7 @@ Example `sources.proton` configuration (fill in your own values):
   "password_command": ["security", "find-generic-password", "-s", "proton-bridge", "-w"],
   "own_addresses": [],
   "watch_mailbox": "Labels/Hermes Watch",
+  "agent_mailbox": "Labels/Hermes Agent",
   "all_mailbox": "All Mail",
   "mode": "draft"
 }
@@ -112,7 +110,7 @@ Example `sources.proton` configuration (fill in your own values):
 hermes-auto source setup proton
 ```
 
-Apply **`Hermes Watch`** to a message in a conversation. Replies are matched through RFC `Message-ID`, `In-Reply-To` and `References`, not subject similarity. As with Gmail, the first poll establishes a baseline. Missing/broken threading headers cannot be reliably matched; those messages will not trigger automatically. The adapter reads up to 256 KiB of raw MIME per reply and supplies at most 20,000 text characters to Hermes. MIME may contain attachment bytes, but attachments are not extracted or supplied to the model. Read-only mailboxes and `BODY.PEEK` preserve read flags.
+Apply **`Hermes Watch`** to a message in a conversation (or **`Hermes Agent`**, `agent_mailbox`, for the full agent, as with Gmail). Replies are matched through RFC `Message-ID`, `In-Reply-To` and `References`, not subject similarity. As with Gmail, the first poll establishes a baseline. Missing/broken threading headers cannot be reliably matched; those messages will not trigger automatically. The adapter reads up to 256 KiB of raw MIME per reply and supplies at most 20,000 text characters to Hermes. MIME may contain attachment bytes, but attachments are not extracted or supplied to the model. Read-only mailboxes and `BODY.PEEK` preserve read flags.
 
 ## Operate
 
@@ -136,7 +134,7 @@ On macOS:
 hermes-auto install-launchd
 ```
 
-By default, the service checks for the `Hermes` desktop process every 60 seconds. Opening the app triggers a scan within that interval; while open it polls every 5 minutes. Closing it stops new scheduled scans (it does not interrupt an already running preparation). Change `desktop_process` if your app uses another process name. Set `desktop_only: false` for background polling independent of the app. `run` is always an explicit immediate run. `max_jobs_per_run`, `run_budget_seconds` and `max_turns` bound preparation work.
+By default, the service checks for the `Hermes` desktop process every 60 seconds. Opening the app triggers a scan within that interval; while open it polls every 5 minutes. Closing it stops new scheduled scans (it does not interrupt an already running preparation). Change `desktop_process` if your app uses another process name. Set `desktop_only: false` for background polling independent of the app. `run` is always an explicit immediate run. `max_jobs_per_run` bounds each run; `agent_run_budget_seconds`/`agent_max_turns` bound full-agent jobs and `run_budget_seconds`/`max_turns` restricted ones.
 
 Linux users can schedule `hermes-auto tick` through a user timer; set `desktop_only: false` on headless machines. Machines asleep/offline cannot process events until they resume.
 
@@ -148,8 +146,8 @@ Uninstall the macOS service with `launchctl bootout gui/$(id -u)/io.github.herme
 - Session creation uses Hermes' session API and is separate from agent execution. Results use structured JSON. Timeout does not lose the reserved session ID.
 - A stopped `creating`/`running` job becomes `needs_attention`. It is never silently delivered again. This is conservative crash recovery, not a claim of exactly-once model execution.
 - All state-changing commands share a process lock. Source cursors and their enqueued events commit together. Missing or damaged state stops execution; it is not silently replaced. A deleted whole configuration directory cannot be distinguished from a new installation.
-- Preparation runs have a tool allowlist at both schema and execution-batch boundaries. For mail without the agent label, drafts have no tools and research has only the two web tools. Todoist tasks and agent-labelled mail threads run with the normal Hermes toolsets by your choice. No terminal, code execution, delegation, mailbox-writing or task-writing tools are allowed. Interactive continuation uses your normal Hermes configuration.
-- Task and mail content are untrusted data. Private context is fetched by deterministic adapters; the unattended model does not search your whole inbox, vault or filesystem. Trusted local Hermes plugins and the operating system remain outside this guard's threat model.
+- Two execution profiles. **Full agent** (Todoist tasks, agent-labelled mail threads): your normal Hermes toolsets, skills and rules, by your explicit choice; the only guards are the prompt's "prepare, don't act" rule and Hermes' approval gate in deny mode. **Restricted** (watched mail): a tool allowlist enforced at both schema and execution-batch boundaries; drafts have no tools, research only the two web tools; no terminal, code execution, delegation, mailbox-writing or task-writing tools.
+- Mail content is untrusted data in both profiles. A full-agent mail thread can reach your files and terminal, so use the agent label only for senders you trust. Trusted local Hermes plugins and the operating system remain outside this guard's threat model.
 - State access is profile-specific. The package needs access to your configured Hermes installation; it is not a hosted connector and does not copy or distribute authentication.
 
 ## Development and tests
