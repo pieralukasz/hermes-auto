@@ -216,3 +216,38 @@ def test_proton_rfc_ids_and_own_alias_exclusion():
 
 def test_independent_entry_points():
     assert set(sources()) >= {"todoist", "gmail", "proton"}
+
+
+def test_finish_completes_one_off_task():
+    import json
+    from hermes_auto_todoist import finish_task
+    writes = []
+    job = {"external_id": "T1", "payload": json.dumps(task())}
+    reads = []
+    outcome = finish_task("td", job, read=lambda command: reads.append(command) or task(), write=writes.append)
+    assert "--full" in reads[0]
+    assert writes == [["td", "task", "complete", "id:T1"]] and "completed" in outcome
+
+
+@pytest.mark.parametrize("state", [{"checked": True}, {"isDeleted": True}])
+def test_finish_skips_closed_task(state):
+    import json
+    from hermes_auto_todoist import finish_task
+    writes = []
+    job = {"external_id": "T1", "payload": json.dumps(task())}
+    finish_task("td", job, read=lambda command: {**task(), **state}, write=writes.append)
+    assert not writes
+
+
+def test_finish_recurring_only_for_prepared_occurrence():
+    import json
+    from hermes_auto_todoist import finish_task
+    prepared = timed_task("2026-10-03T07:30:00")
+    job = {"external_id": "T1", "payload": json.dumps(prepared)}
+    writes = []
+    # Same day, only the time changed: still the prepared occurrence.
+    finish_task("td", job, read=lambda command: timed_task("2026-10-03T09:00:00"), write=writes.append)
+    assert len(writes) == 1
+    # Already completed in Todoist: the next occurrence must stay open.
+    finish_task("td", job, read=lambda command: timed_task("2026-10-04T07:30:00"), write=writes.append)
+    assert len(writes) == 1

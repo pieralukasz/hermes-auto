@@ -66,6 +66,8 @@ Write the goal, the skill to use and the limits ("don't send without my OK") in 
 
 One-off tasks keep one event regardless of rescheduling. A recurring task starts a new occurrence only after a Todoist **completion event**, not because its due date changed. Activity pages are fetched completely with an overlap window. Failed reads do not advance the cursor. Tasks removed from the due/opt-in filter have unstarted work deferred; when eligible again, the same reserved job can proceed. Already prepared tasks never automatically repeat. Explicit `new-session` is available when you want another preparation.
 
+**Archive = done.** When you archive a prepared session in Hermes, the next check completes its Todoist task (`td task complete`). Only an archive that happens after the session was seen open counts: sessions already archived when this check first saw them never complete anything. Already completed or deleted tasks are left alone. A recurring task is completed only while Todoist still shows the occurrence that session prepared (same due day), so archiving an old briefing never skips a newer one. Superseded attempts (`new-session`) do not count. Disable per source with `"complete_on_archive": false`. Unarchiving does not reopen the task.
+
 The Todoist activity API's available history limits recovery after a long period offline. This version does not backfill every missed occurrence: it prepares the current eligible occurrence and relies on available completion history. It will not promise historical reconstruction beyond the provider's retention.
 
 ## Gmail

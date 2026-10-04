@@ -80,10 +80,20 @@ def main():
         print(json.dumps({"ok": True, "python": sys.executable, "source": config["hermes_source"]}))
         db.close()
         return
+    if action == "archive_states":
+        # Read-only: None = session missing, otherwise whether the user archived it (whole lineage).
+        states = {}
+        for item in request.get("session_ids", []):
+            row = db.get_session(item)
+            states[item] = None if row is None else bool(row.get("archived"))
+        print(json.dumps({"states": states}))
+        db.close()
+        return
     session = db.get_session(sid)
     if action == "inspect":
         print(json.dumps({"exists": session is not None,
-                          "messages": session.get("message_count", 0) if session else 0}))
+                          "messages": session.get("message_count", 0) if session else 0,
+                          "archived": bool(session.get("archived")) if session else False}))
         db.close()
         return
     if action == "create":

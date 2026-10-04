@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+from .finish import mark_open
+
 
 MODES = ("open", "draft", "research", "agent")
 
@@ -98,6 +100,8 @@ def process_jobs(store, config, hermes, blocked_sources=()):
             # Hermes may rotate to a compression continuation. Keep its final durable ID.
             final_sid = result.get("session_id") or job["session_id"]
             store.update(job["id"], status="ready", session_id=final_sid, error="")
+            # Seen open right after preparation, so a later archive by the user means "done".
+            mark_open(store, job["id"])
         except Exception as exc:
             failures += 1
             store.update(job["id"], status="needs_attention", error=str(exc))

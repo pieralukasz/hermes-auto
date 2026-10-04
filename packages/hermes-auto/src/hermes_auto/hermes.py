@@ -96,6 +96,10 @@ class Hermes:
     def exists(self, job):
         return self.invoke("inspect", job)["exists"]
 
+    def archive_states(self, session_ids):
+        """{session_id: True archived / False open / None missing}, one bridge process for all."""
+        return self.invoke("archive_states", session_ids=list(session_ids))["states"]
+
     def message_count(self, job):
         return self.invoke("inspect", job)["messages"]
 

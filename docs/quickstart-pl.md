@@ -4,6 +4,8 @@ Instaluj rdzeń `hermes-auto` i tylko potrzebne adaptery. Instrukcja instalacji 
 
 **Todoist:** etykieta `hermes` przy zadaniu na dziś lub zaległym uruchamia pełnego agenta Hermes (narzędzia, skille, reguły). Agent robi to, co mówi tytuł i opis; rzeczy wymagające Twojej zgody (wysyłka, płatność, KSeF) przygotowuje i czeka. Cel i granice wpisz w opis. Zadanie z godziną czeka do tej godziny. Przesunięcie terminu nie tworzy nowej rozmowy; w rutynie nowe wystąpienie zaczyna się po ukończeniu poprzedniego. Działa to jak nowa sesja w aplikacji Hermes: pierwsza wiadomość to tytuł i opis zadania, agent ma Twoje skille, pamięć, reguły i podagentów, a odpowiedź ma normalne formatowanie.
 
+**Zarchiwizowanie sesji = zadanie zrobione.** Gdy zarchiwizujesz w Hermesie przygotowaną rozmowę, następne sprawdzenie odhacza jej zadanie w Todoist. Liczy się tylko archiwizacja po tym, jak automat widział sesję otwartą. Zadanie cykliczne jest odhaczane tylko wtedy, gdy w Todoist nadal widnieje to samo wystąpienie (ten sam dzień), więc archiwizacja starego briefu nie przeskoczy nowego. Przywrócenie z archiwum nie przywraca zadania. Wyłączenie: `"complete_on_archive": false` w źródle todoist.
+
 **Gmail:** oznacz wybrany wątek etykietą `Hermes/Watch` (okrojony szkic) albo `Hermes/Agent` (pełny agent, tylko dla zaufanych nadawców).
 
 **Proton:** oznacz wiadomość z wybranego wątku etykietą `Hermes Watch` albo `Hermes Agent`. Bridge musi działać.

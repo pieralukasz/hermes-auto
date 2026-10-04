@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from .config import default_home, defaults, private_json, read_config, sources
+from .finish import sync_finished
 from .hermes import Hermes
 from .runner import process_jobs
 from .store import Store, locked
@@ -195,10 +196,22 @@ def dispatch(args, home, config, store):
             return 0
         errors = poll(config, store)
         failures = 0
+        blocked = [error.split(":", 1)[0] for error in errors]
+        hermes = None
+
+        def bridge():
+            nonlocal hermes
+            hermes = hermes or Hermes(config, home)
+            return hermes
+
         if command != "scan" and any(j["status"] in ("pending", "created", "retry_pending", "running", "creating")
                                      for j in store.rows()):
-            failures = process_jobs(store, config, Hermes(config, home),
-                                    blocked_sources=[error.split(":", 1)[0] for error in errors])
+            failures = process_jobs(store, config, bridge(), blocked_sources=blocked)
+        if command != "scan":
+            # Archiving a prepared session in Hermes closes its source item (Todoist: completes the task).
+            finish_errors = sync_finished(store, config, bridge, sources(), blocked)
+            failures += len(finish_errors)
+            errors = errors + finish_errors
         store.set_meta("last_poll", time.time())
         store.backup()
         counts = {}

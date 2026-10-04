@@ -6,6 +6,12 @@ import subprocess
 import shutil
 
 
+def command_run(command: list[str]) -> None:
+    result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+    if result.returncode:
+        raise RuntimeError(f"{command[0]} failed (exit {result.returncode}); check its authentication")
+
+
 def command_json(command: list[str]) -> dict:
     result = subprocess.run(command, capture_output=True, text=True, timeout=120)
     if result.returncode:
@@ -118,10 +124,38 @@ def poll_todoist(config, store, run=command_json, now=None):
                              ("todoist_since", json.dumps((dt.date.today() - dt.timedelta(days=1)).isoformat())))
 
 
+def finish_task(td, job, read=command_json, write=command_run):
+    """Complete the task the user marked done by archiving its session; skip what is already closed.
+
+    A recurring task is completed only while it still shows the occurrence this job prepared: its due
+    date then equals the one recorded at enqueue time. After a completion or reschedule in Todoist the
+    due date differs, and completing again would skip a later occurrence the user did not finish.
+    """
+    task_id = job["external_id"]
+    # Without --full, td omits `checked` and `isDeleted`.
+    task = read([td, "task", "view", f"id:{task_id}", "--json", "--full"])
+    if task.get("isDeleted"):
+        return "Archived in Hermes; the task was deleted in Todoist"
+    if task.get("checked"):
+        return "Archived in Hermes; the task was already completed in Todoist"
+    due = task.get("due") or {}
+    if due.get("isRecurring"):
+        # Compare days: changing only today's time keeps the occurrence; completing moves the day.
+        prepared = (((json.loads(job["payload"]).get("due")) or {}).get("date") or "")[:10]
+        if (due.get("date") or "")[:10] != prepared:
+            return "Archived in Hermes; this occurrence was already completed or moved in Todoist"
+    write([td, "task", "complete", f"id:{task_id}"])
+    return "Archived in Hermes; task completed in Todoist"
+
+
 class Source:
     @staticmethod
     def defaults():
-        return {"enabled": True, "label": "hermes", "mode": "agent", "command": shutil.which("td") or "td"}
+        return {"enabled": True, "label": "hermes", "mode": "agent", "complete_on_archive": True,
+                "command": shutil.which("td") or "td"}
+
+    def finish(self, config, job):
+        return finish_task(config["sources"]["todoist"]["command"], job)
 
     def poll(self, config, store):
         source = config["sources"]["todoist"]

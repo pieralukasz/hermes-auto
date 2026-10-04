@@ -9,7 +9,7 @@ hermes-auto-proton ───┘                                  │
                                               full-agent or restricted worker
 ```
 
-Adapter API: export a `Source` class with `defaults() -> dict`, `poll(config, store)` and `setup(config)`. Register it under `[project.entry-points."hermes_auto.sources"]`. `poll` may read its provider and enqueue immutable source events. `setup` is an explicit user command for reversible opt-in label creation, never called by the scheduler. Source failures block that source's pending jobs without disabling unrelated sources.
+Adapter API: export a `Source` class with `defaults() -> dict`, `poll(config, store)` and `setup(config)`. Optionally `finish(config, job) -> str`: called once when the user archives the job's session after it was seen open (`ready`/`needs_attention` -> `done`); it closes the source item (Todoist completes the task) and must be idempotent against items already closed at the source. `poll` stays read-only. Register it under `[project.entry-points."hermes_auto.sources"]`. `poll` may read its provider and enqueue immutable source events. `setup` is an explicit user command for reversible opt-in label creation, never called by the scheduler. Source failures block that source's pending jobs without disabling unrelated sources.
 
 Events use unique `(event_key, generation)` records. Normal polling uses generation zero. Only `new-session` allocates another generation and a new session ID. The title is presentation only. A user may rename or delete a Hermes conversation without changing event identity.
 

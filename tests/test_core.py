@@ -292,3 +292,81 @@ def test_session_title_fits_hermes_limit():
     assert len(title) <= TITLE_LIMIT
     assert title.startswith("☀ Odpisz") and title.endswith(" · todoist · #17")
     assert session_title({"title": "Krótkie", "source": "gmail", "id": 3}) == "☀ Krótkie · gmail · #3"
+
+
+class ArchiveFake:
+    def __init__(self):
+        self.archived = {}
+
+    def archive_states(self, session_ids):
+        return {sid: self.archived.get(sid) for sid in session_ids}
+
+
+class FinishingSource:
+    finished = []
+
+    def finish(self, config, job):
+        FinishingSource.finished.append(job["external_id"])
+        return "closed"
+
+
+def test_archiving_a_session_seen_open_finishes_the_source_item(store, config):
+    from hermes_auto.finish import sync_finished
+    FinishingSource.finished = []
+    enqueue(store, "open-then-archived")
+    enqueue(store, "archived-at-baseline")
+    enqueue(store, "never-prepared")
+    for job_id in (1, 2):
+        store.update(job_id, status="ready")
+    rows = {row["external_id"]: row for row in store.rows()}
+    hermes = ArchiveFake()
+    for key in rows:
+        hermes.archived[rows[key]["session_id"]] = False
+    hermes.archived[rows["archived-at-baseline"]["session_id"]] = True
+    installed = {"todoist": FinishingSource}
+    assert sync_finished(store, config, lambda: hermes, installed) == []
+    assert FinishingSource.finished == []
+    hermes.archived[rows["open-then-archived"]["session_id"]] = True
+    hermes.archived[rows["never-prepared"]["session_id"]] = True
+    for _ in range(3):
+        sync_finished(store, config, lambda: hermes, installed)
+    assert FinishingSource.finished == ["open-then-archived"]
+    assert [row["status"] for row in store.rows()] == ["done", "ready", "pending"]
+
+
+def test_finish_respects_opt_out_and_failures(store, config):
+    from hermes_auto.finish import mark_open, sync_finished
+
+    class Broken:
+        def finish(self, config, job):
+            raise RuntimeError("offline")
+
+    enqueue(store)
+    store.update(1, status="ready")
+    mark_open(store, 1)
+    hermes = ArchiveFake()
+    hermes.archived[store.rows()[0]["session_id"]] = True
+    config["sources"]["todoist"]["complete_on_archive"] = False
+    assert sync_finished(store, config, lambda: hermes, {"todoist": Broken}) == []
+    config["sources"]["todoist"]["complete_on_archive"] = True
+    assert sync_finished(store, config, lambda: hermes, {"todoist": Broken})
+    assert store.rows()[0]["status"] == "ready" and "offline" in store.rows()[0]["error"]
+
+
+def test_prepared_job_is_marked_open(store, config):
+    enqueue(store)
+    process_jobs(store, config, HermesFake())
+    assert store.get_meta("archive_seen:1") == "open"
+
+
+def test_superseded_generation_never_finishes(store, config):
+    from hermes_auto.finish import mark_open, sync_finished
+    FinishingSource.finished = []
+    enqueue(store)
+    store.update(1, status="needs_attention")
+    mark_open(store, 1)
+    store.new_generation(1)
+    hermes = ArchiveFake()
+    hermes.archived[store.rows()[0]["session_id"]] = True
+    sync_finished(store, config, lambda: hermes, {"todoist": FinishingSource})
+    assert FinishingSource.finished == []
