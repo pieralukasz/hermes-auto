@@ -283,3 +283,12 @@ def test_desktop_parity_lifts_oneshot_limits(monkeypatch):
     assert footprint.prune_oneshot_tools([{"function": {"name": "skill_manage"}}])
     assert Agent(platform="cli").platform == "desktop"
     assert Agent(platform="telegram").platform == "telegram"
+
+
+def test_session_title_fits_hermes_limit():
+    from hermes_auto.hermes import TITLE_LIMIT, session_title
+    long_job = {"title": "Odpisz bartkowi na maila " * 10, "source": "todoist", "id": 17}
+    title = session_title(long_job)
+    assert len(title) <= TITLE_LIMIT
+    assert title.startswith("☀ Odpisz") and title.endswith(" · todoist · #17")
+    assert session_title({"title": "Krótkie", "source": "gmail", "id": 3}) == "☀ Krótkie · gmail · #3"

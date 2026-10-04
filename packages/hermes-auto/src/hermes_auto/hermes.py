@@ -10,6 +10,19 @@ from pathlib import Path
 from .config import private_json
 from .runner import full_tools
 
+# Hermes SessionDB.MAX_TITLE_LENGTH; a longer title makes session creation fail.
+TITLE_LIMIT = 100
+
+
+def session_title(job, limit=TITLE_LIMIT):
+    """`☀ <title> · <source> · #<id>`, shortening only the task title so the suffix survives."""
+    suffix = f" · {job['source']} · #{job['id']}"
+    text = " ".join(str(job["title"] or "").split())
+    room = limit - len(suffix) - 2
+    if len(text) > room:
+        text = text[:room - 1].rstrip() + "…"
+    return f"☀ {text}{suffix}"
+
 
 class Hermes:
     def __init__(self, config, home):
@@ -87,7 +100,7 @@ class Hermes:
         return self.invoke("inspect", job)["messages"]
 
     def create(self, job, prompt):
-        title = f"☀ {job['title'][:150]} · {job['source']} · #{job['id']}"
+        title = session_title(job)
         message = ("Sesja jest gotowa. Automatyczne przygotowanie jest wyłączone; możesz zacząć rozmowę."
                    if self.config["language"].lower() in ("polish", "polski", "pl") else
                    "This session is ready. Automatic preparation is disabled; continue when you are ready.")

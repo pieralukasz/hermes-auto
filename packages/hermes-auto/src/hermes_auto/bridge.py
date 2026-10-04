@@ -89,7 +89,9 @@ def main():
     if action == "create":
         if session is None:
             db.create_session(sid, source="cli")
-            db.set_session_title(sid, request["title"])
+        if session is None or not session.get("title"):
+            # A failed earlier create can leave an untitled session; finish it instead of skipping.
+            db.set_session_title(sid, request["title"][:db.MAX_TITLE_LENGTH])
         if job["mode"] == "open" and not db.get_messages(sid):
             db.append_message(sid, "user", content=request["prompt"])
             db.append_message(sid, "assistant", content=request["open_message"])
