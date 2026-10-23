@@ -68,14 +68,6 @@ One-off tasks keep one event regardless of rescheduling. A recurring task starts
 
 **Archive = done.** When you archive a prepared session in Hermes, the next check completes its Todoist task (`td task complete`). Only an archive that happens after the session was seen open counts: sessions already archived when this check first saw them never complete anything. Already completed or deleted tasks are left alone. A recurring task is completed only while Todoist still shows the occurrence that session prepared (same due day) and has logged no completion of it since the job was queued, so archiving an old briefing, or a session whose agent already ticked the task, never skips a newer occurrence. The Todoist prompt lets the agent complete its own task once the work is actually done; sending, paying, publishing and other records stay gated, and work awaiting approval stays open. Superseded attempts (`new-session`) do not count. Disable per source with `"complete_on_archive": false`. Unarchiving does not reopen the task.
 
-**Another Hermes profile per project.** `profile_routes` in `config.json` runs matching jobs in a named Hermes profile (its own config, credentials, skills, memory and session database), e.g. every task of a work project on the work subscription:
-
-```json
-"profile_routes": [{"source": "todoist", "match": {"projectId": ["<project id>"]}, "profile": "work", "since": "2026-10-23 18:47:23"}]
-```
-
-`match` compares payload fields (a list means any of). `since` (UTC) leaves jobs created before the rule in the home that already holds their sessions. A missing profile fails the job instead of falling back. Archive = done works across profiles; open the profile in Hermes Desktop to see its sessions.
-
 The Todoist activity API's available history limits recovery after a long period offline. This version does not backfill every missed occurrence: it prepares the current eligible occurrence and relies on available completion history. It will not promise historical reconstruction beyond the provider's retention.
 
 ## Gmail
