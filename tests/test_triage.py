@@ -44,7 +44,12 @@ class Fake:
 
     def inspect(self, session_id):
         info = self.sessions.get(session_id)
-        return {"exists": info is not None, "last_active": (info or {}).get("last_active")}
+        return {"exists": info is not None, "last_active": (info or {}).get("last_active"),
+                "owned_by": (info or {}).get("owned_by")}
+
+    def session_excerpts(self, ids):
+        return {sid: {"title": "Google Ads", "date": "2026-10-22", "last_user": "przypomnij tacie",
+                      "last_assistant": "Czekamy na dostęp."} for sid in ids if sid in self.sessions}
 
     def unarchive(self, session_id):
         self.unarchived.append(session_id)
@@ -158,6 +163,7 @@ class Adapter:
     def __init__(self, tasks):
         self.tasks = tasks
         self.applied = []
+        self.filters = {}
 
     def inbox_tasks(self, settings):
         return self.tasks
@@ -166,6 +172,9 @@ class Adapter:
         return {"projects": [{"id": "P-home", "path": "Dom", "sections": [], "samples": []},
                              {"id": "P-blog", "path": "Biznes › Blog", "sections": [{"id": "S1", "name": "Posty"}],
                               "samples": ["Post o AI"]}]}
+
+    def filter_tasks(self, settings, names):
+        return [{**task, "_filter": name} for name in names for task in self.filters.get(name, [])]
 
     def apply(self, settings, task, decision, label):
         self.applied.append((task["id"], decision))
@@ -196,11 +205,11 @@ def test_todoist_settle_apply_plan_and_run(store, config):
     message = json.loads(jobs["questions"]["payload"])["open_message"]
     assert "Umyć samochód** → Dom · P4" in message and "Blog to bieżący cel." in message
     assert "po Twoim OK:** 1 (Napisać post na bloga)" in message and "1: O czym ma być post?" in message
-    assert "- 1: `td task update id:A --labels hermes --due today`" in message
+    assert "- 1: td task update id:A --labels hermes --due today" in message
     assert "Zadań stąd nie wykonuję" in message
-    assert jobs["questions"]["title"] == "Inbox Todoist: posortowane (2)"
+    assert jobs["questions"]["title"] == "Todoist: plan do zatwierdzenia (2)"
     states = dict(store.db.execute("SELECT item_id, decision FROM triage_items").fetchall())
-    assert states == {"A": "asked", "B": "moved"}
+    assert states == {"A": "planned", "B": "planned"}
     # The plan session already lists them, so the brief does not repeat them.
     assert store.db.execute("SELECT MIN(briefed) FROM triage_items").fetchone()[0] == 1
 
@@ -290,7 +299,7 @@ def test_followup_waits_for_the_session_it_joins(store, config):
 
 
 class ContextFake(Fake):
-    def recent_sessions(self, days=21, limit=400):
+    def recent_sessions(self, days=21, limit=400, exclude=()):
         return [{"id": "S-ads", "title": "Google Ads account invitation", "date": "2026-10-22"},
                 {"id": "S-other", "title": "Przegląd maili", "date": "2026-10-21"}]
 
@@ -394,3 +403,123 @@ def test_dated_agent_task_gets_label_only_after_ok(store, config):
     assert adapter.applied[0][1]["agent"] is False  # no label, so the due-date poller cannot start it
     message = json.loads(store.rows()[-1]["payload"])["open_message"]
     assert "Wywiad** → Dom · P2 · hermes po OK" in message and "po Twoim OK:** 1 (Wywiad)" in message
+
+
+def queue_followup(store, session="S1"):
+    reply = mail("R1", "T9")
+    reply["account"] = "me@example.test"
+    store.db.execute("INSERT INTO followups(event_key,source,session_id,title,payload) VALUES (?,?,?,?,?)",
+                     ("gmail:me@example.test:R1", "gmail", session, "Re: Ads", json.dumps(reply)))
+    store.db.commit()
+
+
+def test_followup_into_desktop_owned_session_opens_linked_session(store, config):
+    hermes = Fake(sessions={"S1": {"owned_by": "desktop"}})
+    queue_followup(store)
+    assert triage.process_followups(store, config, hermes) == 0
+    assert hermes.runs == [] and hermes.unarchived == []  # nothing written to, nothing unarchived
+    assert store.db.execute("SELECT status FROM followups").fetchone()[0] == "redirected"
+    job = store.rows()[-1]
+    payload = json.loads(job["payload"])
+    assert job["title"] == "↩ Google Ads" and payload["deny_tools"] is True
+    assert payload["followup_of"]["id"] == "S1"
+    prompt = prompt_for(job, config)
+    assert "otwarta w Hermes Desktop" in prompt and "id S1" in prompt and "Czekamy na dostęp." in prompt
+    # Later replies in the thread continue in the new session.
+    pinned = store.get_meta(triage.thread_key("gmail", "me@example.test", "T9"))
+    assert pinned == job["session_id"]
+
+
+def test_followup_refused_mid_run_is_redirected(store, config):
+    from hermes_auto.hermes import SessionBusy
+
+    class Busy(Fake):
+        def run(self, job, prompt):
+            raise SessionBusy("open elsewhere")
+
+    hermes = Busy(sessions={"S1": {}})
+    queue_followup(store)
+    assert triage.process_followups(store, config, hermes) == 0
+    assert store.db.execute("SELECT status FROM followups").fetchone()[0] == "redirected"
+    assert store.rows()[-1]["title"] == "↩ Google Ads"
+
+
+def test_review_filter_tasks_get_a_plan_once(store, config):
+    config["triage"]["todoist"] = {"settle_minutes": 0}
+    adapter = Adapter([])
+    triage.triage_todoist(store, config, Fake(), adapter)  # first run: empty Inbox baseline
+    old = {"id": "R", "content": "Poprawić rolki", "labels": ["hermes"], "projectId": "P-home"}
+    adapter.filters["Do organizacji"] = [old]
+    store.db.execute("INSERT INTO triage_items(account,item_id,kind,decision,payload,briefed) "
+                     "VALUES ('todoist','R','task','moved','{}',1)")  # sorted by the first version
+    store.db.commit()
+    hermes = Fake(replies=[[{"id": "R", "project_id": "P-home", "priority": "p3", "agent": True, "start": "wait",
+                             "waiting_for": "dostęp od taty"}]])
+    report = triage.triage_todoist(store, config, hermes, adapter)
+    assert [task["id"] for task, _, _ in report] == ["R"]
+    assert hermes.prompts[0][1][0]["current_list"] == "Dom"
+    assert triage.triage_todoist(store, config, hermes, adapter) == []  # planned once only
+
+
+def test_agent_tasks_in_current_filters_are_proposed_once(store, config):
+    adapter = Adapter([])
+    adapter.filters = {
+        "Bieżące: Praca": [{"id": "1", "content": "Odnowić domenę", "labels": ["hermes"], "projectId": "P-blog",
+                            "priority": 3, "description": "OVH"},
+                           {"id": "2", "content": "Rutyna", "labels": ["hermes"], "due": {"date": "2026-10-23"}},
+                           {"id": "3", "content": "Telefon", "labels": [], "projectId": "P-home"}],
+        "Bieżące: Bonus": [{"id": "4", "content": "Pirat Tasks", "labels": ["hermes"], "projectId": "P-home",
+                            "priority": 2}]}
+    store.enqueue("todoist:4:once", "todoist", "4", "Pirat Tasks", "agent", {"id": "4"})  # already ran
+    store.db.commit()
+    proposed = triage.propose_agent_tasks(store, config, adapter)
+    assert [task["id"] for task in proposed] == ["1"]
+    job = [row for row in store.rows() if row["source"] == "proposals"][0]
+    message = json.loads(job["payload"])["open_message"]
+    assert "**Odnowić domenę** · Biznes › Blog · P2 (Bieżące: Praca)" in message
+    assert "- 1: td task update id:1 --due today" in message and "niczego z listy nie wykonuję" in message
+    assert triage.propose_agent_tasks(store, config, adapter) == []  # not offered twice
+
+
+class WaitingAdapter(Adapter):
+    def __init__(self, waiting):
+        super().__init__([])
+        self.waiting, self.comments, self.waiting_calls = waiting, [], 0
+
+    def waiting_tasks(self, settings, labels):
+        self.waiting_calls += 1
+        return self.waiting
+
+    def add_comment(self, settings, task_id, text):
+        self.comments.append((task_id, text))
+
+
+def test_waiting_task_ready_after_mail_opens_one_session(store, config):
+    adapter = WaitingAdapter([{"id": "W", "content": "Rolki dla taty", "labels": ["czekam", "hermes"],
+                               "projectId": "P-home", "comments": ["Czekam na maila od taty"]},
+                              {"id": "X", "content": "Kredyt", "labels": ["czekam"], "projectId": "P-home"}])
+    dad = mail("D1", "T7", subject="Pliki do rolek", sender="Tata <tata@example.test>")
+    hermes = Fake(replies=[[{"task_id": "W", "mail": 0, "ready": True, "got": "tata przysłał pliki rolek"},
+                            {"task_id": "X", "mail": 0, "ready": False, "got": "wstępna oferta",
+                             "missing": "decyzja banku"},
+                            {"task_id": "nope", "mail": 0, "ready": True}],
+                           []])
+    found = triage.check_waiting(store, config, hermes, adapter, [dad])
+    assert [(task["id"], ready) for task, _, ready in found] == [("W", True), ("X", False)]
+    job = [row for row in store.rows() if row["source"] == "unblocked"][0]
+    message = json.loads(job["payload"])["open_message"]
+    assert job["title"] == "Odblokowane: Rolki dla taty"
+    assert "Przyszło: Tata, „Pliki do rolek”" in message and "agent ruszy w osobnej sesji" in message
+    assert "td task update id:W --labels hermes --due today" in message and "<!--" in message
+    assert adapter.comments == [("X", "Hermes: przyszło od Tata („Pliki do rolek”): wstępna oferta. "
+                                      "Brakuje jeszcze: decyzja banku.")]
+    # The same mail never speaks up twice; the waiting list is cached.
+    assert triage.check_waiting(store, config, hermes, adapter, [dad]) == []
+    assert adapter.waiting_calls == 1
+
+
+def test_no_waiting_check_without_mail_or_waiting_tasks(store, config):
+    hermes = Fake()
+    assert triage.check_waiting(store, config, hermes, WaitingAdapter([]), [mail("M")]) == []
+    assert triage.check_waiting(store, config, hermes, WaitingAdapter([{"id": "W", "content": "x"}]), []) == []
+    assert hermes.prompts == []

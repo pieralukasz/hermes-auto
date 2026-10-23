@@ -45,6 +45,7 @@ def run_triage(config, store, bridge, installed, blocked=()):
     if not options["enabled"]:
         return [], 0
     errors, failures = [], 0
+    new_mail = []
     for name in ("gmail", "proton"):
         settings = config["sources"].get(name, {})
         source = installed.get(name)
@@ -54,7 +55,8 @@ def run_triage(config, store, bridge, installed, blocked=()):
             candidates, key, cursor = source().inbox(config, store, limit=options["max_mail_per_run"])
             if candidates:
                 account = candidates[0].get("account", "")
-                triage.triage_mail(store, config, bridge(), name, account, candidates, key, cursor)
+                report = triage.triage_mail(store, config, bridge(), name, account, candidates, key, cursor)
+                new_mail += [item for _, item, _ in report or []]
             else:
                 store.set_meta(key, cursor)
         except Exception as exc:
@@ -62,10 +64,21 @@ def run_triage(config, store, bridge, installed, blocked=()):
     todoist = installed.get("todoist")
     if (options["todoist"]["enabled"] and config["sources"].get("todoist", {}).get("enabled")
             and "todoist" not in blocked and todoist is not None and hasattr(todoist, "inbox_tasks")):
+        # Separate steps: the sorter raises after queuing its plan when a stored decision still fails to apply
+        # (retried next check); that must not skip proposals or the waiting check for this check's new mail.
         try:
-            triage.triage_todoist(store, config, bridge(), todoist())
-        except Exception as exc:
+            adapter = todoist()
+        except Exception as exc:  # noqa: BLE001
             errors.append(f"triage todoist: {exc}")
+            adapter = None
+        for step, call in () if adapter is None else (("triage todoist", lambda: triage.triage_todoist(store, config, bridge(), adapter)),
+                           ("proposals todoist", lambda: triage.propose_agent_tasks(store, config, adapter)),
+                           ("waiting todoist", lambda: triage.check_waiting(store, config, bridge(), adapter,
+                                                                            new_mail))):
+            try:
+                call()
+            except Exception as exc:
+                errors.append(f"{step}: {exc}")
     if store.db.execute("SELECT 1 FROM followups WHERE status IN ('pending','retry_pending')").fetchone():
         failures += triage.process_followups(store, config, bridge())
     triage.maybe_brief(store, config)

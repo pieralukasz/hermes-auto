@@ -300,8 +300,9 @@ def test_session_title_fits_hermes_limit():
     long_job = {"title": "Odpisz bartkowi na maila " * 10, "source": "todoist", "id": 17}
     title = session_title(long_job)
     assert len(title) <= TITLE_LIMIT
-    assert title.startswith("☀ Odpisz") and title.endswith(" · todoist · #17")
-    assert session_title({"title": "Krótkie", "source": "gmail", "id": 3}) == "☀ Krótkie · gmail · #3"
+    assert title.startswith("Odpisz") and title.endswith(" · todoist · #17")
+    assert session_title({"title": "Krótkie", "source": "gmail", "id": 3}) == "Krótkie · gmail · #3"
+    assert session_title({"title": "K", "source": "gmail", "id": 3}, prefix="☀ ") == "☀ K · gmail · #3"
 
 
 class ArchiveFake:

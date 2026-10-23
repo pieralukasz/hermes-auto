@@ -190,7 +190,24 @@ def rowid_at(conn, timestamp):
     return lo
 
 
-AUTOMATION_TITLE = "☀ %"
+def live_owner(session_id):
+    """Surface (e.g. "desktop") holding a live lease on this session, else None.
+
+    Hermes refuses a second writer (SESSION_NOT_OWNED) while e.g. Desktop keeps the conversation's runtime;
+    Desktop holds every conversation opened since it started until ~6 h idle. Unreadable registry: None,
+    and the run's own refusal is still caught by the caller.
+    """
+    try:
+        from hermes_cli.active_sessions import active_session_registry_snapshot
+        for entry in active_session_registry_snapshot():
+            if entry.get("session_id") == session_id:
+                return entry.get("surface") or "another window"
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+AUTOMATION_TITLE = "☀ %"  # sessions from before titles lost the prefix
 
 
 def recent_sessions(db_path, request):
@@ -204,11 +221,12 @@ def recent_sessions(db_path, request):
             "SELECT id, title, COALESCE(last_activity_at, started_at) AS active FROM sessions "
             "WHERE COALESCE(last_activity_at, started_at) >= ? AND parent_session_id IS NULL "
             "AND COALESCE(title,'') != '' AND title NOT LIKE ? AND title NOT LIKE 'Subagent:%' "
-            "ORDER BY active DESC LIMIT ?", (since, AUTOMATION_TITLE, int(request.get("limit") or 400))).fetchall()
+            "ORDER BY active DESC LIMIT ?", (since, AUTOMATION_TITLE, int(request.get("limit") or 400) + len(request.get("exclude") or []))).fetchall()
     finally:
         conn.close()
+    exclude = set(request.get("exclude") or [])
     return [{"id": sid, "title": title, "date": time.strftime("%Y-%m-%d", time.localtime(active))}
-            for sid, title, active in rows]
+            for sid, title, active in rows if sid not in exclude]
 
 
 def session_excerpts(db_path, request):
@@ -437,7 +455,7 @@ def main():
         return
     session = db.get_session(sid)
     if action == "inspect":
-        info = {"exists": session is not None,
+        info = {"exists": session is not None, "owned_by": live_owner(sid),
                 "messages": session.get("message_count", 0) if session else 0,
                 "archived": bool(session.get("archived")) if session else False,
                 "last_active": session.get("last_activity_at") if session else None}

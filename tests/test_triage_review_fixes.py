@@ -133,7 +133,7 @@ def test_partial_failure_still_plans_applied_task_and_retries_stored_decision(st
     assert len(second) == 1 and "**Zadanie B**" in plan_text(second[0])
     assert "Zadanie A" not in plan_text(second[0])
     states = dict(store.db.execute("SELECT item_id, decision FROM triage_items").fetchall())
-    assert states == {"A": "moved", "B": "moved"}
+    assert states == {"A": "planned", "B": "planned"}
 
 
 def test_decision_is_stored_before_apply(store):
@@ -229,7 +229,7 @@ def test_plan_wait_command_keeps_czekam(store):
     sort(store, config, hermes, adapter)
     sort(store, config, hermes, adapter)
     text = plan_text(plans(store)[0])
-    assert "td task update id:A --labels czekam,hermes`" in text
+    assert "td task update id:A --labels czekam,hermes\n" in text
     assert "id:A --labels czekam,hermes --due" not in text
 
 
@@ -242,7 +242,7 @@ def test_plan_never_rewrites_due_of_a_recurring_task(store):
     sort(store, config, hermes, adapter)
     sort(store, config, hermes, adapter)
     text = plan_text(plans(store)[0])
-    assert "id:R --labels hermes`" in text
+    assert "id:R --labels hermes\n" in text
     assert "id:R --labels hermes --due today" not in text
 
 

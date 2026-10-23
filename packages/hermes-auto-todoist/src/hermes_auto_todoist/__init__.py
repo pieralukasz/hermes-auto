@@ -193,6 +193,34 @@ def inbox_tasks(td, read=command_json):
     return items(read([td, "task", "list", "--project", f"id:{inbox_project_id(td, read)}", "--all", "--json"]))
 
 
+def filter_tasks(td, names, read=command_json):
+    """Tasks of the named saved filters, deduplicated by id; `_filter` names the first one that listed it."""
+    saved = {f["name"]: f["id"] for f in items(read([td, "filter", "list", "--json"]))}
+    out, seen = [], set()
+    for name in names:
+        if name not in saved:
+            continue
+        for task in items(read([td, "filter", "view", f"id:{saved[name]}", "--all", "--json"])):
+            if str(task["id"]) not in seen:
+                seen.add(str(task["id"]))
+                out.append({**task, "_filter": name})
+    return out
+
+
+def waiting_tasks(td, labels, read=command_json):
+    """Tasks waiting on something (@czekam, @zablokowane) with their last three comments."""
+    query = " | ".join(f"@{label}" for label in labels)
+    tasks = items(read([td, "task", "list", "--filter", query, "--all", "--json"]))
+    for task in tasks:
+        comments = items(read([td, "comment", "list", f"id:{task['id']}", "--all", "--json"]))
+        task["comments"] = [" ".join(str(c.get("content") or "").split())[:300] for c in comments][-3:]
+    return tasks
+
+
+def add_comment(td, task_id, text, write=command_run):
+    write([td, "comment", "add", f"id:{task_id}", "--content", text])
+
+
 def build_outline(td, read=command_json):
     """Lists with their path, description, sections and a few task titles: the sorter's map."""
     projects = items(read([td, "project", "list", "--all", "--json"]))
@@ -230,6 +258,9 @@ def apply_decision(td, task, decision, agent_label, read=command_json, write=com
     task = read([td, "task", "view", ref, "--full", "--json"])
     if task.get("checked") or task.get("isDeleted"):
         raise RuntimeError(f"Task {task['id']} is no longer active")
+    # Tasks already filed (Do organizacji, current agent tasks) may be planned in place: no move then.
+    same_place = (decision.get("project_id") == str(task.get("projectId"))
+                  and (decision.get("section_id") or None) == (task.get("sectionId") or None))
     if decision.get("priority"):
         write([td, "task", "update", ref, "--priority", decision["priority"]])
         applied["priority"] = decision["priority"]
@@ -244,7 +275,7 @@ def apply_decision(td, task, decision, agent_label, read=command_json, write=com
         applied["agent"] = True
         # No due date: the scheduled poller would never pick it up, so the sorter may start it itself.
         applied["run"] = not task.get("due") and not recurring
-    if decision.get("project_id"):
+    if decision.get("project_id") and not same_place:
         command = [td, "task", "move", ref, "--project", f"id:{decision['project_id']}"]
         if decision.get("section_id"):
             command += ["--section", f"id:{decision['section_id']}"]
@@ -273,6 +304,15 @@ class Source:
 
     def task(self, settings, task_id):
         return command_json([settings["command"], "task", "view", f"id:{task_id}", "--full", "--json"])
+
+    def filter_tasks(self, settings, names):
+        return filter_tasks(settings["command"], names)
+
+    def waiting_tasks(self, settings, labels):
+        return waiting_tasks(settings["command"], labels)
+
+    def add_comment(self, settings, task_id, text):
+        add_comment(settings["command"], task_id, text)
 
     def outline(self, settings, store, max_age_hours=24):
         cached = store.get_meta("todoist_outline")

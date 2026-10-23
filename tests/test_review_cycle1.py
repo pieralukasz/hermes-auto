@@ -228,7 +228,7 @@ def test_retry_still_applies_when_task_is_in_original_or_target_project(store):
     adapter.fail = None
     sort(store, adapter, hermes)
     assert [task_id for task_id, _ in adapter.applied] == ["A"]
-    assert item_state(store)[0] == "moved"
+    assert item_state(store)[0] == "planned"
 
 
 # ── L2: bounded retries, visible issues, read errors are not deletions ──────
