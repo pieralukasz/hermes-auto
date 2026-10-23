@@ -132,7 +132,7 @@ class Gmail:
                   if address]
             sent.append({"ts": int(item["internalDate"]) / 1000, "to": to})
         return {
-            "id": message["id"], "thread_id": thread_id, "account": account,
+            "id": message["id"], "thread_id": thread_id, "account": account, "read": "UNREAD" not in labels,
             "from": headers.get("from", ""), "to": headers.get("to", ""), "subject": headers.get("subject", ""),
             "date": headers.get("date", ""), "list_unsubscribe": bool(headers.get("list-unsubscribe")),
             "snippet": message.get("snippet", ""),

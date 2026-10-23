@@ -275,6 +275,9 @@ def triage_mail(store, config, hermes, source, account, candidates, cursor_key=N
            if not store.db.execute("SELECT 1 FROM triage_items WHERE account=? AND item_id=?",
                                    (identity, item["id"])).fetchone()
            and not watched(store, source, account, item.get("thread_id", ""))]
+    # Already read in the mail app: the user has seen it, so no session, brief or reply notice.
+    already_read = [item for item in new if item.get("read")]
+    new = [item for item in new if not item.get("read")]
     routed, unknown = [], []
     for item in new:
         conversation = conversation_id(item)
@@ -309,6 +312,12 @@ def triage_mail(store, config, hermes, source, account, candidates, cursor_key=N
                              (thread_key(source, account, conversation), json.dumps(session)))
 
     with store.db:
+        for item in already_read:
+            store.db.execute("INSERT OR IGNORE INTO triage_items(account,item_id,kind,decision,reason,summary,"
+                             "payload,briefed) VALUES (?,?,?,?,?,?,?,1)",
+                             (identity, item["id"], "mail", "read", "przeczytane przed sortowaniem", "",
+                              json.dumps(item, ensure_ascii=False)))
+            report.append(("read", item, None))
         for item, session in routed:
             follow(item, session)
         for index, item in enumerate(unknown):

@@ -538,3 +538,16 @@ def test_no_waiting_check_without_mail_or_waiting_tasks(store, config):
     assert triage.check_waiting(store, config, hermes, WaitingAdapter([]), [mail("M")]) == []
     assert triage.check_waiting(store, config, hermes, WaitingAdapter([{"id": "W", "content": "x"}]), []) == []
     assert hermes.prompts == []
+
+
+def test_mail_already_read_opens_nothing(store, config):
+    seen = mail("R1", "T5")
+    seen["read"] = True
+    reply = mail("R2", "T6", sent=[{"ts": 1, "to": ["jan@example.test"]}])
+    reply["read"] = True
+    hermes = Fake(found="S1")
+    report = triage.triage_mail(store, config, hermes, "gmail", "me@example.test", [seen, reply])
+    assert [decision for decision, _, _ in report] == ["read", "read"]
+    assert hermes.prompts == [] and hermes.queries == []  # no model call, no session lookup
+    assert store.rows() == [] and store.db.execute("SELECT COUNT(*) FROM followups").fetchone()[0] == 0
+    assert store.db.execute("SELECT MIN(briefed) FROM triage_items").fetchone()[0] == 1  # not in the brief

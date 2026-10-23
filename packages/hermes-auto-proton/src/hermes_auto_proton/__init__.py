@@ -139,11 +139,14 @@ class Proton:
         else:
             uids = [int(uid) for uid in self.search("UID", f"{cursor['uid'] + 1}:*") if int(uid) > cursor["uid"]]
         uids = sorted(uids)[:limit]
+        # BODY.PEEK leaves the Seen flag alone, so this is what the user has already opened.
+        seen = {int(uid) for uid in self.search("UID", f"{uids[0]}:{uids[-1]}", "SEEN")} if uids else set()
         candidates = []
         for uid in uids:
             item = parse_candidate(self.fetch(str(uid).encode()), own)
             if item:
                 item["account"] = account
+                item["read"] = uid in seen
                 candidates.append(item)
         if any(item["refs"] for item in candidates):
             self.select(config.get("sent_mailbox", "Sent"))
