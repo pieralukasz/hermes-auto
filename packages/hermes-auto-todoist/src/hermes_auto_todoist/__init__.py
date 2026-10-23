@@ -193,6 +193,20 @@ def inbox_tasks(td, read=command_json):
     return items(read([td, "task", "list", "--project", f"id:{inbox_project_id(td, read)}", "--all", "--json"]))
 
 
+def filter_tasks(td, names, read=command_json):
+    """Tasks of the named saved filters, deduplicated by id; `_filter` names the first one that listed it."""
+    saved = {f["name"]: f["id"] for f in items(read([td, "filter", "list", "--json"]))}
+    out, seen = [], set()
+    for name in names:
+        if name not in saved:
+            continue
+        for task in items(read([td, "filter", "view", f"id:{saved[name]}", "--all", "--json"])):
+            if str(task["id"]) not in seen:
+                seen.add(str(task["id"]))
+                out.append({**task, "_filter": name})
+    return out
+
+
 def build_outline(td, read=command_json):
     """Lists with their path, description, sections and a few task titles: the sorter's map."""
     projects = items(read([td, "project", "list", "--all", "--json"]))
@@ -227,7 +241,9 @@ def apply_decision(td, task, decision, agent_label, read=command_json, write=com
     """Move, prioritise and label one Inbox task; read it back. Returns what was changed."""
     applied = {}
     ref = f"id:{task['id']}"
-    if decision.get("project_id"):
+    same_place = (decision.get("project_id") == str(task.get("projectId"))
+                  and (decision.get("section_id") or None) == (task.get("sectionId") or None))
+    if decision.get("project_id") and not same_place:
         command = [td, "task", "move", ref, "--project", f"id:{decision['project_id']}"]
         if decision.get("section_id"):
             command += ["--section", f"id:{decision['section_id']}"]
@@ -261,6 +277,9 @@ class Source:
 
     def inbox_tasks(self, settings):
         return inbox_tasks(settings["command"])
+
+    def filter_tasks(self, settings, names):
+        return filter_tasks(settings["command"], names)
 
     def outline(self, settings, store, max_age_hours=24):
         cached = store.get_meta("todoist_outline")

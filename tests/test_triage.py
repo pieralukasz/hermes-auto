@@ -163,6 +163,7 @@ class Adapter:
     def __init__(self, tasks):
         self.tasks = tasks
         self.applied = []
+        self.filters = {}
 
     def inbox_tasks(self, settings):
         return self.tasks
@@ -171,6 +172,9 @@ class Adapter:
         return {"projects": [{"id": "P-home", "path": "Dom", "sections": [], "samples": []},
                              {"id": "P-blog", "path": "Biznes › Blog", "sections": [{"id": "S1", "name": "Posty"}],
                               "samples": ["Post o AI"]}]}
+
+    def filter_tasks(self, settings, names):
+        return [{**task, "_filter": name} for name in names for task in self.filters.get(name, [])]
 
     def apply(self, settings, task, decision, label):
         self.applied.append((task["id"], decision))
@@ -203,9 +207,9 @@ def test_todoist_settle_apply_plan_and_run(store, config):
     assert "po Twoim OK:** 1 (Napisać post na bloga)" in message and "1: O czym ma być post?" in message
     assert "- 1: `td task update id:A --labels hermes --due today`" in message
     assert "Zadań stąd nie wykonuję" in message
-    assert jobs["questions"]["title"] == "Inbox Todoist: posortowane (2)"
+    assert jobs["questions"]["title"] == "Todoist: plan do zatwierdzenia (2)"
     states = dict(store.db.execute("SELECT item_id, decision FROM triage_items").fetchall())
-    assert states == {"A": "asked", "B": "moved"}
+    assert states == {"A": "planned", "B": "planned"}
     # The plan session already lists them, so the brief does not repeat them.
     assert store.db.execute("SELECT MIN(briefed) FROM triage_items").fetchone()[0] == 1
 
@@ -429,3 +433,40 @@ def test_followup_refused_mid_run_is_redirected(store, config):
     assert triage.process_followups(store, config, hermes) == 0
     assert store.db.execute("SELECT status FROM followups").fetchone()[0] == "redirected"
     assert store.rows()[-1]["title"] == "↩ Google Ads"
+
+
+def test_review_filter_tasks_get_a_plan_once(store, config):
+    config["triage"]["todoist"] = {"settle_minutes": 0}
+    adapter = Adapter([])
+    triage.triage_todoist(store, config, Fake(), adapter)  # first run: empty Inbox baseline
+    old = {"id": "R", "content": "Poprawić rolki", "labels": ["hermes"], "projectId": "P-home"}
+    adapter.filters["Do organizacji"] = [old]
+    store.db.execute("INSERT INTO triage_items(account,item_id,kind,decision,payload,briefed) "
+                     "VALUES ('todoist','R','task','moved','{}',1)")  # sorted by the first version
+    store.db.commit()
+    hermes = Fake(replies=[[{"id": "R", "project_id": "P-home", "priority": "p3", "agent": True, "start": "wait",
+                             "waiting_for": "dostęp od taty"}]])
+    report = triage.triage_todoist(store, config, hermes, adapter)
+    assert [task["id"] for task, _, _ in report] == ["R"]
+    assert hermes.prompts[0][1][0]["current_list"] == "Dom"
+    assert triage.triage_todoist(store, config, hermes, adapter) == []  # planned once only
+
+
+def test_agent_tasks_in_current_filters_are_proposed_once(store, config):
+    adapter = Adapter([])
+    adapter.filters = {
+        "Bieżące: Praca": [{"id": "1", "content": "Odnowić domenę", "labels": ["hermes"], "projectId": "P-blog",
+                            "priority": 3, "description": "OVH"},
+                           {"id": "2", "content": "Rutyna", "labels": ["hermes"], "due": {"date": "2026-10-23"}},
+                           {"id": "3", "content": "Telefon", "labels": [], "projectId": "P-home"}],
+        "Bieżące: Bonus": [{"id": "4", "content": "Pirat Tasks", "labels": ["hermes"], "projectId": "P-home",
+                            "priority": 2}]}
+    store.enqueue("todoist:4:once", "todoist", "4", "Pirat Tasks", "agent", {"id": "4"})  # already ran
+    store.db.commit()
+    proposed = triage.propose_agent_tasks(store, config, adapter)
+    assert [task["id"] for task in proposed] == ["1"]
+    job = [row for row in store.rows() if row["source"] == "proposals"][0]
+    message = json.loads(job["payload"])["open_message"]
+    assert "**Odnowić domenę** · Biznes › Blog · P2 (Bieżące: Praca)" in message
+    assert "- 1: `td task update id:1 --due today`" in message and "niczego z listy nie wykonuję" in message
+    assert triage.propose_agent_tasks(store, config, adapter) == []  # not offered twice

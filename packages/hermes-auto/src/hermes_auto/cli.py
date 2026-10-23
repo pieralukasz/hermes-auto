@@ -63,7 +63,9 @@ def run_triage(config, store, bridge, installed, blocked=()):
     if (options["todoist"]["enabled"] and config["sources"].get("todoist", {}).get("enabled")
             and "todoist" not in blocked and todoist is not None and hasattr(todoist, "inbox_tasks")):
         try:
-            triage.triage_todoist(store, config, bridge(), todoist())
+            adapter = todoist()
+            triage.triage_todoist(store, config, bridge(), adapter)
+            triage.propose_agent_tasks(store, config, adapter)
         except Exception as exc:
             errors.append(f"triage todoist: {exc}")
     if store.db.execute("SELECT 1 FROM followups WHERE status IN ('pending','retry_pending')").fetchone():
