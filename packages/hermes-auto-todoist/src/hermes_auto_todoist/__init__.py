@@ -235,10 +235,15 @@ def apply_decision(td, task, decision, agent_label, read=command_json, write=com
         write([td, "task", "update", ref, "--priority", decision["priority"]])
         applied["priority"] = decision["priority"]
     recurring = bool((task.get("due") or {}).get("isRecurring"))
-    if decision.get("agent") and agent_label not in task.get("labels", []):
-        write([td, "task", "update", ref, "--labels", ",".join([*task.get("labels", []), agent_label])])
+    labels = list(task.get("labels", []))
+    wanted = ([agent_label] if decision.get("agent") else []) + list(decision.get("extra_labels") or [])
+    added = [label for label in wanted if label not in labels]
+    if added:
+        write([td, "task", "update", ref, "--labels", ",".join(labels + added)])
+        applied["labels"] = added
+    if decision.get("agent") and agent_label in added:
         applied["agent"] = True
-        # No due date: the scheduled poller would never pick it up, so the sorter starts it now.
+        # No due date: the scheduled poller would never pick it up, so the sorter may start it itself.
         applied["run"] = not task.get("due") and not recurring
     current = read([td, "task", "view", ref, "--full", "--json"])
     if decision.get("project_id") and str(current.get("projectId")) != decision["project_id"]:

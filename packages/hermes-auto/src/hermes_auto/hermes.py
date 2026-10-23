@@ -108,6 +108,14 @@ class Hermes:
     def find_session(self, **query):
         return self.invoke("find_session", **query)["session_id"]
 
+    def recent_sessions(self, days=21, limit=400):
+        """Recent user conversations: [{id, title, date}], newest first. Read-only."""
+        return self.invoke("recent_sessions", days=days, limit=limit)["result"]
+
+    def session_excerpts(self, ids):
+        """{session_id: {title, date, last_user, last_assistant}}. Read-only."""
+        return self.invoke("session_excerpts", ids=list(ids))["result"]
+
     def unarchive(self, session_id):
         return self.invoke("unarchive", {"session_id": session_id})
 

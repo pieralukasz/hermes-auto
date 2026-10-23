@@ -190,6 +190,51 @@ def rowid_at(conn, timestamp):
     return lo
 
 
+AUTOMATION_TITLE = "☀ %"
+
+
+def recent_sessions(db_path, request):
+    """User conversations active in the last `days` (newest first): id, title, last activity date."""
+    import sqlite3
+    import time
+    since = time.time() - float(request.get("days") or 21) * 86400
+    conn = sqlite3.connect(Path(db_path).as_uri() + "?mode=ro", uri=True, timeout=10)
+    try:
+        rows = conn.execute(
+            "SELECT id, title, COALESCE(last_activity_at, started_at) AS active FROM sessions "
+            "WHERE COALESCE(last_activity_at, started_at) >= ? AND parent_session_id IS NULL "
+            "AND COALESCE(title,'') != '' AND title NOT LIKE ? AND title NOT LIKE 'Subagent:%' "
+            "ORDER BY active DESC LIMIT ?", (since, AUTOMATION_TITLE, int(request.get("limit") or 400))).fetchall()
+    finally:
+        conn.close()
+    return [{"id": sid, "title": title, "date": time.strftime("%Y-%m-%d", time.localtime(active))}
+            for sid, title, active in rows]
+
+
+def session_excerpts(db_path, request):
+    """Title, date and the latest user and assistant messages of each session (bounded)."""
+    import sqlite3
+    import time
+    conn = sqlite3.connect(Path(db_path).as_uri() + "?mode=ro", uri=True, timeout=10)
+    out = {}
+    try:
+        for sid in list(request.get("ids") or [])[:30]:
+            row = conn.execute("SELECT title, COALESCE(last_activity_at, started_at) FROM sessions WHERE id=?",
+                               (sid,)).fetchone()
+            if row is None:
+                continue
+            last = {}
+            for role in ("user", "assistant"):
+                found = conn.execute("SELECT content FROM messages WHERE session_id=? AND role=? AND "
+                                     "length(content) > 20 ORDER BY id DESC LIMIT 1", (sid, role)).fetchone()
+                last[role] = " ".join(str(found[0] if found else "").split())[:800]
+            out[sid] = {"title": row[0], "date": time.strftime("%Y-%m-%d", time.localtime(row[1] or 0)),
+                        "last_user": last["user"], "last_assistant": last["assistant"]}
+    finally:
+        conn.close()
+    return out
+
+
 def find_session(db_path, request):
     """Which Hermes session sent the message this reply answers? Read-only, newest send first.
 
@@ -270,6 +315,11 @@ def main():
     if action == "classify":
         db.close()
         print(json.dumps(classify(config, request), ensure_ascii=False))
+        return
+    if action in ("recent_sessions", "session_excerpts"):
+        db.close()
+        reader = recent_sessions if action == "recent_sessions" else session_excerpts
+        print(json.dumps({"result": reader(Path(config["hermes_home"]) / "state.db", request)}, ensure_ascii=False))
         return
     if action == "find_session":
         found = find_session(Path(config["hermes_home"]) / "state.db", request)

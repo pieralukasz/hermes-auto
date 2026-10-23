@@ -172,16 +172,16 @@ class Adapter:
         return {"agent": decision["agent"], "run": decision["agent"] and not task.get("due")}
 
 
-def test_todoist_settle_apply_questions_and_run(store, config):
+def test_todoist_settle_apply_plan_and_run(store, config):
     config["triage"]["todoist"] = {"backlog": True, "auto_start": True}
     tasks = [{"id": "A", "content": "Napisać post na bloga", "labels": []},
              {"id": "B", "content": "Umyć samochód", "labels": []},
              {"id": "C", "content": "Sub", "labels": [], "parentId": "A"}]
     adapter = Adapter(tasks)
     hermes = Fake(replies=[[
-        {"id": "A", "project_id": "P-blog", "section_id": "S1", "priority": None, "agent": True,
-         "question": "Jaki priorytet?", "proposal": "p2"},
-        {"id": "B", "project_id": "P-home", "section_id": "BAD", "priority": "p3", "agent": False},
+        {"id": "A", "project_id": "P-blog", "section_id": "S1", "priority": "p2", "agent": True, "start": "now",
+         "reason": "Blog to bieżący cel.", "question": "O czym ma być post?"},
+        {"id": "B", "project_id": "P-home", "section_id": "BAD", "priority": "p4", "agent": False, "start": "now"},
     ]])
     start = dt.datetime(2026, 10, 23, 8, 0, tzinfo=dt.timezone.utc)
     assert triage.triage_todoist(store, config, hermes, adapter, now=start) == []  # first sighting
@@ -190,15 +190,17 @@ def test_todoist_settle_apply_questions_and_run(store, config):
     report = triage.triage_todoist(store, config, hermes, adapter, now=start)
     assert [task["id"] for task, _, _ in report] == ["A", "B"]
     assert adapter.applied[1][1]["section_id"] is None  # unknown section dropped
+    assert report[1][1]["start"] == "later"  # not an agent task, so nothing to start
     jobs = {job["source"]: job for job in store.rows()}
     assert json.loads(jobs["todoist"]["payload"])["triage_run"] is True
-    assert "hermes" in json.loads(jobs["todoist"]["payload"])["labels"]
-    assert "Jaki priorytet?" in json.loads(jobs["questions"]["payload"])["open_message"]
+    message = json.loads(jobs["questions"]["payload"])["open_message"]
+    assert "Umyć samochód** → Dom · P4" in message and "Blog to bieżący cel." in message
+    assert "po Twoim OK:** 1 (Napisać post na bloga)" in message and "1: O czym ma być post?" in message
+    assert jobs["questions"]["title"] == "Inbox Todoist: posortowane (2)"
     states = dict(store.db.execute("SELECT item_id, decision FROM triage_items").fetchall())
     assert states == {"A": "asked", "B": "moved"}
-    # Moved tasks show up in the next brief.
-    triage.maybe_brief(store, config, now=dt.datetime(2026, 10, 23, 8, 0))
-    assert "Umyć samochód" in json.loads(store.rows()[-1]["payload"])["open_message"]
+    # The plan session already lists them, so the brief does not repeat them.
+    assert store.db.execute("SELECT MIN(briefed) FROM triage_items").fetchone()[0] == 1
 
 
 def test_todoist_dry_mode_changes_nothing(store, config):
@@ -286,16 +288,47 @@ def test_followup_waits_for_the_session_it_joins(store, config):
     assert store.db.execute("SELECT status FROM followups").fetchone()[0] == "ready"
 
 
-def test_agent_task_asks_before_starting(store, config):
+class ContextFake(Fake):
+    def recent_sessions(self, days=21, limit=400):
+        return [{"id": "S-ads", "title": "Google Ads account invitation", "date": "2026-10-22"},
+                {"id": "S-other", "title": "Przegląd maili", "date": "2026-10-21"}]
+
+    def session_excerpts(self, ids):
+        self.excerpt_ids = list(ids)
+        return {"S-ads": {"title": "Google Ads account invitation", "date": "2026-10-22",
+                          "last_user": "przypomnij tacie", "last_assistant": "Czekamy na dostęp do Analytics."}}
+
+
+def test_plan_waits_with_context_and_does_not_start(store, config):
     config["triage"]["todoist"] = {"backlog": True, "settle_minutes": 0}
-    adapter = Adapter([{"id": "A", "content": "Poprawić tacie rolki", "labels": []}])
-    hermes = Fake(replies=[[{"id": "A", "project_id": "P-home", "priority": "p2", "agent": True}]])
+    adapter = Adapter([{"id": "A", "content": "Poprawić adsense tacie", "labels": []}])
+    hermes = ContextFake(replies=[
+        {"A": ["S-ads", "unknown"]},
+        [{"id": "A", "project_id": "P-home", "priority": "p2", "agent": True, "start": "wait",
+          "waiting_for": "dostęp do Google Analytics od taty", "reason": "Bez dostępu nie da się zacząć.",
+          "sessions": ["S-ads"]}]])
     triage.triage_todoist(store, config, hermes, adapter)
     triage.triage_todoist(store, config, hermes, adapter)
+    assert hermes.excerpt_ids == ["S-ads"]  # ids outside the recent list are dropped
+    sent = hermes.prompts[1][1][0]["related_conversations"]
+    assert sent[0]["last_assistant"] == "Czekamy na dostęp do Analytics."
+    assert adapter.applied[0][1]["extra_labels"] == ["czekam"]
     jobs = {job["source"]: job for job in store.rows()}
-    assert "todoist" not in jobs  # labelled, but no agent run yet
+    assert "todoist" not in jobs  # waiting, and auto_start is off anyway
     message = json.loads(jobs["questions"]["payload"])["open_message"]
-    assert "uruchomić go teraz, czy czekasz" in message
+    assert "@czekam" in message and "Czeka na: dostęp do Google Analytics od taty" in message
+    assert "„Google Ads account invitation”" in message and "po Twoim OK" not in message
+
+
+def test_apply_decision_adds_agent_and_wait_labels():
+    from hermes_auto_todoist import apply_decision
+    writes = []
+    task = {"id": "T", "labels": ["AI"]}
+    applied = apply_decision("td", task, {"project_id": "P", "priority": "p2", "agent": True,
+                                          "extra_labels": ["czekam"]}, "hermes",
+                             read=lambda command: {"projectId": "P"}, write=writes.append)
+    assert ["td", "task", "update", "id:T", "--labels", "AI,hermes,czekam"] in writes
+    assert applied["agent"] is True and applied["labels"] == ["hermes", "czekam"]
 
 
 def test_one_full_agent_per_check(store, config):
@@ -338,3 +371,15 @@ def test_one_full_agent_per_check(store, config):
 ])
 def test_read_only_commands(command, allowed):
     assert read_only_command(command) is allowed
+
+
+def test_dated_agent_task_gets_label_only_after_ok(store, config):
+    config["triage"]["todoist"] = {"backlog": True, "settle_minutes": 0}
+    adapter = Adapter([{"id": "A", "content": "Wywiad", "labels": [], "due": {"date": "2026-10-23"}}])
+    hermes = Fake(replies=[[{"id": "A", "project_id": "P-home", "priority": "p2", "agent": True, "start": "now",
+                             "waiting_for": "nic."}]])
+    triage.triage_todoist(store, config, hermes, adapter)
+    triage.triage_todoist(store, config, hermes, adapter)
+    assert adapter.applied[0][1]["agent"] is False  # no label, so the due-date poller cannot start it
+    message = json.loads(store.rows()[-1]["payload"])["open_message"]
+    assert "Wywiad** → Dom · P2 · hermes po OK" in message and "po Twoim OK:** 1 (Wywiad)" in message
