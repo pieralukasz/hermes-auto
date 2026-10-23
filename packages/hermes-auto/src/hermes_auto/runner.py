@@ -15,9 +15,14 @@ def full_tools(job):
 
 def prompt_for(job, config, retry=False):
     if retry:
-        return ("The user explicitly requested continuation of the interrupted preparation. "
-                "Inspect this conversation, avoid repeating completed work, and finish the original request. "
-                "Preparation only; do not send, buy, publish or change external records.")
+        base = ("The user explicitly requested continuation of the interrupted preparation. "
+                "Inspect this conversation, avoid repeating completed work, and finish the original request. ")
+        if job["source"] == "todoist":
+            # The user's standing rule: tick off a Todoist task the agent actually finished.
+            return base + ("Do not send, buy, publish or change other external records. If the task is now "
+                           "actually done, complete this Todoist task (only this occurrence of a recurring task) "
+                           "and read it back; if the result awaits the user's approval, leave it open.")
+        return base + "Preparation only; do not send, buy, publish or change external records."
     full = full_tools(job)
     instructions = {
         "open": "Read this context when the user continues the conversation. No automatic work is required.",
@@ -32,13 +37,20 @@ def prompt_for(job, config, retry=False):
         # Written like the user typing the task into a new Desktop session, plus one unattended note.
         task = json.loads(job["payload"])
         polish = config["language"].lower() in ("polish", "polski", "pl")
+        ref = f" (id:{task['id']})" if task.get("id") else ""
+        # Sending, paying and other records stay gated; ticking off this task once it is really done does not.
         note = ("(Uruchomione automatycznie z mojego zadania w Todoist; nie ma mnie przy komputerze, więc nie "
                 "zadawaj pytań, tylko podejmij rozsądne decyzje i je zaznacz. Niczego nie wysyłaj, nie płać, "
-                "nie zamawiaj i nie zmieniaj zadań ani innych rekordów: przygotuj to do mojej akceptacji.)"
+                "nie zamawiaj, nie publikuj i nie zmieniaj innych zadań ani rekordów: przygotuj to do mojej "
+                f"akceptacji. Gdy faktycznie wykonasz to zadanie{ref}, od razu je odhacz w Todoist (przy "
+                "cyklicznym tylko to wystąpienie) i sprawdź odczytem. Jeśli wynik czeka na moją akceptację, "
+                "np. szkic do wysłania, zostaw zadanie otwarte.)"
                 if polish else
                 "(Started automatically from my Todoist task; I'm away, so don't ask questions: make reasonable "
-                "decisions and say so. Don't send, pay, order or change tasks or other records: prepare them "
-                "for my approval.)")
+                "decisions and say so. Don't send, pay, order, publish or change other tasks or records: prepare "
+                f"them for my approval. Once you have actually done this task{ref}, complete it in Todoist right "
+                "away (only this occurrence if it recurs) and read it back. If the result awaits my approval, "
+                "e.g. a draft to send, leave the task open.)")
         parts = [task.get("content") or job.get("title", ""), task.get("description") or "", note]
         return "\n\n".join(part.strip() for part in parts if part and part.strip())
     if full:

@@ -243,11 +243,14 @@ def test_finish_recurring_only_for_prepared_occurrence():
     import json
     from hermes_auto_todoist import finish_task
     prepared = timed_task("2026-10-03T07:30:00")
-    job = {"external_id": "T1", "payload": json.dumps(prepared)}
+    job = {"external_id": "T1", "payload": json.dumps(prepared), "created": "2026-10-03 05:29:00"}
     writes = []
+
+    def current(date):
+        return lambda command: {"results": []} if "activity" in command else timed_task(date)
     # Same day, only the time changed: still the prepared occurrence.
-    finish_task("td", job, read=lambda command: timed_task("2026-10-03T09:00:00"), write=writes.append)
+    finish_task("td", job, read=current("2026-10-03T09:00:00"), write=writes.append)
     assert len(writes) == 1
     # Already completed in Todoist: the next occurrence must stay open.
-    finish_task("td", job, read=lambda command: timed_task("2026-10-04T07:30:00"), write=writes.append)
+    finish_task("td", job, read=current("2026-10-04T07:30:00"), write=writes.append)
     assert len(writes) == 1

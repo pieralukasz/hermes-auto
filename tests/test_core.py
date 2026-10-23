@@ -227,6 +227,15 @@ def test_prompt_treats_source_as_data(store, config):
         {"content": "Brief", "description": "Sprawdź ceny"})}, {**config, "language": "Polish"})
     assert todo.startswith("Brief\n\nSprawdź ceny\n\n(Uruchomione automatycznie")
     assert "Niczego nie wysyłaj, nie płać" in todo and "automation" not in todo
+    # Standing rule: a task the agent really finished is ticked off; approval-pending work stays open.
+    assert "nie zmieniaj zadań" not in todo and "od razu je odhacz w Todoist" in todo
+    assert "zostaw zadanie otwarte" in todo
+    ided = prompt_for({**job, "source": "todoist", "payload": json.dumps(
+        {"id": "T9", "content": "Brief"})}, {**config, "language": "Polish"})
+    assert "zadanie (id:T9), od razu je odhacz" in ided
+    retry = prompt_for({**job, "source": "todoist"}, config, retry=True)
+    assert "complete this Todoist task" in retry and "Do not send, buy, publish" in retry
+    assert "Preparation only" in prompt_for(job, config, retry=True)
 
 
 def test_todoist_draft_and_research_get_full_tools(store, config):

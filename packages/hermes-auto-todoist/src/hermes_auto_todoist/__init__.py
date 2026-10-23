@@ -124,12 +124,41 @@ def poll_todoist(config, store, run=command_json, now=None):
                              ("todoist_since", json.dumps((dt.date.today() - dt.timedelta(days=1)).isoformat())))
 
 
+def utc_stamp(value):
+    stamp = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00").replace(" ", "T"))
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=dt.timezone.utc)
+
+
+def completed_after(td, task_id, since, read):
+    """Whether Todoist logged a completion of this task at or after `since` (the job's UTC enqueue time)."""
+    start = utc_stamp(since)
+    cursor = None
+    seen_cursors = set()
+    while True:
+        # One day earlier: the activity filter takes a date, possibly in the account's timezone.
+        command = [td, "activity", "--type", "task", "--event", "completed",
+                   "--since", (start.date() - dt.timedelta(days=1)).isoformat(), "--limit", "100", "--json"]
+        if cursor:
+            command += ["--cursor", cursor]
+        page = read(command)
+        for event in items(page):
+            if str(event["objectId"]) == task_id and utc_stamp(event["eventDate"]) >= start:
+                return True
+        cursor = page.get("nextCursor")
+        if not cursor:
+            return False
+        if cursor in seen_cursors:
+            raise RuntimeError("Todoist repeated a pagination cursor")
+        seen_cursors.add(cursor)
+
+
 def finish_task(td, job, read=command_json, write=command_run):
     """Complete the task the user marked done by archiving its session; skip what is already closed.
 
     A recurring task is completed only while it still shows the occurrence this job prepared: its due
-    date then equals the one recorded at enqueue time. After a completion or reschedule in Todoist the
-    due date differs, and completing again would skip a later occurrence the user did not finish.
+    date then equals the one recorded at enqueue time, and Todoist has logged no completion of the task
+    since the job was enqueued (the agent may already have ticked it). Otherwise completing again would
+    close a later occurrence, which can fall on the same day for sub-daily recurrences.
     """
     task_id = job["external_id"]
     # Without --full, td omits `checked` and `isDeleted`.
@@ -144,6 +173,8 @@ def finish_task(td, job, read=command_json, write=command_run):
         prepared = (((json.loads(job["payload"]).get("due")) or {}).get("date") or "")[:10]
         if (due.get("date") or "")[:10] != prepared:
             return "Archived in Hermes; this occurrence was already completed or moved in Todoist"
+        if completed_after(td, task_id, job["created"], read):
+            return "Archived in Hermes; this occurrence was already completed in Todoist"
     write([td, "task", "complete", f"id:{task_id}"])
     return "Archived in Hermes; task completed in Todoist"
 
