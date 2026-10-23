@@ -25,7 +25,22 @@ def config():
             "triage": {"enabled": True, "brief_times": ["07:45", "16:30"]}}
 
 
-class Fake:
+class BackgroundShim:
+    """Background run API over a synchronous `run`: start does the work, collect hands the result back."""
+
+    def start(self, job, prompt):
+        try:
+            return {"result": self.run(job, prompt)}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)}
+
+    def collect(self, handle):
+        if "error" in handle:
+            raise RuntimeError(handle["error"])
+        return handle["result"]
+
+
+class Fake(BackgroundShim):
     """Hermes bridge stand-in: scripted classifier replies, a session table, recorded runs."""
 
     def __init__(self, replies=None, sessions=None, found=None):
@@ -343,7 +358,7 @@ def test_apply_decision_adds_agent_and_wait_labels():
     assert applied["agent"] is True and applied["labels"] == ["hermes", "czekam"]
 
 
-def test_one_full_agent_per_check(store, config):
+def test_all_agents_start_at_once(store, config):
     for key in ("A", "B", "C"):
         store.enqueue(f"todoist:{key}:once", "todoist", key, key, "agent", {"id": key})
     store.enqueue("brief:x", "brief", "x", "Brief", "open", {"open_message": "hej"})
@@ -351,7 +366,7 @@ def test_one_full_agent_per_check(store, config):
     hermes = Fake()
     process_jobs(store, config, hermes)
     status = {job["external_id"]: job["status"] for job in store.rows()}
-    assert status == {"A": "ready", "B": "pending", "C": "pending", "x": "ready"}
+    assert status == {"A": "ready", "B": "ready", "C": "ready", "x": "ready"}
 
 
 @pytest.mark.parametrize("command, allowed", [
@@ -383,7 +398,6 @@ def test_one_full_agent_per_check(store, config):
 ])
 def test_read_only_commands(command, allowed):
     assert read_only_command(command) is allowed
-
 
 def test_dated_agent_task_gets_label_only_after_ok(store, config):
     config["triage"]["todoist"] = {"backlog": True, "settle_minutes": 0}

@@ -116,9 +116,14 @@ class Store:
                         (*fields.values(), job_id))
         self.db.commit()
 
-    def recover(self):
-        self.db.execute("UPDATE jobs SET status='needs_attention', error=? WHERE status IN ('running','creating')",
-                        ("Runner stopped before confirming completion. Inspect session before retrying.",))
+    def recover(self, keep=()):
+        """Jobs left mid-step by a stopped runner need a look; background runs in `keep` are still tracked."""
+        keep = set(keep)
+        for (job_id,) in self.db.execute("SELECT id FROM jobs WHERE status IN ('running','creating')").fetchall():
+            if job_id not in keep:
+                self.db.execute("UPDATE jobs SET status='needs_attention', error=? WHERE id=?",
+                                ("Runner stopped before confirming completion. Inspect session before retrying.",
+                                 job_id))
         self.db.commit()
 
     def new_generation(self, job_id):

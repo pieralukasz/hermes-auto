@@ -158,7 +158,7 @@ def install_launchd(home):
     agent = Path.home() / "Library/LaunchAgents/io.github.hermes-auto.plist"
     payload = {
         "Label": "io.github.hermes-auto", "ProgramArguments": [str(entry), "--home", str(home), "tick"],
-        "RunAtLoad": True, "StartInterval": 60,
+        "RunAtLoad": True, "StartInterval": 60, "AbandonProcessGroup": True,
         "EnvironmentVariables": {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(Path.home())},
         "StandardOutPath": str(home / "service.log"), "StandardErrorPath": str(home / "service.log"),
     }

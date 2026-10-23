@@ -22,7 +22,22 @@ def config():
     return {**defaults(), "sources": {"todoist": {"enabled": True}}}
 
 
-class HermesFake:
+class BackgroundShim:
+    """Background run API over a synchronous `run`: start does the work, collect hands the result back."""
+
+    def start(self, job, prompt):
+        try:
+            return {"result": self.run(job, prompt)}
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)}
+
+    def collect(self, handle):
+        if "error" in handle:
+            raise RuntimeError(handle["error"])
+        return handle["result"]
+
+
+class HermesFake(BackgroundShim):
     def __init__(self):
         self.sessions = {}
         self.calls = []
@@ -125,10 +140,8 @@ def test_source_disable_and_per_run_budget(store, config):
     hermes = HermesFake()
     process_jobs(store, config, hermes, blocked_sources=["todoist"])
     assert not hermes.calls
-    config["max_jobs_per_run"] = 2
-    config["max_agent_jobs_per_run"] = 5
     process_jobs(store, config, hermes)
-    assert len(hermes.calls) == 2
+    assert len(hermes.calls) == 6  # no per-check cap: every due job starts at once
 
 
 def test_user_started_created_session_is_not_automatically_interrupted(store, config):

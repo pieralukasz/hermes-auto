@@ -90,25 +90,47 @@ def source_enabled(job, config):
     return bool(config["sources"].get(job["source"], {}).get("enabled"))
 
 
-def process_jobs(store, config, hermes, blocked_sources=()):
-    store.recover()
-    processed = 0
-    agents = 0
+def collect_runs(store, hermes):
+    """Finish background runs that ended since the last check. Returns the number that failed."""
     failures = 0
+    for job in store.rows():
+        if job["status"] != "running":
+            continue
+        handle = store.get_meta(f"run:{job['id']}")
+        if not handle:
+            continue
+        try:
+            result = hermes.collect(handle)
+        except Exception as exc:
+            failures += 1
+            store.update(job["id"], status="needs_attention", error=str(exc))
+            store.set_meta(f"run:{job['id']}", None)
+            continue
+        if result is None:
+            continue  # still working
+        # Hermes may rotate to a compression continuation. Keep its final durable ID.
+        final_sid = result.get("session_id") or job["session_id"]
+        store.update(job["id"], status="ready", session_id=final_sid, error="")
+        store.set_meta(f"run:{job['id']}", None)
+        # Seen open right after preparation, so a later archive by the user means "done".
+        mark_open(store, job["id"])
+    return failures
+
+
+def process_jobs(store, config, hermes, blocked_sources=()):
+    """Create sessions and start every due run at once, in the background; no queue, no per-check cap.
+
+    Runs are separate processes; the check returns right away and a later check collects results.
+    """
+    running = {job["id"] for job in store.rows() if job["status"] == "running"
+               and store.get_meta(f"run:{job['id']}")}
+    store.recover(keep=running)
+    failures = collect_runs(store, hermes)
     for job in store.rows():
         if job["source"] in blocked_sources or not source_enabled(job, config):
             continue
         if job["status"] not in ("pending", "created", "retry_pending"):
             continue
-        if processed >= config["max_jobs_per_run"]:
-            break
-        heavy = full_tools(job) and job["mode"] != "open"
-        if heavy and agents >= config.get("max_agent_jobs_per_run", 1):
-            # A full agent may take its whole budget; one per check keeps the sorter and short
-            # runs from waiting behind a queue of them. The rest go in the next checks.
-            continue
-        agents += heavy
-        processed += 1
         retry = job["status"] == "retry_pending"
         prompt = prompt_for(job, config, retry)
         try:
@@ -129,13 +151,9 @@ def process_jobs(store, config, hermes, blocked_sources=()):
                 store.update(job["id"], status="ready", error="")
                 continue
             store.update(job["id"], status="running", attempts=job["attempts"] + 1, error="")
-            result = hermes.run(job, prompt)
-            # Hermes may rotate to a compression continuation. Keep its final durable ID.
-            final_sid = result.get("session_id") or job["session_id"]
-            store.update(job["id"], status="ready", session_id=final_sid, error="")
-            # Seen open right after preparation, so a later archive by the user means "done".
-            mark_open(store, job["id"])
+            store.set_meta(f"run:{job['id']}", hermes.start(job, prompt))
         except Exception as exc:
             failures += 1
             store.update(job["id"], status="needs_attention", error=str(exc))
-    return failures
+    # Runs that already ended (fast ones, or failed starts) are settled now rather than next check.
+    return failures + collect_runs(store, hermes)
