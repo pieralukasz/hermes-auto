@@ -196,6 +196,8 @@ def test_todoist_settle_apply_plan_and_run(store, config):
     message = json.loads(jobs["questions"]["payload"])["open_message"]
     assert "Umyć samochód** → Dom · P4" in message and "Blog to bieżący cel." in message
     assert "po Twoim OK:** 1 (Napisać post na bloga)" in message and "1: O czym ma być post?" in message
+    assert "- 1: `td task update id:A --labels hermes --due today`" in message
+    assert "Zadań stąd nie wykonuję" in message
     assert jobs["questions"]["title"] == "Inbox Todoist: posortowane (2)"
     states = dict(store.db.execute("SELECT item_id, decision FROM triage_items").fetchall())
     assert states == {"A": "asked", "B": "moved"}

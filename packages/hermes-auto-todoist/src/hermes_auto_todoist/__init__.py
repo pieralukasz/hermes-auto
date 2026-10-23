@@ -61,7 +61,9 @@ def poll_todoist(config, store, run=command_json, now=None):
     label = config["todoist"]["label"]
     # One label (hermes) runs the full agent. Legacy mode labels still opt in and pick their mode.
     opt_in = " | ".join(f"@{name}" for name in [label, *(f"hermes-{mode}" for mode in MODES)])
-    listed = items(run([td, "task", "list", "--filter", f"({opt_in}) & (today | overdue)", "--all", "--json"]))
+    # Waiting or blocked tasks keep the label but do not start until the label is removed.
+    listed = items(run([td, "task", "list", "--filter",
+                        f"({opt_in}) & (today | overdue) & !@czekam & !@zablokowane", "--all", "--json"]))
     # Before its due time a task is treated like one scheduled later: not yet opted in.
     tasks = [task for task in listed if due_time_reached(task, now)]
     recurring = [t for t in tasks if (t.get("due") or {}).get("isRecurring")]

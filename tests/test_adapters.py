@@ -254,3 +254,10 @@ def test_finish_recurring_only_for_prepared_occurrence():
     # Already completed in Todoist: the next occurrence must stay open.
     finish_task("td", job, read=current("2026-10-04T07:30:00"), write=writes.append)
     assert len(writes) == 1
+
+
+def test_waiting_tasks_are_not_started(store):
+    fake = TodoistFake(task())
+    poll_todoist(CFG, store, fake)
+    query = fake.calls[0][fake.calls[0].index("--filter") + 1]
+    assert query.endswith("& (today | overdue) & !@czekam & !@zablokowane")

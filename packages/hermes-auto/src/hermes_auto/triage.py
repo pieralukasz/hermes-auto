@@ -499,16 +499,25 @@ def render_plan(report, config):
         if why.strip():
             lines.append(f"   {why.strip()}")
         if decision.get("start") == "now":
-            starts.append(f"{number} ({task['content']})")
+            starts.append((number, task))
         if decision.get("question"):
             questions.append(f"- {number}: {decision['question']}")
     if starts:
-        lines += ["", "**Agent może zacząć od razu, po Twoim OK:** " + ", ".join(starts) + "."]
+        lines += ["", "**Agent może zacząć od razu, po Twoim OK:** "
+                  + ", ".join(f"{number} ({task['content']})" for number, task in starts) + "."]
     if questions:
         lines += ["", "**Do doprecyzowania (nie blokuje):**", *questions]
     lines += ["", "Odpowiedz „ok” albo zmiany, np. „3 p2, 5 do Dom, 2 nie uruchamiaj, 4 czekam na Szymona”. "
-                  "Wprowadzę je w Todoist (td CLI, skill lukasz-todoist-tasks) i sprawdzę odczytem. Zadaniom do "
-                  "uruchomienia dodam `hermes` i datę na dziś, a automat otworzy każdemu osobną sesję."]
+                  "Każde uruchomione zadanie dostanie własną, nową sesję; ta służy tylko do planu."]
+    commands = [f"- {number}: `td task update id:{task['id']} --labels "
+                f"{','.join(sorted({*task.get('labels', []), 'hermes'}))} --due today`"
+                for number, task in starts]
+    lines += ["", "<details><summary>Jak wykonam Twoją odpowiedź</summary>", "",
+              "W tej sesji zmieniam tylko Todoist (td CLI, skill lukasz-todoist-tasks) i sprawdzam odczytem "
+              "(`td task view id:… --json`). Zadań stąd nie wykonuję, nawet po „ok”: uruchomienie to etykieta "
+              "`hermes` plus data na dziś, a automat w ciągu ok. 10 minut otworzy każdemu osobną sesję. "
+              "`--labels` zastępuje etykiety, więc zachowuję obecne. „czekam” = dodaję `czekam`. "
+              "Przy „ok” wykonuję dokładnie:", *(commands or ["- (nic do uruchomienia)"]), "", "</details>"]
     return "\n".join(lines)
 
 
