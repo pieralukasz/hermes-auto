@@ -241,7 +241,7 @@ def parser():
         item = commands.add_parser(name, help="Explicitly continue a failed job" if name == "retry" else
                                    "Explicitly create a fresh conversation for an existing event")
         item.add_argument("job_id", type=int)
-    again = commands.add_parser("retry-followup", help="Explicitly re-deliver a failed reply into its session")
+    again = commands.add_parser("retry-followup", help="Explicitly retry a failed reply (opens a new session)")
     again.add_argument("followup_id", type=int)
     commands.add_parser("install-launchd", help="Install a macOS user service")
     commands.add_parser("backup", help="Write a consistent backup of automation state")
@@ -341,7 +341,7 @@ def dispatch(args, home, config, store):
         print("Queued. Run 'hermes-auto run' or wait for the next scheduled check.")
     elif command == "retry-followup":
         retry_followup(store, Hermes(config, home), args.followup_id)
-        print("Queued into the same session. Run 'hermes-auto run' or wait for the next scheduled check.")
+        print("Queued; it opens a new session. Run 'hermes-auto run' or wait for the next scheduled check.")
     elif command == "triage-preview":
         with tempfile.TemporaryDirectory(prefix="hermes-auto-preview-") as directory:
             preview = Store(Path(directory), initialize=True)
