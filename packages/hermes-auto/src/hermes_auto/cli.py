@@ -62,6 +62,7 @@ def run_triage(config, store, bridge, installed, blocked=()):
         except Exception as exc:
             errors.append(f"triage {name}: {exc}")
     todoist = installed.get("todoist")
+    adapter = None
     if (options["todoist"]["enabled"] and config["sources"].get("todoist", {}).get("enabled")
             and "todoist" not in blocked and todoist is not None and hasattr(todoist, "inbox_tasks")):
         # Separate steps: the sorter raises after queuing its plan when a stored decision still fails to apply
@@ -81,7 +82,10 @@ def run_triage(config, store, bridge, installed, blocked=()):
                 errors.append(f"{step}: {exc}")
     if store.db.execute("SELECT 1 FROM followups WHERE status IN ('pending','retry_pending')").fetchone():
         failures += triage.process_followups(store, config, bridge())
-    triage.maybe_brief(store, config)
+    try:
+        triage.maybe_brief(store, config, hermes=bridge, adapter=adapter)
+    except Exception as exc:  # noqa: BLE001 - a failed section source retries at the next check
+        errors.append(f"brief: {exc}")
     return errors, failures
 
 

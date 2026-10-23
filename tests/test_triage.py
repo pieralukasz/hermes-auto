@@ -1,5 +1,7 @@
 import datetime as dt
 import json
+import re
+import sys
 import sqlite3
 
 import pytest
@@ -550,3 +552,70 @@ def test_mail_already_read_opens_nothing(store, config):
     assert hermes.prompts == [] and hermes.queries == []  # no model call, no session lookup
     assert store.rows() == [] and store.db.execute("SELECT COUNT(*) FROM followups").fetchone()[0] == 0
     assert store.db.execute("SELECT MIN(briefed) FROM triage_items").fetchone()[0] == 1  # not in the brief
+
+
+def section_source(tmp_path, payload, fail_flag=None):
+    script = tmp_path / "section.py"
+    script.write_text(
+        "import json, os, sys, pathlib\n"
+        f"flag = {str(fail_flag)!r}\n"
+        "if flag != 'None' and pathlib.Path(flag).exists():\n"
+        "    sys.exit(3)\n"
+        "data = json.loads(" + repr(json.dumps(payload)) + ")\n"
+        "data['summary'] = data['summary'].replace('SINCE', os.environ.get('SINCE') or 'none')\n"
+        "print('noise'); print(json.dumps(data))\n")
+    return {"name": "Sure", "command": [sys.executable, str(script)], "times": ["07:45"]}
+
+
+SURE = {"title": "Sure", "summary": "3 nowe transakcje od SINCE", "lines": ["Najwięcej: Zakupy 50 zł."],
+        "questions": [{"text": "ORLEN 87,00 zł (PKO, 22.10)", "reason": "kategoria zależy od zakupu", "proposal": None},
+                      {"text": "Top-Up 1 000,00 zł", "reason": "bez kategorii", "proposal": "Wkład Julii?"}],
+        "categories": ["Transport › Paliwo i auto", "Wkład Julii"], "propose_prompt": "Zaproponuj kategorię.",
+        "context": "Karta *3727 to własna karta PKO Visa.",
+        "evidence": [{"id": "sure:1", "from": "Sure (PKO)", "subject": "Wpływ 500,00 zł", "date": "2026-10-23",
+                      "body": "Tata zwrot"}],
+        "agent_note": "Wykonuj według skilla lukasz-sure-finance. Entry id: 1=11, 2=12"}
+
+
+def test_brief_section_from_source_with_proposals_and_waiting_check(store, config, tmp_path):
+    config["triage"]["brief_sources"] = [section_source(tmp_path, SURE)]
+    hermes = Fake(replies=[[{"i": 0, "proposal": "Paliwo i auto? (inaczej Restauracje i kawiarnie)"}], []])
+    adapter = WaitingAdapter([{"id": "W", "content": "Zwrot od taty", "labels": ["czekam"], "projectId": "P-home"}])
+    title = triage.maybe_brief(store, config, now=dt.datetime(2026, 10, 24, 8, 0), hermes=lambda: hermes,
+                               adapter=adapter)
+    assert title == "Brief 24.10 07:45"
+    message = json.loads(store.rows()[-1]["payload"])["open_message"]
+    message = re.sub(r"\\(.)", r"\1", message)  # markdown escapes render as plain characters
+    assert "## Sure" in message and "3 nowe transakcje od none" in message and "Najwięcej: Zakupy" in message
+    assert "1. ORLEN 87,00 zł (PKO, 22.10): **Paliwo i auto? (inaczej Restauracje i kawiarnie)**" in message
+    assert "2. Top-Up 1 000,00 zł: **Wkład Julii?** (bez kategorii)" in message
+    assert "<!--" in message and "Entry id: 1=11" in message
+    assert "Karta *3727 to własna karta" in hermes.prompts[0][0]  # earlier decisions reach the proposer
+    assert hermes.prompts[1][1]["mails"][0]["subject"] == "Wpływ 500,00 zł"  # inflows checked against @czekam
+    assert store.get_meta("brief_source_since:Sure") and not store.get_meta("brief_source_due:Sure")
+    # Next morning SINCE is the previous success.
+    triage.maybe_brief(store, config, now=dt.datetime(2026, 10, 25, 8, 0), hermes=lambda: Fake(replies=[[], []]),
+                       adapter=adapter)
+    assert "od 2026-" in json.loads(store.rows()[-1]["payload"])["open_message"]
+
+
+def test_failed_section_source_retries_and_posts_alone(store, config, tmp_path):
+    flag = tmp_path / "down"
+    flag.write_text("x")
+    quiet = {**SURE, "questions": [], "evidence": [], "lines": []}
+    config["triage"]["brief_sources"] = [section_source(tmp_path, quiet, fail_flag=flag)]
+    with pytest.raises(RuntimeError):
+        triage.maybe_brief(store, config, now=dt.datetime(2026, 10, 24, 8, 0))
+    assert store.rows() == [] and store.get_meta("brief_source_due:Sure") is True
+    flag.unlink()
+    assert triage.maybe_brief(store, config, now=dt.datetime(2026, 10, 24, 8, 10)) is None
+    job = store.rows()[-1]
+    assert job["title"] == "Brief 24.10 08:10" and "## Sure" in json.loads(job["payload"])["open_message"]
+    assert triage.maybe_brief(store, config, now=dt.datetime(2026, 10, 24, 8, 20)) is None
+    assert len(store.rows()) == 1  # posted once
+
+
+def test_quiet_section_source_adds_nothing(store, config, tmp_path):
+    config["triage"]["brief_sources"] = [section_source(tmp_path, {"title": "Sure", "summary": "", "questions": []})]
+    assert triage.maybe_brief(store, config, now=dt.datetime(2026, 10, 24, 8, 0)) is None
+    assert store.rows() == []
