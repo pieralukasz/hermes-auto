@@ -199,11 +199,12 @@ def test_todoist_settle_apply_plan_and_run(store, config):
     report = triage.triage_todoist(store, config, hermes, adapter, now=start)
     assert [task["id"] for task, _, _ in report] == ["A", "B"]
     assert adapter.applied[1][1]["section_id"] is None  # unknown section dropped
+    assert adapter.applied[1][1]["priority"] == "p3"  # p4 would loop back into Do organizacji
     assert report[1][1]["start"] == "later"  # not an agent task, so nothing to start
     jobs = {job["source"]: job for job in store.rows()}
     assert json.loads(jobs["todoist"]["payload"])["triage_run"] is True
     message = json.loads(jobs["questions"]["payload"])["open_message"]
-    assert "Umyć samochód** → Dom · P4" in message and "Blog to bieżący cel." in message
+    assert "Umyć samochód** → Dom · P3" in message and "Blog to bieżący cel." in message
     assert "po Twoim OK:** 1 (Napisać post na bloga)" in message and "1: O czym ma być post?" in message
     assert "- 1: td task update id:A --labels hermes --due today" in message
     assert "Zadań stąd nie wykonuję" in message
