@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -56,25 +57,73 @@ def desktop_parity(agent_class):
     agent_class.__init__ = desktop_init
 
 
-def deny_tool_execution(agent_class, allowed=frozenset()):
-    """Keep the session's normal tool list (and so its stored prompt) but refuse to execute tools.
+SHELL_META = set(";|&<>`$\n\r\\(){}")
+GOOGLE_API = "/skills/productivity/google-workspace/scripts/google_api.py"
+GOOGLE_READS = {("calendar", "list"), ("gmail", "search"), ("gmail", "get"), ("gmail", "labels")}
+TODOIST_READS = {("today",), ("upcoming",), ("inbox",), ("completed",), ("activity",),
+                 ("task", "list"), ("task", "view"), ("project", "list"), ("project", "view"),
+                 ("section", "list"), ("label", "list"), ("filter", "list"), ("filter", "view")}
+READ_TOOLS = frozenset({"skill_view", "skills_list", "session_search"})
 
-    Used when third-party mail enters a conversation: the model may ask for a tool, every call
-    outside `allowed` gets an error result instead of running, and the turn continues. Filtering
-    the tool list instead would rebuild the stored system prompt with a reduced toolset, and the
-    user's later turns in that session would lose their tools.
+
+def read_only_command(command):
+    """True only for a single plain read command: calendar/Gmail reads via the Google script, Todoist reads.
+
+    No shell syntax at all (pipes, redirects, substitutions, chaining), so the allowed program is the
+    only thing that runs. Anything else is refused, however harmless it looks.
+    """
+    import shlex
+    text = str(command or "").strip()
+    # Single-quoted text is literal in sh (Todoist filters use `|` and `&`); everything else may not
+    # contain shell syntax.
+    bare = re.sub(r"'[^']*'", "''", text)
+    if not text or "'" in bare.replace("''", "") or SHELL_META & set(bare):
+        return False
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    program = Path(tokens[0]).name
+    if program == "td":
+        return any(tuple(tokens[1:1 + len(read)]) == read for read in TODOIST_READS)
+    if program in ("python", "python3") and len(tokens) >= 4 and tokens[1].endswith(GOOGLE_API):
+        return (tokens[2], tokens[3]) in GOOGLE_READS
+    return False
+
+
+def deny_tool_execution(agent_class, allowed=READ_TOOLS):
+    """Keep the session's normal tool list (and so its stored prompt) but execute only reads.
+
+    Used when third-party mail enters a conversation: every call outside `allowed`, and every
+    terminal command that is not a plain read (`read_only_command`), gets an error result instead
+    of running, and the turn continues. Filtering the tool list instead would rebuild the stored
+    system prompt with a reduced toolset, and the user's later turns in that session would lose
+    their tools.
     """
     from agent.turn_tool_validation import _append_tool_error_results
     original = agent_class._execute_tool_calls
 
+    def permitted(call):
+        name = call.function.name
+        if name in allowed:
+            return True
+        if name != "terminal":
+            return False
+        try:
+            arguments = json.loads(call.function.arguments or "{}")
+        except (TypeError, ValueError):
+            return False
+        return not arguments.get("background") and read_only_command(arguments.get("command"))
+
     def guarded(self, assistant_message, messages, *args, **kwargs):
         calls = list(getattr(assistant_message, "tool_calls", None) or [])
-        blocked = [call for call in calls if call.function.name not in allowed]
-        if not blocked:
+        if all(permitted(call) for call in calls):
             return original(self, assistant_message, messages, *args, **kwargs)
         _append_tool_error_results(messages, calls, lambda call: json.dumps({
-            "error": "Tools are disabled for this automatic step (third-party mail). "
-                     "Answer from the conversation and the message only."}))
+            "error": "Only reads are allowed in this automatic step (third-party mail): calendar list, "
+                     "gmail search/get, td list/view/today, session_search, skills. Nothing ran in this batch."}))
         return None
 
     agent_class._execute_tool_calls = guarded
@@ -273,9 +322,9 @@ def main():
     cli.CLI_CONFIG["approvals"] = {"mode": "manual", "single_query_mode": "deny"}
     if request.get("deny_tools"):
         # Third-party mail inside a normal session: the session keeps its full toolset and prompt,
-        # nothing but skill lookups executes during this turn.
+        # only plain reads (calendar, Gmail search/get, Todoist, past sessions, skills) execute.
         desktop_parity(AIAgent)
-        deny_tool_execution(AIAgent, frozenset({"skill_view", "skills_list"}))
+        deny_tool_execution(AIAgent)
         cli.main(query=request["prompt"], resume=sid, quiet=True, oneshot=True, output_format="stream-json",
                  max_turns=config["max_turns"], run_budget=config["run_budget_seconds"])
         return
