@@ -235,41 +235,145 @@ def session_excerpts(db_path, request):
     return out
 
 
-def find_session(db_path, request):
-    """Which Hermes session sent the message this reply answers? Read-only, newest send first.
+GOOGLE_SENDS = {("gmail", "send"), ("gmail", "reply")}
+# Quoted text the shell takes literally: single quotes, and double quotes without $, ` or \.
+LITERAL_QUOTES = re.compile(r"'[^']*'|\"[^\"$`\\\\]*\"")
 
-    A send from a session leaves the subject or the recipient in that session's tool calls or
-    results within minutes of Gmail/Proton recording it as sent. Searching a bounded rowid window
-    around each send time keeps this to a few thousand rows instead of the whole history.
+
+def google_send_command(command):
+    """True only for one plain `python …/google_api.py gmail send|reply …` invocation.
+
+    The Google Workspace skill script is the only known sender (`gmail send` / `gmail reply`; both
+    print `{"status": "sent", "id": …, "threadId": …}`). Anything else (drafts, other tools, reads,
+    chained or substituted shell) is not a send this function recognises, so routing fails closed.
+    """
+    import shlex
+    text = str(command or "").strip()
+    bare = LITERAL_QUOTES.sub("''", text)
+    if not text or "'" in bare.replace("''", "") or '"' in bare or SHELL_META & set(bare):
+        return False
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        return False
+    return (len(tokens) >= 4 and re.fullmatch(r"python3?(\.\d+)?", Path(tokens[0]).name) is not None
+            and tokens[1].endswith(GOOGLE_API) and (tokens[2], tokens[3]) in GOOGLE_SENDS)
+
+
+def send_calls(tool_calls):
+    """{tool_call_id} of recognised send invocations in an assistant row's tool_calls JSON."""
+    try:
+        calls = json.loads(tool_calls or "[]")
+    except (TypeError, ValueError):
+        return set()
+    found = set()
+    for call in calls if isinstance(calls, list) else []:
+        function = call.get("function") if isinstance(call, dict) else None
+        if not isinstance(function, dict) or function.get("name") != "terminal" or not call.get("id"):
+            continue
+        arguments = function.get("arguments")
+        try:
+            arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
+        except ValueError:
+            continue
+        if (isinstance(arguments, dict) and not arguments.get("background")
+                and google_send_command(arguments.get("command"))):
+            found.add(str(call["id"]))
+    return found
+
+
+def send_receipt(content, thread_id, message_ids):
+    """True when a terminal result is exactly a successful Gmail send receipt for this thread
+    (receipt threadId) or for one of the user's sent messages (receipt id)."""
+    try:
+        outer = json.loads(content or "")
+        receipt = json.loads(str(outer.get("output") or "").strip()) if isinstance(outer, dict) else None
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(receipt, dict) or outer.get("exit_code") != 0 or receipt.get("status") != "sent":
+        return False
+    return bool((thread_id and receipt.get("threadId") == thread_id)
+                or (receipt.get("id") and str(receipt["id"]) in message_ids))
+
+
+def provenance_sessions(rows, thread_id, message_ids):
+    """Sessions holding a recognised send call AND its successful receipt (same session, same
+    tool_call_id). A receipt without its call, a call without its receipt, or any read never counts."""
+    calls = {}
+    for session_id, role, content, tool_calls, tool_call_id in rows:
+        if role == "assistant":
+            for call_id in send_calls(tool_calls):
+                calls[call_id] = session_id
+    return {session_id for session_id, role, content, tool_calls, tool_call_id in rows
+            if role == "tool" and tool_call_id and calls.get(str(tool_call_id)) == session_id
+            and send_receipt(content, thread_id, message_ids)}
+
+
+def find_session(db_path, request):
+    """Which Hermes session sent the message this reply answers? Read-only; fails closed.
+
+    Only a parsed send action with its correlated success receipt naming this thread (or the sent
+    message) counts, within a bounded window around each send time (see `provenance_sessions`).
+    Subjects, recipients, prose and reads are no proof: the user may have replied by hand. Mail
+    sent any other way is not routed. If more than one session shows provenance, nothing is returned.
     """
     import sqlite3
     conn = sqlite3.connect(Path(db_path).as_uri() + "?mode=ro", uri=True, timeout=10)
     try:
-        subject = normalized_subject(request.get("subject"))
-        needles = [value for value in (request.get("thread_id"), subject if len(subject) >= 6 else "")
-                   if value]
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+        if not {"role", "content", "tool_calls", "tool_call_id", "timestamp", "session_id"} <= columns:
+            return None
+        thread_id = str(request.get("thread_id") or "")
+        thread_id = thread_id if len(thread_id) >= 6 else ""
+        excluded = set(request.get("exclude", []))
         for sent in sorted(request.get("sent", []), key=lambda item: -item["ts"]):
+            message_ids = {str(sent["id"])} if sent.get("id") else set()
+            if not thread_id and not message_ids:
+                continue
             first = rowid_at(conn, sent["ts"] - 1800)
             last = rowid_at(conn, sent["ts"] + 300)
-            terms = needles + [address for address in sent.get("to", []) if "@" in address]
-            if not terms:
-                continue
-            clauses = " OR ".join("instr(coalesce(content,''),?) OR instr(coalesce(tool_calls,''),?)"
-                                  for _ in terms)
-            params = [value for term in terms for value in (term, term)]
             rows = conn.execute(
-                f"SELECT session_id, timestamp FROM messages WHERE id BETWEEN ? AND ? AND ({clauses})",
-                (first, last, *params)).fetchall()
-            sessions = {}
-            for session_id, timestamp in rows:
-                distance = abs(timestamp - sent["ts"])
-                sessions[session_id] = min(sessions.get(session_id, distance), distance)
-            excluded = set(request.get("exclude", []))
-            ranked = sorted((distance, session_id) for session_id, distance in sessions.items()
-                            if session_id not in excluded)
-            if ranked:
-                return ranked[0][1]
+                "SELECT session_id, role, content, tool_calls, tool_call_id FROM messages WHERE id BETWEEN ? "
+                "AND ? AND timestamp BETWEEN ? AND ? AND role IN ('tool','assistant') ORDER BY id",
+                (first, last, sent["ts"] - 1800, sent["ts"] + 300)).fetchall()
+            sessions = provenance_sessions(rows, thread_id, message_ids) - excluded
+            if len(sessions) == 1:
+                return sessions.pop()
+            if sessions:
+                return None  # Ambiguous: never guess which conversation gets a third party's reply.
         return None
+    finally:
+        conn.close()
+
+
+def delivery_scope(db, session_id):
+    """Every session id the conversation spans: the whole compression lineage (root to live tip)
+    plus the resume target. None when Hermes cannot tell, so a retry is refused rather than guessed."""
+    try:
+        lineage = list(db.get_compression_lineage(session_id) or [])
+        tip = db.resolve_resume_session_id(session_id)
+        if tip and tip not in lineage:
+            lineage += list(db.get_compression_lineage(tip) or []) or [tip]
+    except Exception:  # noqa: BLE001 - a missing or failing lineage API is no proof of absence
+        return None
+    ids = list(dict.fromkeys([session_id, *lineage]))
+    return ids if lineage else None
+
+
+def reply_delivered(db_path, session_ids, needles):
+    """Read-only: does one user message in these sessions contain every needle (a routed reply's
+    date and sender)? Independent of how the prompt framed the mail."""
+    import sqlite3
+    ids = [sid for sid in dict.fromkeys(session_ids) if sid]
+    needles = [str(needle) for needle in needles or [] if needle]
+    if not needles or not ids:
+        return False
+    conn = sqlite3.connect(Path(db_path).as_uri() + "?mode=ro", uri=True, timeout=10)
+    try:
+        marks = ",".join("?" for _ in ids)
+        found = " AND ".join("instr(coalesce(content,''), ?) > 0" for _ in needles)
+        return conn.execute(f"SELECT 1 FROM messages WHERE session_id IN ({marks}) AND role='user' AND {found} "
+                            "LIMIT 1", (*ids, *needles)).fetchone() is not None
     finally:
         conn.close()
 
@@ -300,6 +404,8 @@ def main():
         from agent.auxiliary_client import call_llm
         assert callable(_append_tool_error_results) and callable(call_llm)
         assert callable(db.set_session_hidden) and callable(db.set_session_archived)
+        # Delivery guard of retry-followup reads the whole compression lineage.
+        assert callable(db.get_compression_lineage) and callable(db.resolve_resume_session_id)
         print(json.dumps({"ok": True, "python": sys.executable, "source": config["hermes_source"]}))
         db.close()
         return
@@ -331,10 +437,17 @@ def main():
         return
     session = db.get_session(sid)
     if action == "inspect":
-        print(json.dumps({"exists": session is not None,
-                          "messages": session.get("message_count", 0) if session else 0,
-                          "archived": bool(session.get("archived")) if session else False,
-                          "last_active": session.get("last_activity_at") if session else None}))
+        info = {"exists": session is not None,
+                "messages": session.get("message_count", 0) if session else 0,
+                "archived": bool(session.get("archived")) if session else False,
+                "last_active": session.get("last_activity_at") if session else None}
+        if request.get("needles"):
+            # Retry of an interrupted reply: was its text already appended anywhere in the compression
+            # lineage? None (unknown) when the lineage cannot be read; the caller then refuses.
+            ids = delivery_scope(db, sid) if session is not None else None
+            info["delivered"] = (reply_delivered(Path(config["hermes_home"]) / "state.db", ids, request["needles"])
+                                 if ids else None)
+        print(json.dumps(info))
         db.close()
         return
     if action == "unarchive":

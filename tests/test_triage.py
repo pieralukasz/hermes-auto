@@ -245,7 +245,7 @@ def test_json_and_subject_helpers():
         parse_json_block("no json here")
 
 
-def test_find_session_prefers_nearest_send(tmp_path):
+def test_find_session_rejects_legacy_rows_without_roles(tmp_path):
     path = tmp_path / "state.db"
     db = sqlite3.connect(path)
     db.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, content TEXT, "
@@ -259,12 +259,13 @@ def test_find_session_prefers_nearest_send(tmp_path):
     db.commit()
     db.close()
     query = {"subject": "Re: Filmy AI 2102", "sent": [{"ts": 5020.0, "to": ["dad@example.test"]}]}
-    assert find_session(path, query) == "S-send"
+    assert find_session(path, query) is None
     assert find_session(path, {"subject": "Nic", "sent": [{"ts": 5020.0, "to": []}]}) is None
-    assert find_session(path, {**query, "exclude": ["S-send"]}) == "S-mention"
+    assert find_session(path, {**query, "exclude": ["S-send"]}) is None
 
 
-def test_linkedin_messages_from_one_person_share_a_session(store, config):
+def test_linkedin_messages_in_separate_threads_are_separate_conversations(store, config):
+    # Contract (review cycle 1): a display name is no identity; only the provider thread id groups mail.
     hermes = Fake(replies=[[{"i": 0, "decision": "session", "reason": "", "summary": ""},
                             {"i": 1, "decision": "session", "reason": "", "summary": ""}]])
     first = mail("L1", "X1", sender="Marta Syldatk via LinkedIn <messaging-digest-noreply@linkedin.com>",
@@ -272,10 +273,8 @@ def test_linkedin_messages_from_one_person_share_a_session(store, config):
     second = mail("L2", "X2", sender="Marta Syldatk via LinkedIn <messaging-digest-noreply@linkedin.com>",
                   subject="Marta just messaged you")
     triage.triage_mail(store, config, hermes, "proton", "me@example.test", [first, second])
-    jobs = store.rows()
-    assert len(jobs) == 1
-    follow = store.db.execute("SELECT session_id FROM followups").fetchone()
-    assert follow[0] == jobs[0]["session_id"]
+    assert len(store.rows()) == 2
+    assert store.db.execute("SELECT COUNT(*) FROM followups").fetchone()[0] == 0
     assert triage.conversation_id(mail("Z", "T", sender="LinkedIn <messages-noreply@linkedin.com>")) == "T"
 
 
@@ -325,10 +324,20 @@ def test_plan_waits_with_context_and_does_not_start(store, config):
 def test_apply_decision_adds_agent_and_wait_labels():
     from hermes_auto_todoist import apply_decision
     writes = []
-    task = {"id": "T", "labels": ["AI"]}
+    task = {"id": "T", "labels": ["AI"], "priority": 1, "projectId": "inbox"}
+
+    def write(command):
+        writes.append(command)
+        if "--labels" in command:
+            task["labels"] = command[command.index("--labels") + 1].split(",")
+        if "--priority" in command:
+            task["priority"] = 3
+        if "--project" in command:
+            task["projectId"] = "P"
+
     applied = apply_decision("td", task, {"project_id": "P", "priority": "p2", "agent": True,
                                           "extra_labels": ["czekam"]}, "hermes",
-                             read=lambda command: {"projectId": "P"}, write=writes.append)
+                             read=lambda command: dict(task), write=write)
     assert ["td", "task", "update", "id:T", "--labels", "AI,hermes,czekam"] in writes
     assert applied["agent"] is True and applied["labels"] == ["hermes", "czekam"]
 

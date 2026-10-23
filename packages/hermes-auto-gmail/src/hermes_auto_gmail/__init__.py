@@ -7,6 +7,9 @@ from email.utils import getaddresses, parseaddr
 
 from hermes_auto.streams import deactivate_missing, observe_stream
 
+# Messages stamped this far before the cursor are re-read and de-duplicated by id.
+OVERLAP_MS = 120_000
+
 
 def text_parts(payload):
     text = []
@@ -57,28 +60,55 @@ class Gmail:
         key = f"triage_cursor:gmail:{account}"
         cursor = since_ms if since_ms is not None else store.get_meta(key)
         if cursor is None:
-            return [], key, int(time.time() * 1000)
-        ids, page_token = [], None
+            return [], key, {"ms": int(time.time() * 1000), "seen": {}}
+        if isinstance(cursor, dict):
+            # The cursor keeps the ids handed over in the overlap window, so a message stamped at or
+            # slightly before the last hand-over is still read once and only once.
+            mark, seen = int(cursor["ms"]), {str(k): int(v) for k, v in cursor.get("seen", {}).items()}
+            floor = mark - OVERLAP_MS
+        else:
+            # A plain timestamp (preview window or a cursor from an older version): read from it on.
+            mark, seen = int(cursor), {}
+            floor = mark
+        # Read every page: the oldest messages come last and must not be cut off.
+        ids = self.list_ids(f"in:inbox after:{floor // 1000 - 1}")
+        fresh = []
+        for message_id in ids:
+            if message_id in seen:
+                continue
+            stamp = int(self.get(f"messages/{message_id}", format="minimal").get("internalDate") or 0)
+            if stamp >= floor:
+                fresh.append((stamp, message_id))
+        fresh.sort()
+        # Hand over at most `limit` messages, oldest first; the rest wait for the next run.
+        fresh = fresh[:limit]
+        candidates = []
+        for _, message_id in fresh:
+            item = self.candidate(account, self.get(f"messages/{message_id}", format="full"), own)
+            if item:
+                candidates.append(item)
+        if not fresh:
+            return candidates, key, cursor
+        handed = {**seen, **{message_id: stamp for stamp, message_id in fresh}}
+        mark = max(mark, fresh[-1][0])
+        window = {message_id: stamp for message_id, stamp in handed.items() if stamp >= mark - OVERLAP_MS}
+        return candidates, key, {"ms": mark, "seen": window}
+
+    def list_ids(self, query):
+        """All message ids matching `query`, across every page; a repeated page token is an error."""
+        ids, page_token, tokens = {}, None, set()
         while True:
-            params = {"q": f"in:inbox after:{int(cursor / 1000) - 120}", "maxResults": 100}
+            params = {"q": query, "maxResults": 100}
             if page_token:
                 params["pageToken"] = page_token
             page = self.get("messages", **params)
-            ids.extend(item["id"] for item in page.get("messages", []))
+            ids.update(dict.fromkeys(item["id"] for item in page.get("messages", [])))
             page_token = page.get("nextPageToken")
-            if not page_token or len(ids) >= 500:
-                break
-        fresh = []
-        for message_id in ids:
-            message = self.get(f"messages/{message_id}", format="full")
-            stamp = int(message.get("internalDate") or 0)
-            if stamp > cursor:
-                fresh.append((stamp, message))
-        fresh.sort(key=lambda pair: pair[0])
-        # Hand over at most `limit` messages; the cursor stops at the last one handed over.
-        fresh = fresh[:limit]
-        candidates = [item for item in (self.candidate(account, message, own) for _, message in fresh) if item]
-        return candidates, key, fresh[-1][0] if fresh else cursor
+            if not page_token:
+                return list(ids)
+            if page_token in tokens:
+                raise RuntimeError("Gmail returned a repeated page token; cursor was not advanced")
+            tokens.add(page_token)
 
     def candidate(self, account, message, own):
         labels = set(message.get("labelIds", []))

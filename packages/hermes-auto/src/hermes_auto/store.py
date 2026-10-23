@@ -119,6 +119,11 @@ class Store:
     def recover(self):
         self.db.execute("UPDATE jobs SET status='needs_attention', error=? WHERE status IN ('running','creating')",
                         ("Runner stopped before confirming completion. Inspect session before retrying.",))
+        # A reply that was running may already be in its session: never replay it on its own.
+        self.db.execute("UPDATE followups SET status='needs_attention', error=?, updated=CURRENT_TIMESTAMP "
+                        "WHERE status='running'",
+                        ("Runner stopped before confirming the reply reached its session. Inspect the session, "
+                         "then use retry-followup.",))
         self.db.commit()
 
     def new_generation(self, job_id):

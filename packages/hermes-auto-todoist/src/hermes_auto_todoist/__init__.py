@@ -227,12 +227,9 @@ def apply_decision(td, task, decision, agent_label, read=command_json, write=com
     """Move, prioritise and label one Inbox task; read it back. Returns what was changed."""
     applied = {}
     ref = f"id:{task['id']}"
-    if decision.get("project_id"):
-        command = [td, "task", "move", ref, "--project", f"id:{decision['project_id']}"]
-        if decision.get("section_id"):
-            command += ["--section", f"id:{decision['section_id']}"]
-        write(command)
-        applied["project_id"] = decision["project_id"]
+    task = read([td, "task", "view", ref, "--full", "--json"])
+    if task.get("checked") or task.get("isDeleted"):
+        raise RuntimeError(f"Task {task['id']} is no longer active")
     if decision.get("priority"):
         write([td, "task", "update", ref, "--priority", decision["priority"]])
         applied["priority"] = decision["priority"]
@@ -243,13 +240,25 @@ def apply_decision(td, task, decision, agent_label, read=command_json, write=com
     if added:
         write([td, "task", "update", ref, "--labels", ",".join(labels + added)])
         applied["labels"] = added
-    if decision.get("agent") and agent_label in added:
+    if decision.get("agent"):
         applied["agent"] = True
         # No due date: the scheduled poller would never pick it up, so the sorter may start it itself.
         applied["run"] = not task.get("due") and not recurring
+    if decision.get("project_id"):
+        command = [td, "task", "move", ref, "--project", f"id:{decision['project_id']}"]
+        if decision.get("section_id"):
+            command += ["--section", f"id:{decision['section_id']}"]
+        write(command)
+        applied["project_id"] = decision["project_id"]
     current = read([td, "task", "view", ref, "--full", "--json"])
     if decision.get("project_id") and str(current.get("projectId")) != decision["project_id"]:
         raise RuntimeError(f"Task {task['id']} did not move; check Todoist")
+    if decision.get("section_id") and str(current.get("sectionId")) != decision["section_id"]:
+        raise RuntimeError(f"Task {task['id']} section was not updated")
+    if decision.get("priority") and current.get("priority") != 5 - int(decision["priority"][1]):
+        raise RuntimeError(f"Task {task['id']} priority was not updated")
+    if not set(labels + added).issubset(current.get("labels", [])):
+        raise RuntimeError(f"Task {task['id']} labels were not preserved")
     return applied
 
 
@@ -261,6 +270,9 @@ class Source:
 
     def inbox_tasks(self, settings):
         return inbox_tasks(settings["command"])
+
+    def task(self, settings, task_id):
+        return command_json([settings["command"], "task", "view", f"id:{task_id}", "--full", "--json"])
 
     def outline(self, settings, store, max_age_hours=24):
         cached = store.get_meta("todoist_outline")

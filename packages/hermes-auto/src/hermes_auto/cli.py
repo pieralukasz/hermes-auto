@@ -128,6 +128,46 @@ def triage_preview(config, store, home, days):
     return report
 
 
+def retry_followup(store, hermes, followup_id):
+    """Queue a failed reply again, into the same session, only after inspecting that session.
+
+    Refuses when the session is gone (never recreated here) or already holds the reply's text (an
+    interrupted run may have delivered it; replaying would duplicate it). Nothing runs now.
+    """
+    from .triage import one_line
+    row = store.db.execute("SELECT * FROM followups WHERE id=?", (followup_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"No followup {followup_id}")
+    if row["status"] != "needs_attention":
+        raise ValueError("Only needs_attention followups can be retried")
+    item = json.loads(row["payload"])
+    # The reply's Date and From header values exactly as the mail prompt prints them (`one_line`, raw From,
+    # not a parsed address); both in one user message of the session's lineage = delivered.
+    needles = [one_line(item.get("date")), one_line(item.get("from"))]
+    if not all(needles):
+        raise ValueError("Hermes Auto cannot tell whether this reply already reached its session; "
+                         f"open session {row['session_id']} and continue there by hand")
+    info = hermes.invoke("inspect", {"session_id": row["session_id"]}, needles=needles)
+
+    def mark(status, error):
+        store.db.execute("UPDATE followups SET status=?,error=?,updated=CURRENT_TIMESTAMP WHERE id=?",
+                         (status, error, followup_id))
+        store.db.commit()
+
+    if not info["exists"]:
+        mark("deleted", "Session is missing; the reply was not redirected or recreated")
+        raise ValueError("The session was deleted; retry-followup will not recreate it")
+    if not isinstance(info.get("delivered"), bool):
+        mark("needs_attention", f"Could not verify whether the reply reached session {row['session_id']}; "
+             "continue there by hand")
+        raise ValueError("Hermes Auto cannot tell whether this reply already reached its session "
+                         f"{row['session_id']}; open it and continue there by hand")
+    if info.get("delivered") is not False:
+        mark("needs_attention", f"The reply already reached session {row['session_id']}; continue there by hand")
+        raise ValueError(f"The reply is already in session {row['session_id']}; open it instead of retrying")
+    mark("retry_pending", "")
+
+
 def eligible_tick(config, store):
     if config["desktop_only"]:
         result = subprocess.run(["pgrep", "-x", config["desktop_process"]],
@@ -188,6 +228,8 @@ def parser():
         item = commands.add_parser(name, help="Explicitly continue a failed job" if name == "retry" else
                                    "Explicitly create a fresh conversation for an existing event")
         item.add_argument("job_id", type=int)
+    again = commands.add_parser("retry-followup", help="Explicitly re-deliver a failed reply into its session")
+    again.add_argument("followup_id", type=int)
     commands.add_parser("install-launchd", help="Install a macOS user service")
     commands.add_parser("backup", help="Write a consistent backup of automation state")
     return root
@@ -248,9 +290,22 @@ def dispatch(args, home, config, store):
     elif command == "status":
         jobs = [{key: job[key] for key in ("id", "source", "title", "mode", "status", "session_id", "error")}
                 for job in store.rows()]
+        # Replies routed into existing sessions; payloads (mail bodies) stay out of CLI output.
+        followups = [dict(row) for row in store.db.execute(
+            "SELECT id, source, title, status, session_id, attempts, error FROM followups ORDER BY id")]
+        # Sorter tasks it stopped retrying or left alone because the user changed them meanwhile.
+        from .triage import stored_state
+        issues = []
+        for row in store.db.execute("SELECT item_id, decision, reason, payload FROM triage_items WHERE "
+                                    "account='todoist' AND decision IN ('needs_attention','user_changed') "
+                                    "ORDER BY created, rowid"):
+            state = stored_state(row)
+            task = state.get("task") or json.loads(row["payload"] or "{}")
+            issues.append({"item_id": row["item_id"], "decision": row["decision"], "content": task.get("content", ""),
+                           "attempts": state.get("attempts", 0), "error": state.get("error", "")})
         print(json.dumps({"paused": store.get_meta("paused", False),
-                          "source_errors": store.get_meta("source_errors", []), "jobs": jobs}, indent=2,
-                         ensure_ascii=False))
+                          "source_errors": store.get_meta("source_errors", []), "jobs": jobs,
+                          "followups": followups, "triage_issues": issues}, indent=2, ensure_ascii=False))
     elif command in ("pause", "resume"):
         store.set_meta("paused", command == "pause")
         print(command + "d")
@@ -271,6 +326,9 @@ def dispatch(args, home, config, store):
                 raise ValueError("The session was deleted; it will not be recreated by retry")
             store.update(job["id"], status="retry_pending", error="")
         print("Queued. Run 'hermes-auto run' or wait for the next scheduled check.")
+    elif command == "retry-followup":
+        retry_followup(store, Hermes(config, home), args.followup_id)
+        print("Queued into the same session. Run 'hermes-auto run' or wait for the next scheduled check.")
     elif command == "triage-preview":
         with tempfile.TemporaryDirectory(prefix="hermes-auto-preview-") as directory:
             preview = Store(Path(directory), initialize=True)
@@ -297,6 +355,10 @@ def dispatch(args, home, config, store):
             return 0
         if command == "tick" and not eligible_tick(config, store):
             return 0
+        if command != "scan":
+            # Under the run lock anything still "running" was interrupted: jobs and replies alike go to
+            # needs_attention before any work starts, so nothing is replayed without an explicit retry.
+            store.recover()
         errors = poll(config, store)
         failures = 0
         blocked = [error.split(":", 1)[0] for error in errors]

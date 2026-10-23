@@ -125,6 +125,13 @@ def process_jobs(store, config, hermes, blocked_sources=()):
                              error="Session already contains messages; inspect before retrying preparation")
                 failures += 1
                 continue
+            elif retry and not hermes.message_count(job):
+                # Interrupted before anything reached the session (e.g. during create): the retry is
+                # the first message, so it carries the original task, and create finishes the same
+                # session's title and visibility instead of a continuation prompt with no context.
+                prompt = prompt_for(job, config)
+                store.update(job["id"], status="creating")  # interrupted again -> needs_attention, no loop
+                hermes.create(job, prompt)
             if job["mode"] == "open":
                 store.update(job["id"], status="ready", error="")
                 continue

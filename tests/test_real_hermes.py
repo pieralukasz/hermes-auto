@@ -31,6 +31,8 @@ def test_real_session_api_two_profiles(tmp_path):
             hermes.create(job, "Synthetic test context")
             info = hermes.invoke("inspect", job)
             assert (info["exists"], info["messages"], info["archived"]) == (True, 2, False)
+            assert hermes.invoke("inspect", job, needles=["Synthetic test context"])["delivered"] is True
+            assert hermes.invoke("inspect", job, needles=["not delivered"])["delivered"] is False
             assert hermes.archive_states([job["session_id"], "missing"]) == {
                 job["session_id"]: False, "missing": None}
             assert hermes.unarchive(job["session_id"])["archived"] is False

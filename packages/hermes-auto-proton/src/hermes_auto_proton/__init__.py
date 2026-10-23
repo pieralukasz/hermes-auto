@@ -25,6 +25,25 @@ def root_id(message):
     return (refs or parents or own or [None])[0]
 
 
+def body_text(message, preferencelist):
+    """The message body as text. An unknown or broken charset falls back to UTF-8 with replacement
+    characters, so one malformed message keeps its content and never stops the whole source."""
+    try:
+        body = message.get_body(preferencelist=preferencelist)
+    except (KeyError, LookupError, ValueError):
+        body = None
+    if body is None:
+        return ""
+    try:
+        text = body.get_content()
+    except (KeyError, LookupError, ValueError, UnicodeError):
+        payload = body.get_payload(decode=True)
+        text = payload.decode("utf-8", errors="replace") if isinstance(payload, bytes) else str(payload or "")
+    if body.get_content_type() == "text/html":
+        text = re.sub(r"<[^>]+>", " ", text)
+    return text
+
+
 def parse_candidate(raw, own_addresses):
     """An INBOX message as a sorter candidate, or None for the user's own or unidentifiable mail."""
     message = BytesParser(policy=email.policy.default).parsebytes(raw)
@@ -32,13 +51,7 @@ def parse_candidate(raw, own_addresses):
     sender = parseaddr(str(message.get("From", "")))[1].casefold()
     if not ids or not sender or sender in own_addresses:
         return None
-    try:
-        body = message.get_body(preferencelist=("plain", "html"))
-        text = body.get_content() if body else ""
-        if body is not None and body.get_content_type() == "text/html":
-            text = re.sub(r"<[^>]+>", " ", text)
-    except (KeyError, LookupError, ValueError):
-        text = ""
+    text = body_text(message, ("plain", "html"))
     refs = message_ids(message.get("References")) + message_ids(message.get("In-Reply-To"))
     return {"id": ids[0], "thread_id": root_id(message) or ids[0], "from": str(message.get("From", "")),
             "to": str(message.get("To", "")), "subject": str(message.get("Subject", "")),
@@ -52,8 +65,7 @@ def parse_event(raw, own_addresses):
     if not ids:
         return None
     sender = parseaddr(str(message.get("From", "")))[1].casefold()
-    body = message.get_body(preferencelist=("plain",)) if message.is_multipart() else message
-    text = body.get_content() if body and body.get_content_type() == "text/plain" else ""
+    text = body_text(message, ("plain",))
     reply = bool(message_ids(message.get("In-Reply-To")) or message_ids(message.get("References")))
     payload = {"id": ids[0], "from": str(message.get("From", "")),
                "subject": str(message.get("Subject", "Email reply")), "date": str(message.get("Date", "")),
