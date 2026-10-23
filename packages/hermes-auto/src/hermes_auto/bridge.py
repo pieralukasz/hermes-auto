@@ -190,6 +190,23 @@ def rowid_at(conn, timestamp):
     return lo
 
 
+def live_owner(session_id):
+    """Surface (e.g. "desktop") holding a live lease on this session, else None.
+
+    Hermes refuses a second writer (SESSION_NOT_OWNED) while e.g. Desktop keeps the conversation's runtime;
+    Desktop holds every conversation opened since it started until ~6 h idle. Unreadable registry: None,
+    and the run's own refusal is still caught by the caller.
+    """
+    try:
+        from hermes_cli.active_sessions import active_session_registry_snapshot
+        for entry in active_session_registry_snapshot():
+            if entry.get("session_id") == session_id:
+                return entry.get("surface") or "another window"
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
 AUTOMATION_TITLE = "☀ %"
 
 
@@ -331,7 +348,7 @@ def main():
         return
     session = db.get_session(sid)
     if action == "inspect":
-        print(json.dumps({"exists": session is not None,
+        print(json.dumps({"exists": session is not None, "owned_by": live_owner(sid),
                           "messages": session.get("message_count", 0) if session else 0,
                           "archived": bool(session.get("archived")) if session else False,
                           "last_active": session.get("last_activity_at") if session else None}))

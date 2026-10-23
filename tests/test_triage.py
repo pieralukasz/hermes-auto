@@ -44,7 +44,12 @@ class Fake:
 
     def inspect(self, session_id):
         info = self.sessions.get(session_id)
-        return {"exists": info is not None, "last_active": (info or {}).get("last_active")}
+        return {"exists": info is not None, "last_active": (info or {}).get("last_active"),
+                "owned_by": (info or {}).get("owned_by")}
+
+    def session_excerpts(self, ids):
+        return {sid: {"title": "Google Ads", "date": "2026-10-22", "last_user": "przypomnij tacie",
+                      "last_assistant": "Czekamy na dostęp."} for sid in ids if sid in self.sessions}
 
     def unarchive(self, session_id):
         self.unarchived.append(session_id)
@@ -385,3 +390,42 @@ def test_dated_agent_task_gets_label_only_after_ok(store, config):
     assert adapter.applied[0][1]["agent"] is False  # no label, so the due-date poller cannot start it
     message = json.loads(store.rows()[-1]["payload"])["open_message"]
     assert "Wywiad** → Dom · P2 · hermes po OK" in message and "po Twoim OK:** 1 (Wywiad)" in message
+
+
+def queue_followup(store, session="S1"):
+    reply = mail("R1", "T9")
+    reply["account"] = "me@example.test"
+    store.db.execute("INSERT INTO followups(event_key,source,session_id,title,payload) VALUES (?,?,?,?,?)",
+                     ("gmail:me@example.test:R1", "gmail", session, "Re: Ads", json.dumps(reply)))
+    store.db.commit()
+
+
+def test_followup_into_desktop_owned_session_opens_linked_session(store, config):
+    hermes = Fake(sessions={"S1": {"owned_by": "desktop"}})
+    queue_followup(store)
+    assert triage.process_followups(store, config, hermes) == 0
+    assert hermes.runs == [] and hermes.unarchived == []  # nothing written to, nothing unarchived
+    assert store.db.execute("SELECT status FROM followups").fetchone()[0] == "redirected"
+    job = store.rows()[-1]
+    payload = json.loads(job["payload"])
+    assert job["title"] == "↩ Google Ads" and payload["deny_tools"] is True
+    assert payload["followup_of"]["id"] == "S1"
+    prompt = prompt_for(job, config)
+    assert "otwarta w Hermes Desktop" in prompt and "id S1" in prompt and "Czekamy na dostęp." in prompt
+    # Later replies in the thread continue in the new session.
+    pinned = store.get_meta(triage.thread_key("gmail", "me@example.test", "T9"))
+    assert pinned == job["session_id"]
+
+
+def test_followup_refused_mid_run_is_redirected(store, config):
+    from hermes_auto.hermes import SessionBusy
+
+    class Busy(Fake):
+        def run(self, job, prompt):
+            raise SessionBusy("open elsewhere")
+
+    hermes = Busy(sessions={"S1": {}})
+    queue_followup(store)
+    assert triage.process_followups(store, config, hermes) == 0
+    assert store.db.execute("SELECT status FROM followups").fetchone()[0] == "redirected"
+    assert store.rows()[-1]["title"] == "↩ Google Ads"

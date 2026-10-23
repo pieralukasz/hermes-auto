@@ -24,6 +24,10 @@ def session_title(job, limit=TITLE_LIMIT):
     return f"☀ {text}{suffix}"
 
 
+class SessionBusy(RuntimeError):
+    """Hermes refused the run: another surface (Desktop) holds the conversation (SESSION_NOT_OWNED)."""
+
+
 class Hermes:
     def __init__(self, config, home):
         self.config = config
@@ -74,6 +78,8 @@ class Hermes:
                     err.seek(0)
                     diagnostic = err.read().decode(errors="replace")[-12000:]
                     private_json(self.home / "last-error.json", {"action": action, "error": diagnostic})
+                    if "hermes-refusal-reason: SESSION_NOT_OWNED" in diagnostic:
+                        raise SessionBusy(f"Hermes {action} refused: the session is open in another window")
                     raise RuntimeError(f"Hermes {action} failed (exit {process.returncode}); see local last-error.json")
                 if action == "run":
                     results = [record for record in records if record.get("type") == "result"]
