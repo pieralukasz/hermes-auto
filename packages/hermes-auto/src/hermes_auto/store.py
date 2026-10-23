@@ -116,9 +116,22 @@ class Store:
                         (*fields.values(), job_id))
         self.db.commit()
 
-    def recover(self):
-        self.db.execute("UPDATE jobs SET status='needs_attention', error=? WHERE status IN ('running','creating')",
-                        ("Runner stopped before confirming completion. Inspect session before retrying.",))
+    def background_runs(self):
+        """IDs of `running` jobs that have a background run handle; `collect` settles them, not recovery."""
+        return {job["id"] for job in self.rows() if job["status"] == "running" and self.get_meta(f"run:{job['id']}")}
+
+    def recover(self, keep=None):
+        """Jobs left mid-step by a stopped runner need a look; background runs (`keep`) are still tracked.
+
+        Without `keep`, every job with a background run handle is kept: whether its process is still alive is
+        decided by `Hermes.collect`, which marks a dead run needs_attention itself.
+        """
+        keep = self.background_runs() if keep is None else set(keep)
+        for (job_id,) in self.db.execute("SELECT id FROM jobs WHERE status IN ('running','creating')").fetchall():
+            if job_id not in keep:
+                self.db.execute("UPDATE jobs SET status='needs_attention', error=? WHERE id=?",
+                                ("Runner stopped before confirming completion. Inspect session before retrying.",
+                                 job_id))
         # A reply that was running may already be in its session: never replay it on its own.
         self.db.execute("UPDATE followups SET status='needs_attention', error=?, updated=CURRENT_TIMESTAMP "
                         "WHERE status='running'",

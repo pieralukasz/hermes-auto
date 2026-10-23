@@ -27,6 +27,26 @@ def session_title(job, limit=TITLE_LIMIT, prefix=""):
     return f"{prefix}{text}{suffix}"
 
 
+def run_alive(pid, directory):
+    """True when a process of the run's group still carries its run directory in its command line.
+
+    A bare pid check would take a reused pid (any unrelated process) for the run, and the overrun kill
+    would then signal that process. `start` makes the shell a group leader (pgid == pid) and passes the
+    request path, so group plus directory identifies the run. None when `ps` itself fails.
+    """
+    try:
+        listing = subprocess.run(["ps", "-A", "-ww", "-o", "pid=", "-o", "pgid=", "-o", "command="],
+                                 capture_output=True, text=True, timeout=10, check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    marker = str(directory)
+    for line in listing.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[1] == str(pid) and marker in parts[2]:
+            return True
+    return False
+
+
 class SessionBusy(RuntimeError):
     """Hermes refused the run: another surface (Desktop) holds the conversation (SESSION_NOT_OWNED)."""
 
@@ -67,37 +87,96 @@ class Hermes:
                     process.wait()
                     raise RuntimeError("Hermes interrupted or exceeded its budget; inspect the existing session")
                 out.seek(0)
-                lines = out.read().decode(errors="replace").splitlines()
-                records = []
-                for line in lines:
+                err.seek(0)
+                return self.parse(action, process.returncode, out.read().decode(errors="replace"),
+                                  err.read().decode(errors="replace"))
+
+    def parse(self, action, returncode, stdout, stderr):
+        lines = stdout.splitlines()
+        records = []
+        for line in lines:
+            try:
+                record = json.loads(line)
+                if isinstance(record, dict):
+                    records.append(record)
+            except ValueError:
+                pass
+        if returncode:
+            # Keep private diagnostics locally; CLI output does not expose email/task bodies.
+            diagnostic = stderr[-12000:]
+            private_json(self.home / "last-error.json", {"action": action, "error": diagnostic})
+            if "hermes-refusal-reason: SESSION_NOT_OWNED" in diagnostic:
+                raise SessionBusy(f"Hermes {action} refused: the session is open in another window")
+            raise RuntimeError(f"Hermes {action} failed (exit {returncode}); see local last-error.json")
+        if action == "run":
+            results = [record for record in records if record.get("type") == "result"]
+            if not results or results[-1].get("is_error") or results[-1].get("exit_code", 0):
+                private_json(self.home / "last-error.json", {
+                    "action": action, "result": results[-1] if results else None,
+                    "record_types": [record.get("type") for record in records][-40:],
+                    "stdout_tail": "\n".join(lines)[-6000:], "stderr_tail": stderr[-6000:]})
+                raise RuntimeError("Hermes returned no confirmed successful result; see local last-error.json")
+            return results[-1]
+        if not records:
+            raise RuntimeError(f"Hermes {action} returned no receipt")
+        return records[-1]
+
+    def start(self, job, prompt):
+        """Start a run in the background and return a handle; `collect` reads it later.
+
+        The process gets its own session (survives the tick and launchd) and writes its exit code to a
+        file, so any later tick can tell finished, crashed and overdue runs apart.
+        """
+        import time
+        runs = self.home / "runs"
+        runs.mkdir(mode=0o700, exist_ok=True)
+        directory = Path(tempfile.mkdtemp(prefix=f"job-{job['id']}-", dir=runs))
+        request = directory / "request.json"
+        deny = bool(job.get("deny_tools") or json.loads(job.get("payload") or "{}").get("deny_tools"))
+        private_json(request, {"action": "run", "config": self.config, "job": job, "prompt": prompt,
+                               "full_tools": full_tools(job), "deny_tools": deny})
+        command = [self.python, "-I", str(Path(__file__).with_name("bridge.py")), str(request)]
+        script = 'umask 077; "$@" >"$OUT" 2>"$ERR"; echo $? >"$CODE.tmp" && mv "$CODE.tmp" "$CODE"'
+        env = {**os.environ, "OUT": str(directory / "stdout"), "ERR": str(directory / "stderr"),
+               "CODE": str(directory / "exit_code")}
+        process = subprocess.Popen(["/bin/sh", "-c", script, "hermes-auto-run", *command], env=env,
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   start_new_session=True, close_fds=True)
+        return {"pid": process.pid, "dir": str(directory), "deadline": time.time() + self.budget(job) + 60}
+
+    def collect(self, handle):
+        """None while running; the run's result when done; raises like `run` on failure or overrun."""
+        import shutil
+        import time
+        directory = Path(handle["dir"])
+        if directory.resolve().parent != (self.home / "runs").resolve():
+            # Provenance: only read (and later delete) a directory `start` made under this home's runs/.
+            raise RuntimeError("Hermes run directory is not one this automation created; inspect the session")
+        code_file = directory / "exit_code"
+        if not code_file.exists():
+            alive = run_alive(handle["pid"], directory)
+            if alive is not False and time.time() < handle["deadline"]:
+                return None
+            if alive:
+                for sig in (signal.SIGTERM, signal.SIGKILL):
                     try:
-                        record = json.loads(line)
-                        if isinstance(record, dict):
-                            records.append(record)
-                    except ValueError:
-                        pass
-                if process.returncode:
-                    # Keep private diagnostics locally; CLI output does not expose email/task bodies.
-                    err.seek(0)
-                    diagnostic = err.read().decode(errors="replace")[-12000:]
-                    private_json(self.home / "last-error.json", {"action": action, "error": diagnostic})
-                    if "hermes-refusal-reason: SESSION_NOT_OWNED" in diagnostic:
-                        raise SessionBusy(f"Hermes {action} refused: the session is open in another window")
-                    raise RuntimeError(f"Hermes {action} failed (exit {process.returncode}); see local last-error.json")
-                if action == "run":
-                    results = [record for record in records if record.get("type") == "result"]
-                    if not results or results[-1].get("is_error") or results[-1].get("exit_code", 0):
-                        err.seek(0)
-                        private_json(self.home / "last-error.json", {
-                            "action": action, "result": results[-1] if results else None,
-                            "record_types": [record.get("type") for record in records][-40:],
-                            "stdout_tail": "\n".join(lines)[-6000:],
-                            "stderr_tail": err.read().decode(errors="replace")[-6000:]})
-                        raise RuntimeError("Hermes returned no confirmed successful result; see local last-error.json")
-                    return results[-1]
-                if not records:
-                    raise RuntimeError(f"Hermes {action} returned no receipt")
-                return records[-1]
+                        os.killpg(handle["pid"], sig)
+                    except (ProcessLookupError, PermissionError):
+                        break
+                    time.sleep(2)
+                raise RuntimeError("Hermes exceeded its budget; inspect the existing session")
+            if alive is None:
+                raise RuntimeError("Hermes exceeded its budget and its process could not be identified; "
+                                   "inspect the existing session")
+            if not code_file.exists():
+                raise RuntimeError("Hermes run stopped without an exit code; inspect the existing session")
+        returncode = int(code_file.read_text().strip() or 1)
+        stdout = (directory / "stdout").read_text(errors="replace") if (directory / "stdout").exists() else ""
+        stderr = (directory / "stderr").read_text(errors="replace") if (directory / "stderr").exists() else ""
+        try:
+            return self.parse("run", returncode, stdout, stderr)
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
 
     def budget(self, job):
         key = ("agent_run_budget_seconds" if job and full_tools(job) and not job.get("deny_tools")

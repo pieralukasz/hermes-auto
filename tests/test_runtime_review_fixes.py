@@ -250,6 +250,13 @@ class CrashOnceHermes:
         self.prompts.append(prompt)
         return {"session_id": job["session_id"]}
 
+    # Agent runs start in the background (main 9a7b1c3); this run finishes at once.
+    def start(self, job, prompt):
+        return {"result": self.run(job, prompt)}
+
+    def collect(self, handle):
+        return handle["result"]
+
 
 def crashed_job(store, config, hermes):
     store.enqueue("todoist:T:once", "todoist", "T", "Zrób raport VAT", "agent",
