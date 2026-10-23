@@ -300,7 +300,7 @@ def test_followup_waits_for_the_session_it_joins(store, config):
 
 
 class ContextFake(Fake):
-    def recent_sessions(self, days=21, limit=400):
+    def recent_sessions(self, days=21, limit=400, exclude=()):
         return [{"id": "S-ads", "title": "Google Ads account invitation", "date": "2026-10-22"},
                 {"id": "S-other", "title": "Przegląd maili", "date": "2026-10-21"}]
 

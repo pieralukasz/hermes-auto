@@ -207,7 +207,7 @@ def live_owner(session_id):
     return None
 
 
-AUTOMATION_TITLE = "☀ %"
+AUTOMATION_TITLE = "☀ %"  # sessions from before titles lost the prefix
 
 
 def recent_sessions(db_path, request):
@@ -221,11 +221,12 @@ def recent_sessions(db_path, request):
             "SELECT id, title, COALESCE(last_activity_at, started_at) AS active FROM sessions "
             "WHERE COALESCE(last_activity_at, started_at) >= ? AND parent_session_id IS NULL "
             "AND COALESCE(title,'') != '' AND title NOT LIKE ? AND title NOT LIKE 'Subagent:%' "
-            "ORDER BY active DESC LIMIT ?", (since, AUTOMATION_TITLE, int(request.get("limit") or 400))).fetchall()
+            "ORDER BY active DESC LIMIT ?", (since, AUTOMATION_TITLE, int(request.get("limit") or 400) + len(request.get("exclude") or []))).fetchall()
     finally:
         conn.close()
+    exclude = set(request.get("exclude") or [])
     return [{"id": sid, "title": title, "date": time.strftime("%Y-%m-%d", time.localtime(active))}
-            for sid, title, active in rows]
+            for sid, title, active in rows if sid not in exclude]
 
 
 def session_excerpts(db_path, request):

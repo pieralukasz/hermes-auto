@@ -14,14 +14,17 @@ from .runner import full_tools
 TITLE_LIMIT = 100
 
 
-def session_title(job, limit=TITLE_LIMIT):
-    """`☀ <title> · <source> · #<id>`, shortening only the task title so the suffix survives."""
+def session_title(job, limit=TITLE_LIMIT, prefix=""):
+    """`<prefix><title> · <source> · #<id>`, shortening only the task title so the suffix survives.
+
+    No prefix by default; the optional Desktop "Auto" page plugin needs `title_prefix: "☀ "`.
+    """
     suffix = f" · {job['source']} · #{job['id']}"
     text = " ".join(str(job["title"] or "").split())
-    room = limit - len(suffix) - 2
+    room = limit - len(suffix) - len(prefix)
     if len(text) > room:
         text = text[:room - 1].rstrip() + "…"
-    return f"☀ {text}{suffix}"
+    return f"{prefix}{text}{suffix}"
 
 
 class SessionBusy(RuntimeError):
@@ -114,9 +117,9 @@ class Hermes:
     def find_session(self, **query):
         return self.invoke("find_session", **query)["session_id"]
 
-    def recent_sessions(self, days=21, limit=400):
-        """Recent user conversations: [{id, title, date}], newest first. Read-only."""
-        return self.invoke("recent_sessions", days=days, limit=limit)["result"]
+    def recent_sessions(self, days=21, limit=400, exclude=()):
+        """Recent user conversations (minus `exclude`, the automation's own): [{id, title, date}]. Read-only."""
+        return self.invoke("recent_sessions", days=days, limit=limit, exclude=list(exclude))["result"]
 
     def session_excerpts(self, ids):
         """{session_id: {title, date, last_user, last_assistant}}. Read-only."""
@@ -133,7 +136,7 @@ class Hermes:
         return self.invoke("inspect", job)["messages"]
 
     def create(self, job, prompt):
-        title = session_title(job)
+        title = session_title(job, prefix=self.config.get("title_prefix", ""))
         payload = json.loads(job.get("payload") or "{}")
         message = payload.get("open_message") or (
             "Sesja jest gotowa. Automatyczne przygotowanie jest wyłączone; możesz zacząć rozmowę."

@@ -451,11 +451,13 @@ def outline_text(outline):
     return "\n".join(lines)
 
 
-def related_sessions(hermes, config, tasks):
+def related_sessions(hermes, config, tasks, store=None):
     """{task_id: [excerpt]}: past conversations about the same matter, chosen by the model from titles."""
     options = settings(config)["todoist"]
+    own = [row[0] for row in store.db.execute("SELECT session_id FROM jobs WHERE session_id IS NOT NULL")] \
+        if store is not None else []
     try:
-        recent = hermes.recent_sessions(days=options["context_days"])
+        recent = hermes.recent_sessions(days=options["context_days"], exclude=own)
     except Exception:  # noqa: BLE001 - context is optional; sorting goes on without it
         return {}
     if not recent:
@@ -631,7 +633,7 @@ def triage_todoist(store, config, hermes, adapter, now=None):
     if not settled:
         return []
     outline = adapter.outline(source_settings, store, options["outline_hours"])
-    related = related_sessions(hermes, config, settled)
+    related = related_sessions(hermes, config, settled, store)
     paths = {project["id"]: project["path"] for project in outline["projects"]}
     for task in settled:
         if str(task["id"]) in review_ids:
