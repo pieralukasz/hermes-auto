@@ -18,6 +18,8 @@ Na Macu usługa sprawdza co minutę, czy aplikacja Hermes jest otwarta. Podczas 
 
 `hermes-auto status` pokazuje przygotowane rozmowy i problemy, także przerwane odpowiedzi mailowe. `retry-followup ID` ponawia konkretną odpowiedź (w nowej sesji) tylko po sprawdzeniu, że nie została już dostarczona. Przy niepewności odmawia i wymaga ręcznej kontynuacji. Błędy sortowania zadań po trzech próbach oraz wykryte ręczne przeniesienia są widoczne w `triage_issues`; automat nie ponawia ich bez końca. `pause` / `resume` zatrzymuje / wznawia automat. `retry ID` kontynuuje sprawdzoną przez Ciebie przerwaną pracę w tej samej sesji. `new-session ID` świadomie tworzy nową. Obie komendy dodają pracę do kolejki; wykonuje ją następne sprawdzenie lub `hermes-auto run`.
 
+**Projekt w osobnym profilu Hermesa:** `profile_routes` w `config.json` kieruje zadania wybranego projektu Todoista do profilu (np. służbowego, z osobną subskrypcją, skillami i pamięcią). Sesje takich zadań widać po przełączeniu profilu w Desktopie; archiwizacja nadal odhacza zadanie.
+
 Nie usuwaj katalogu stanu, żeby „zresetować” automat: to rejestr zapobiegający duplikatom. Używaj jawnych poleceń i `hermes-auto backup`. Każdy pakiet można wyłączyć osobno: `hermes-auto source disable gmail`.
 
 Maile z `Hermes Watch` są okrojone: szkic bez narzędzi albo (tryb `research`) tylko wyszukiwanie i odczyt stron. Agent nie wysyła wiadomości, nie zapisuje szkiców w skrzynce, nie płaci i nie zmienia zadań; przygotowuje to do Twojej akceptacji. Komendy wymagające zatwierdzenia są odrzucane. Treść wybranych zadań i nowych odpowiedzi jest przekazywana do modelu skonfigurowanego w Twoim Hermesie.

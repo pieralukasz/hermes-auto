@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 
 from .config import private_json
+from .profiles import config_for, profile_for, routed_profiles
 from .runner import full_tools
 
 # Hermes SessionDB.MAX_TITLE_LENGTH; a longer title makes session creation fail.
@@ -63,10 +64,15 @@ class Hermes:
         if not (Path(config["hermes_source"]) / "hermes_state_registry.py").is_file():
             raise RuntimeError("Set hermes_source to a supported Hermes Agent source installation")
 
-    def invoke(self, action, job=None, **extra):
+    def config_for_job(self, job):
+        """Bridge config for this job: its routed Hermes profile, else the configured home."""
+        return config_for(self.config, profile_for(job, self.config))
+
+    def invoke(self, action, job=None, *, profile_config=None, **extra):
+        config = profile_config or self.config_for_job(job)
         with tempfile.TemporaryDirectory(prefix="request-", dir=self.home) as directory:
             request = Path(directory) / "request.json"
-            private_json(request, {"action": action, "config": self.config, "job": job or {}, **extra})
+            private_json(request, {"action": action, "config": config, "job": job or {}, **extra})
             command = [self.python, "-I", str(Path(__file__).with_name("bridge.py")), str(request)]
             with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
                 process = subprocess.Popen(command, stdout=out, stderr=err, start_new_session=True)
@@ -133,7 +139,7 @@ class Hermes:
         directory = Path(tempfile.mkdtemp(prefix=f"job-{job['id']}-", dir=runs))
         request = directory / "request.json"
         deny = bool(job.get("deny_tools") or json.loads(job.get("payload") or "{}").get("deny_tools"))
-        private_json(request, {"action": "run", "config": self.config, "job": job, "prompt": prompt,
+        private_json(request, {"action": "run", "config": self.config_for_job(job), "job": job, "prompt": prompt,
                                "full_tools": full_tools(job), "deny_tools": deny})
         command = [self.python, "-I", str(Path(__file__).with_name("bridge.py")), str(request)]
         script = 'umask 077; "$@" >"$OUT" 2>"$ERR"; echo $? >"$CODE.tmp" && mv "$CODE.tmp" "$CODE"'
@@ -206,8 +212,21 @@ class Hermes:
 
 
     def archive_states(self, session_ids):
-        """{session_id: True archived / False open / None missing}, one bridge process for all."""
-        return self.invoke("archive_states", session_ids=list(session_ids))["states"]
+        """{session_id: True archived / False open / None missing}, one bridge process per Hermes home.
+
+        Sessions of routed jobs live in their profile's database; ids missing from the default home are
+        looked up in each routed profile (session ids are unique across homes).
+        """
+        ids = list(session_ids)
+        states = self.invoke("archive_states", session_ids=ids)["states"]
+        for profile in routed_profiles(self.config):
+            missing = [sid for sid in ids if states.get(sid) is None]
+            if not missing:
+                break
+            found = self.invoke("archive_states", profile_config=config_for(self.config, profile),
+                                session_ids=missing)["states"]
+            states.update({sid: state for sid, state in found.items() if state is not None})
+        return states
 
     def message_count(self, job):
         return self.invoke("inspect", job)["messages"]
