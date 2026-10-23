@@ -17,7 +17,6 @@ import secrets
 import uuid
 from email.utils import parseaddr
 
-from .hermes import SessionBusy
 
 MAIL_DECISIONS = ("session", "brief", "skip")
 INTERNAL_SOURCES = ("brief", "questions", "proposals", "unblocked")
@@ -216,17 +215,8 @@ def mail_session_prompt(item, reason, config):
     return note + "\n\n" + mail_block(item)
 
 
-def followup_prompt(item, config):
-    """A reply in this conversation's thread: say it arrived and what it says, nothing more."""
-    if polish(config):
-        note = "(Automat: w wątku z tej rozmowy przyszła odpowiedź. " + NOTICE_PL
-    else:
-        note = "(Automation: a reply arrived in the thread from this conversation. " + NOTICE_EN
-    return note + "\n\n" + mail_block(item)
-
-
 def redirected_prompt(item, config):
-    """A reply whose conversation is held open elsewhere (Desktop): new session carrying that context."""
+    """A reply in a thread sent from an earlier conversation: a new session carrying that context."""
     origin = item["followup_of"]
     # One line each: an earlier turn may quote mail text, which must not pose as a header or the note.
     context = "\n".join(filter(None, [
@@ -236,13 +226,13 @@ def redirected_prompt(item, config):
         f"Moja ostatnia odpowiedź tam: {one_line(origin['last_assistant'], 1000)}"
         if origin.get("last_assistant") else ""]))
     if polish(config):
-        note = ("(Automat: przyszła odpowiedź w wątku wysłanym z innej rozmowy. Tamta rozmowa jest otwarta w Hermes "
-                "Desktop, więc nie mogłem jej tam dopisać i zaczynam tę. Najpierw jednym zdaniem wskaż, której "
-                "rozmowy dotyczy (tytuł i id), potem " + NOTICE_PL[0].lower() + NOTICE_PL[1:])
+        note = ("(Automat: przyszła odpowiedź w wątku wysłanym z wcześniejszej rozmowy. Tamtej rozmowy nie ruszam, "
+                "zaczynam tę; więcej kontekstu znajdziesz w niej przez session_search. Najpierw jednym zdaniem wskaż, "
+                "której rozmowy dotyczy (tytuł i id), potem " + NOTICE_PL[0].lower() + NOTICE_PL[1:])
     else:
-        note = ("(Automation: a reply arrived in a thread sent from another conversation, which is open in Hermes "
-                "Desktop, so it starts here. First name that conversation (title and id) in one sentence, then "
-                + NOTICE_EN[0].lower() + NOTICE_EN[1:])
+        note = ("(Automation: a reply arrived in a thread sent from an earlier conversation. That conversation is "
+                "left untouched and this one starts here; search it with session_search for more context. First "
+                "name that conversation (title and id) in one sentence, then " + NOTICE_EN[0].lower() + NOTICE_EN[1:])
     return note + "\n\nKontekst tamtej rozmowy (to tylko odczyt):\n" + context + "\n\n" + mail_block(item)
 
 
@@ -385,20 +375,18 @@ def redirect_followup(store, row, item, reason, hermes=None):
                          (reason, row["id"]))
 
 
-def process_followups(store, config, hermes, busy_seconds=120, now=None):
-    """Run each routed reply inside its original session (unarchived first); tools stay blocked.
+def process_followups(store, config, hermes):
+    """Every routed reply opens a new session ("↩ <title>") carrying the earlier conversation's context.
 
-    Replies waiting for a busy session do not use up the per-check limit, so they cannot starve others.
-    Interrupted ('running') replies are moved to needs_attention by `Store.recover` before this runs."""
+    The earlier conversation is never written to or unarchived (the user's decision): another agent takes the
+    reply over, and can look things up in the old conversation read-only.
+    """
     failures = 0
-    started = 0
     ids = [row[0] for row in store.db.execute(
         "SELECT id FROM followups WHERE status IN ('pending','retry_pending') ORDER BY id")]
     for row_id in ids:
-        if started >= config["max_jobs_per_run"]:
-            break
         # Read each row now, not from a snapshot: an earlier redirect in this loop may have moved it to the
-        # replacement session, and handling it under the dead id would open a second new conversation.
+        # replacement session, and handling it under the old id would open a second new conversation.
         row = store.db.execute("SELECT * FROM followups WHERE id=? AND status IN ('pending','retry_pending')",
                                (row_id,)).fetchone()
         if row is None:
@@ -407,46 +395,15 @@ def process_followups(store, config, hermes, busy_seconds=120, now=None):
         item = json.loads(row["payload"])
         try:
             if store.db.execute(
-                    "SELECT 1 FROM jobs WHERE session_id=? AND status IN ('pending','creating','created','running',"
+                    "SELECT 1 FROM jobs WHERE session_id=? AND status IN ('pending','creating','created',"
                     "'retry_pending')", (row["session_id"],)).fetchone():
-                continue  # The conversation it joins is still being prepared; next check.
-            info = hermes.inspect(row["session_id"])
-            if not info["exists"]:
-                # The conversation is gone: treat the reply as new mail needing attention.
-                redirect_followup(store, row, item, "odpowiedź w wątku, którego sesja już nie istnieje")
-                continue
-            if info.get("owned_by"):
-                # Open in Desktop: Hermes refuses a second writer until Desktop lets go (hours). The user
-                # chose a new session at once, carrying that conversation's latest context.
-                redirect_followup(store, row, item, f"rozmowa otwarta w {one_line(info['owned_by'], 40)}", hermes)
-                continue
-            current = now if now is not None else dt.datetime.now().timestamp()
-            if info.get("last_active") and current - float(info["last_active"]) < busy_seconds:
-                continue  # The user is likely mid-conversation there; try on the next check.
-            started += 1
-            hermes.unarchive(row["session_id"])
-            store.db.execute("UPDATE followups SET status='running',attempts=attempts+1,"
-                             "updated=CURRENT_TIMESTAMP WHERE id=?", (row["id"],))
-            store.db.commit()
-            job = {"id": row["id"], "session_id": row["session_id"], "source": row["source"], "mode": "draft",
-                   "title": row["title"], "payload": row["payload"], "deny_tools": True}
-            result = hermes.run(job, followup_prompt(item, config))
-            final = result.get("session_id") or row["session_id"]
-            store.db.execute("UPDATE followups SET status='ready',session_id=?,error='',"
-                             "updated=CURRENT_TIMESTAMP WHERE id=?", (final, row["id"]))
-            store.db.commit()
-        except SessionBusy:
-            # Taken by Desktop between the check and the run (Hermes refused before writing): same as above.
-            try:
-                redirect_followup(store, row, item, "rozmowa otwarta w innym oknie", hermes)
-            except Exception as exc:  # noqa: BLE001
-                failures += 1
-                store.db.rollback()
-                store.db.execute("UPDATE followups SET status='needs_attention',error=?,updated=CURRENT_TIMESTAMP "
-                                 "WHERE id=?", (str(exc), row["id"]))
-                store.db.commit()
+                continue  # The earlier conversation is still being created; its context comes next check.
+            exists = hermes.inspect(row["session_id"])["exists"]
+            redirect_followup(store, row, item, "odpowiedź w wątku z wcześniejszej rozmowy" if exists else
+                              "odpowiedź w wątku, którego sesja już nie istnieje", hermes if exists else None)
         except Exception as exc:
             failures += 1
+            store.db.rollback()
             store.db.execute("UPDATE followups SET status='needs_attention',error=?,updated=CURRENT_TIMESTAMP "
                              "WHERE id=?", (str(exc), row["id"]))
             store.db.commit()

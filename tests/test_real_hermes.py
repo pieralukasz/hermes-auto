@@ -35,7 +35,6 @@ def test_real_session_api_two_profiles(tmp_path):
             assert hermes.invoke("inspect", job, needles=["not delivered"])["delivered"] is False
             assert hermes.archive_states([job["session_id"], "missing"]) == {
                 job["session_id"]: False, "missing": None}
-            assert hermes.unarchive(job["session_id"])["archived"] is False
             assert hermes.find_session(subject="Synthetic subject", sent=[{"ts": 1.0, "to": []}]) is None
             ids.append(job["session_id"])
         finally:

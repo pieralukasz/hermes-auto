@@ -468,15 +468,6 @@ def main():
         print(json.dumps(info))
         db.close()
         return
-    if action == "unarchive":
-        # Bring the user's conversation back before a reply lands in it.
-        if session is None:
-            raise RuntimeError("Target session is missing")
-        if session.get("archived"):
-            db.set_session_archived(sid, False)
-        db.close()
-        print(json.dumps({"session_id": sid, "archived": False}))
-        return
     if action == "create":
         if session is None:
             db.create_session(sid, source="cli")

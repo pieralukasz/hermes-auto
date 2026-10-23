@@ -129,9 +129,12 @@ def test_recover_moves_interrupted_followup_to_needs_attention_not_replay(store,
         def run(self, job, prompt):
             self.runs.append(job["id"])
             return {"session_id": job["session_id"]}
+        def session_excerpts(self, ids):
+            return {}
     hermes = Recorder()
     triage.process_followups(store, config, hermes)
-    assert hermes.runs == [waiting]  # the interrupted reply is not replayed
+    assert hermes.runs == []  # replies open new sessions; nothing runs in the old one
+    assert followup(store, waiting)["status"] == "redirected"  # the interrupted reply is not replayed
     assert followup(store, stuck)["status"] == "needs_attention"
 
 

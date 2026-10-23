@@ -311,18 +311,19 @@ def test_dead_session_mapping_moves_to_the_new_session(store):
     assert tuple(follow) == (new_session, "pending")
 
 
-def test_busy_followups_do_not_starve_free_ones(store):
+def test_replies_wait_only_for_a_session_still_being_created(store):
     config = cfg()
     store.db.execute("INSERT INTO jobs(event_key,source,external_id,title,mode,payload,session_id,status) "
-                     "VALUES('e','gmail','x','t','draft','{}','BUSY','running')")
-    for number in range(config["max_jobs_per_run"] + 1):
-        session = "BUSY" if number < config["max_jobs_per_run"] else "FREE"
+                     "VALUES('e','gmail','x','t','draft','{}','NEW','pending')")
+    for number, session in enumerate(["NEW", "FREE", "FREE2"]):
         store.db.execute("INSERT INTO followups(event_key,source,session_id,title,payload) VALUES(?,?,?,?,?)",
-                         (f"k{number}", "gmail", session, "t", json.dumps(mail(f"r{number}"))))
+                         (f"k{number}", "gmail", session, "t", json.dumps(mail(f"r{number}", f"T{number}"))))
     store.db.commit()
-    hermes = Hermes(sessions={"FREE": {}})
+    hermes = Hermes(sessions={"FREE": {}, "FREE2": {}})
     triage.process_followups(store, config, hermes)
-    assert [job["session_id"] for job, _ in hermes.runs] == ["FREE"]
+    status = dict(store.db.execute("SELECT session_id, status FROM followups").fetchall())
+    assert status["NEW"] == "pending" and hermes.runs == []
+    assert sum(1 for value in status.values() if value == "redirected") == 2
 
 
 def test_interrupted_followup_needs_attention_not_rerun(store):

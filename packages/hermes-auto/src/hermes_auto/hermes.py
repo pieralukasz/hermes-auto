@@ -204,8 +204,6 @@ class Hermes:
         """{session_id: {title, date, last_user, last_assistant}}. Read-only."""
         return self.invoke("session_excerpts", ids=list(ids))["result"]
 
-    def unarchive(self, session_id):
-        return self.invoke("unarchive", {"session_id": session_id})
 
     def archive_states(self, session_ids):
         """{session_id: True archived / False open / None missing}, one bridge process for all."""

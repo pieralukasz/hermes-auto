@@ -126,19 +126,18 @@ def test_reply_to_session_sent_mail_becomes_followup(store, config):
     assert store.db.execute("SELECT COUNT(*) FROM followups").fetchone()[0] == 2
 
 
-def test_followup_runs_in_original_session_without_tools(store, config):
+def test_reply_opens_new_session_and_leaves_the_old_one_alone(store, config):
     hermes = Fake(found="S1", sessions={"S1": {"last_active": 1000.0}})
     triage.triage_mail(store, config, hermes, "gmail", "me@example.test",
                        [mail("M1", sent=[{"ts": 900.0, "to": []}])])
-    # The user was active in S1 a moment ago: wait for the next check.
-    assert triage.process_followups(store, config, hermes, now=1030.0) == 0
-    assert hermes.runs == []
-    triage.process_followups(store, config, hermes, now=2000.0)
-    assert hermes.unarchived == ["S1"]
-    job, prompt = hermes.runs[0]
-    assert job["session_id"] == "S1" and job["deny_tools"] is True
-    assert "przyszła odpowiedź" in prompt and "Dzień dobry" in prompt
-    assert store.db.execute("SELECT status FROM followups").fetchone()[0] == "ready"
+    assert triage.process_followups(store, config, hermes) == 0
+    assert hermes.runs == [] and hermes.unarchived == []  # nothing written to or unarchived
+    job = store.rows()[-1]
+    payload = json.loads(job["payload"])
+    assert job["title"] == "↩ Google Ads" and payload["deny_tools"] is True and payload["followup_of"]["id"] == "S1"
+    prompt = prompt_for(job, config)
+    assert "Tamtej rozmowy nie ruszam" in prompt and "session_search" in prompt and "Dzień dobry" in prompt
+    assert store.db.execute("SELECT status FROM followups").fetchone()[0] == "redirected"
 
 
 def test_followup_for_deleted_session_becomes_new_mail_session(store, config):
@@ -311,7 +310,7 @@ def test_followup_waits_for_the_session_it_joins(store, config):
     assert hermes.runs == [] and store.db.execute("SELECT status FROM followups").fetchone()[0] == "pending"
     process_jobs(store, config, hermes)
     triage.process_followups(store, config, hermes)
-    assert store.db.execute("SELECT status FROM followups").fetchone()[0] == "ready"
+    assert store.db.execute("SELECT status FROM followups").fetchone()[0] == "redirected"
 
 
 class ContextFake(Fake):
@@ -432,14 +431,14 @@ def test_followup_into_desktop_owned_session_opens_linked_session(store, config)
     hermes = Fake(sessions={"S1": {"owned_by": "desktop"}})
     queue_followup(store)
     assert triage.process_followups(store, config, hermes) == 0
-    assert hermes.runs == [] and hermes.unarchived == []  # nothing written to, nothing unarchived
+    assert hermes.runs == [] and hermes.unarchived == []
     assert store.db.execute("SELECT status FROM followups").fetchone()[0] == "redirected"
     job = store.rows()[-1]
     payload = json.loads(job["payload"])
     assert job["title"] == "↩ Google Ads" and payload["deny_tools"] is True
     assert payload["followup_of"]["id"] == "S1"
     prompt = prompt_for(job, config)
-    assert "otwarta w Hermes Desktop" in prompt and "id S1" in prompt and "Czekamy na dostęp." in prompt
+    assert "Tamtej rozmowy nie ruszam" in prompt and "id S1" in prompt and "Czekamy na dostęp." in prompt
     # Later replies in the thread continue in the new session.
     pinned = store.get_meta(triage.thread_key("gmail", "me@example.test", "T9"))
     assert pinned == job["session_id"]
