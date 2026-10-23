@@ -47,6 +47,9 @@ DEFAULTS = {
         "apply": True,
         # False: tasks already in the Inbox when the sorter first runs are left alone.
         "backlog": False,
+        # False: an agent-capable task gets the label, but the agent starts only after the user says
+        # so in the questions session (or schedules the task for today).
+        "auto_start": False,
         "settle_minutes": 15,
         "outline_hours": 24,
         "agent_label": "hermes",
@@ -429,8 +432,9 @@ def render_questions(asked, config):
         if decision.get("proposal"):
             line += f" Proponuję: {decision['proposal']}."
         lines.append(line)
-    lines += ["", "Odpowiedz krótko, np. „1 p2, 2 przenieś do Dom”, a wprowadzę to w Todoist "
-                  "(td CLI, skill lukasz-todoist-tasks) i sprawdzę odczytem."]
+    lines += ["", "Odpowiedz krótko, np. „1 p2, 2 przenieś do Dom, 3 uruchom”, a wprowadzę to w Todoist "
+                  "(td CLI, skill lukasz-todoist-tasks) i sprawdzę odczytem. „Uruchom” znaczy: zrób to zadanie "
+                  "teraz w tej sesji albo ustaw je na dziś, żeby automat otworzył mu własną sesję."]
     return "\n".join(lines)
 
 
@@ -479,12 +483,18 @@ def triage_todoist(store, config, hermes, adapter, now=None):
         applied = {}
         if options["apply"]:
             applied = adapter.apply(source_settings, task, decision, options["agent_label"])
-            if applied.get("run"):
+            if applied.get("run") and options["auto_start"]:
                 payload = {**task, "labels": sorted({*task.get("labels", []), options["agent_label"]}),
                            "triage_run": True}
                 store.enqueue(f"todoist:{task['id']}:once", "todoist", str(task["id"]), task["content"],
                               source_settings.get("mode", "agent"), payload)
                 store.db.commit()
+            elif applied.get("run"):
+                # The agent could do it, but it may be waiting for access or a reply: ask first.
+                applied["run"] = False
+                start = ("Agent może to zrobić: uruchomić go teraz, czy czekasz na coś (dostęp, mail, czyjaś "
+                         "decyzja)? Jeśli czekasz, dam @czekam.")
+                decision = {**decision, "question": " ".join(filter(None, [decision["question"], start]))}
         status = "asked" if decision["question"] or not decision["project_id"] else "moved"
         if status == "asked":
             asked.append((task, decision))

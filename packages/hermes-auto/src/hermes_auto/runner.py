@@ -93,6 +93,7 @@ def source_enabled(job, config):
 def process_jobs(store, config, hermes, blocked_sources=()):
     store.recover()
     processed = 0
+    agents = 0
     failures = 0
     for job in store.rows():
         if job["source"] in blocked_sources or not source_enabled(job, config):
@@ -101,6 +102,12 @@ def process_jobs(store, config, hermes, blocked_sources=()):
             continue
         if processed >= config["max_jobs_per_run"]:
             break
+        heavy = full_tools(job) and job["mode"] != "open"
+        if heavy and agents >= config.get("max_agent_jobs_per_run", 1):
+            # A full agent may take its whole budget; one per check keeps the sorter and short
+            # runs from waiting behind a queue of them. The rest go in the next checks.
+            continue
+        agents += heavy
         processed += 1
         retry = job["status"] == "retry_pending"
         prompt = prompt_for(job, config, retry)

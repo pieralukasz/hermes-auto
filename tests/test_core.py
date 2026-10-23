@@ -126,6 +126,7 @@ def test_source_disable_and_per_run_budget(store, config):
     process_jobs(store, config, hermes, blocked_sources=["todoist"])
     assert not hermes.calls
     config["max_jobs_per_run"] = 2
+    config["max_agent_jobs_per_run"] = 5
     process_jobs(store, config, hermes)
     assert len(hermes.calls) == 2
 

@@ -173,7 +173,7 @@ class Adapter:
 
 
 def test_todoist_settle_apply_questions_and_run(store, config):
-    config["triage"]["todoist"] = {"backlog": True}
+    config["triage"]["todoist"] = {"backlog": True, "auto_start": True}
     tasks = [{"id": "A", "content": "Napisać post na bloga", "labels": []},
              {"id": "B", "content": "Umyć samochód", "labels": []},
              {"id": "C", "content": "Sub", "labels": [], "parentId": "A"}]
@@ -284,3 +284,26 @@ def test_followup_waits_for_the_session_it_joins(store, config):
     process_jobs(store, config, hermes)
     triage.process_followups(store, config, hermes)
     assert store.db.execute("SELECT status FROM followups").fetchone()[0] == "ready"
+
+
+def test_agent_task_asks_before_starting(store, config):
+    config["triage"]["todoist"] = {"backlog": True, "settle_minutes": 0}
+    adapter = Adapter([{"id": "A", "content": "Poprawić tacie rolki", "labels": []}])
+    hermes = Fake(replies=[[{"id": "A", "project_id": "P-home", "priority": "p2", "agent": True}]])
+    triage.triage_todoist(store, config, hermes, adapter)
+    triage.triage_todoist(store, config, hermes, adapter)
+    jobs = {job["source"]: job for job in store.rows()}
+    assert "todoist" not in jobs  # labelled, but no agent run yet
+    message = json.loads(jobs["questions"]["payload"])["open_message"]
+    assert "uruchomić go teraz, czy czekasz" in message
+
+
+def test_one_full_agent_per_check(store, config):
+    for key in ("A", "B", "C"):
+        store.enqueue(f"todoist:{key}:once", "todoist", key, key, "agent", {"id": key})
+    store.enqueue("brief:x", "brief", "x", "Brief", "open", {"open_message": "hej"})
+    store.db.commit()
+    hermes = Fake()
+    process_jobs(store, config, hermes)
+    status = {job["external_id"]: job["status"] for job in store.rows()}
+    assert status == {"A": "ready", "B": "pending", "C": "pending", "x": "ready"}
