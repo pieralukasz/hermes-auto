@@ -207,6 +207,20 @@ def filter_tasks(td, names, read=command_json):
     return out
 
 
+def waiting_tasks(td, labels, read=command_json):
+    """Tasks waiting on something (@czekam, @zablokowane) with their last three comments."""
+    query = " | ".join(f"@{label}" for label in labels)
+    tasks = items(read([td, "task", "list", "--filter", query, "--all", "--json"]))
+    for task in tasks:
+        comments = items(read([td, "comment", "list", f"id:{task['id']}", "--all", "--json"]))
+        task["comments"] = [" ".join(str(c.get("content") or "").split())[:300] for c in comments][-3:]
+    return tasks
+
+
+def add_comment(td, task_id, text, write=command_run):
+    write([td, "comment", "add", f"id:{task_id}", "--content", text])
+
+
 def build_outline(td, read=command_json):
     """Lists with their path, description, sections and a few task titles: the sorter's map."""
     projects = items(read([td, "project", "list", "--all", "--json"]))
@@ -280,6 +294,12 @@ class Source:
 
     def filter_tasks(self, settings, names):
         return filter_tasks(settings["command"], names)
+
+    def waiting_tasks(self, settings, labels):
+        return waiting_tasks(settings["command"], labels)
+
+    def add_comment(self, settings, task_id, text):
+        add_comment(settings["command"], task_id, text)
 
     def outline(self, settings, store, max_age_hours=24):
         cached = store.get_meta("todoist_outline")

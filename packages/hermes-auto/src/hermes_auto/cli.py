@@ -45,6 +45,7 @@ def run_triage(config, store, bridge, installed, blocked=()):
     if not options["enabled"]:
         return [], 0
     errors, failures = [], 0
+    new_mail = []
     for name in ("gmail", "proton"):
         settings = config["sources"].get(name, {})
         source = installed.get(name)
@@ -54,7 +55,8 @@ def run_triage(config, store, bridge, installed, blocked=()):
             candidates, key, cursor = source().inbox(config, store, limit=options["max_mail_per_run"])
             if candidates:
                 account = candidates[0].get("account", "")
-                triage.triage_mail(store, config, bridge(), name, account, candidates, key, cursor)
+                report = triage.triage_mail(store, config, bridge(), name, account, candidates, key, cursor)
+                new_mail += [item for _, item, _ in report or []]
             else:
                 store.set_meta(key, cursor)
         except Exception as exc:
@@ -66,6 +68,7 @@ def run_triage(config, store, bridge, installed, blocked=()):
             adapter = todoist()
             triage.triage_todoist(store, config, bridge(), adapter)
             triage.propose_agent_tasks(store, config, adapter)
+            triage.check_waiting(store, config, bridge(), adapter, new_mail)
         except Exception as exc:
             errors.append(f"triage todoist: {exc}")
     if store.db.execute("SELECT 1 FROM followups WHERE status IN ('pending','retry_pending')").fetchone():

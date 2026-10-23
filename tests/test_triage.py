@@ -205,7 +205,7 @@ def test_todoist_settle_apply_plan_and_run(store, config):
     message = json.loads(jobs["questions"]["payload"])["open_message"]
     assert "Umyć samochód** → Dom · P4" in message and "Blog to bieżący cel." in message
     assert "po Twoim OK:** 1 (Napisać post na bloga)" in message and "1: O czym ma być post?" in message
-    assert "- 1: `td task update id:A --labels hermes --due today`" in message
+    assert "- 1: td task update id:A --labels hermes --due today" in message
     assert "Zadań stąd nie wykonuję" in message
     assert jobs["questions"]["title"] == "Todoist: plan do zatwierdzenia (2)"
     states = dict(store.db.execute("SELECT item_id, decision FROM triage_items").fetchall())
@@ -468,5 +468,49 @@ def test_agent_tasks_in_current_filters_are_proposed_once(store, config):
     job = [row for row in store.rows() if row["source"] == "proposals"][0]
     message = json.loads(job["payload"])["open_message"]
     assert "**Odnowić domenę** · Biznes › Blog · P2 (Bieżące: Praca)" in message
-    assert "- 1: `td task update id:1 --due today`" in message and "niczego z listy nie wykonuję" in message
+    assert "- 1: td task update id:1 --due today" in message and "niczego z listy nie wykonuję" in message
     assert triage.propose_agent_tasks(store, config, adapter) == []  # not offered twice
+
+
+class WaitingAdapter(Adapter):
+    def __init__(self, waiting):
+        super().__init__([])
+        self.waiting, self.comments, self.waiting_calls = waiting, [], 0
+
+    def waiting_tasks(self, settings, labels):
+        self.waiting_calls += 1
+        return self.waiting
+
+    def add_comment(self, settings, task_id, text):
+        self.comments.append((task_id, text))
+
+
+def test_waiting_task_ready_after_mail_opens_one_session(store, config):
+    adapter = WaitingAdapter([{"id": "W", "content": "Rolki dla taty", "labels": ["czekam", "hermes"],
+                               "projectId": "P-home", "comments": ["Czekam na maila od taty"]},
+                              {"id": "X", "content": "Kredyt", "labels": ["czekam"], "projectId": "P-home"}])
+    dad = mail("D1", "T7", subject="Pliki do rolek", sender="Tata <tata@example.test>")
+    hermes = Fake(replies=[[{"task_id": "W", "mail": 0, "ready": True, "got": "tata przysłał pliki rolek"},
+                            {"task_id": "X", "mail": 0, "ready": False, "got": "wstępna oferta",
+                             "missing": "decyzja banku"},
+                            {"task_id": "nope", "mail": 0, "ready": True}],
+                           []])
+    found = triage.check_waiting(store, config, hermes, adapter, [dad])
+    assert [(task["id"], ready) for task, _, ready in found] == [("W", True), ("X", False)]
+    job = [row for row in store.rows() if row["source"] == "unblocked"][0]
+    message = json.loads(job["payload"])["open_message"]
+    assert job["title"] == "Odblokowane: Rolki dla taty"
+    assert "Przyszło: Tata, „Pliki do rolek”" in message and "agent ruszy w osobnej sesji" in message
+    assert "td task update id:W --labels hermes --due today" in message and "<!--" in message
+    assert adapter.comments == [("X", "Hermes: przyszło od Tata („Pliki do rolek”): wstępna oferta. "
+                                      "Brakuje jeszcze: decyzja banku.")]
+    # The same mail never speaks up twice; the waiting list is cached.
+    assert triage.check_waiting(store, config, hermes, adapter, [dad]) == []
+    assert adapter.waiting_calls == 1
+
+
+def test_no_waiting_check_without_mail_or_waiting_tasks(store, config):
+    hermes = Fake()
+    assert triage.check_waiting(store, config, hermes, WaitingAdapter([]), [mail("M")]) == []
+    assert triage.check_waiting(store, config, hermes, WaitingAdapter([{"id": "W", "content": "x"}]), []) == []
+    assert hermes.prompts == []
