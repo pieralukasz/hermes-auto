@@ -114,6 +114,27 @@ hermes-auto source setup proton
 
 Apply **`Hermes Watch`** to a message in a conversation (or **`Hermes Agent`**, `agent_mailbox`, for the full agent, as with Gmail). Replies are matched through RFC `Message-ID`, `In-Reply-To` and `References`, not subject similarity. As with Gmail, the first poll establishes a baseline. Missing/broken threading headers cannot be reliably matched; those messages will not trigger automatically. The adapter reads up to 256 KiB of raw MIME per reply and supplies at most 20,000 text characters to Hermes. MIME may contain attachment bytes, but attachments are not extracted or supplied to the model. Read-only mailboxes and `BODY.PEEK` preserve read flags.
 
+## Sorter (opt-in)
+
+Instead of labelling threads and tasks yourself, let the sorter look at everything new:
+
+```json
+"triage": {
+  "enabled": true,
+  "model": "claude-sonnet-4-6",
+  "brief_times": ["07:45", "16:30"],
+  "hide_sessions": true,
+  "todoist": {"apply": true, "settle_minutes": 15}
+}
+```
+
+- **Mail (Gmail, Proton):** every new inbox message gets one decision. *Session*: a person expects your answer or action, so a conversation opens with a summary and a reply draft. *Brief*: worth knowing, listed in the next brief at `brief_times`. *Skip*: marketing and noise. Adjust `mail_criteria` in plain language. Message notifications from LinkedIn and similar services count as mail from that person.
+- **Replies go back to their conversation.** When someone answers mail you sent from a Hermes session, the reply lands in that same session (unarchived if needed) with a summary and a draft, instead of a new conversation.
+- **Third-party mail never runs with tools.** Both cases are summary and draft only; tools return when you continue the conversation yourself. Nothing is sent.
+- **Todoist Inbox:** a task that has sat in the Inbox for `settle_minutes` is moved to the fitting list, gets a priority only when the task makes it evident, and gets the `hermes` label when the agent can do it (no due date: the agent starts right away). What the sorter cannot decide (usually the priority) is asked in one "questions" session; answer there and the agent applies it. `apply: false` decides without changing anything.
+- `hermes-auto triage-preview --days 14` shows what the sorter would decide for recent mail and the current Inbox, without changing anything (it does spend model tokens). The report is written to `triage-preview.md` in the automation home.
+- Desktop: copy `desktop-plugin/hermes-auto` to `~/.hermes/desktop-plugins/hermes-auto`. It adds an **Auto** row to the sidebar with every automation session; `hide_sessions` keeps them out of the main Sessions list.
+
 ## Operate
 
 ```sh

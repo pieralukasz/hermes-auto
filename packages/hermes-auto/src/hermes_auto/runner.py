@@ -14,6 +14,13 @@ def full_tools(job):
 
 
 def prompt_for(job, config, retry=False):
+    from .triage import INTERNAL_SOURCES, internal_prompt, mail_session_prompt
+    if job["source"] in INTERNAL_SOURCES:
+        return internal_prompt(job, config)
+    triaged = json.loads(job["payload"]).get("triage") if job["source"] != "todoist" else None
+    if triaged and not retry:
+        # New mail the sorter flagged: summary and reply draft, tools blocked for this step.
+        return mail_session_prompt(json.loads(job["payload"]), triaged.get("reason", ""), config)
     if retry:
         base = ("The user explicitly requested continuation of the interrupted preparation. "
                 "Inspect this conversation, avoid repeating completed work, and finish the original request. ")
@@ -76,12 +83,19 @@ def prompt_for(job, config, retry=False):
     )
 
 
+def source_enabled(job, config):
+    from .triage import INTERNAL_SOURCES
+    if job["source"] in INTERNAL_SOURCES:
+        return bool(config.get("triage", {}).get("enabled"))
+    return bool(config["sources"].get(job["source"], {}).get("enabled"))
+
+
 def process_jobs(store, config, hermes, blocked_sources=()):
     store.recover()
     processed = 0
     failures = 0
     for job in store.rows():
-        if job["source"] in blocked_sources or not config["sources"].get(job["source"], {}).get("enabled"):
+        if job["source"] in blocked_sources or not source_enabled(job, config):
             continue
         if job["status"] not in ("pending", "created", "retry_pending"):
             continue

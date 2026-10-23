@@ -18,7 +18,8 @@ def test_real_session_api_two_profiles(tmp_path):
         hermes_home.mkdir(exist_ok=True)
         config = {**defaults(), "hermes_home": str(hermes_home),
                   "hermes_python": os.environ["HERMES_AUTO_TEST_PYTHON"],
-                  "hermes_source": os.environ["HERMES_AUTO_TEST_SOURCE"]}
+                  "hermes_source": os.environ["HERMES_AUTO_TEST_SOURCE"],
+                  "triage": {"hide_sessions": True}}
         store = Store(home, initialize=True)
         try:
             store.enqueue("example", "todoist", "x", "Integration test", "open", {})
@@ -28,9 +29,12 @@ def test_real_session_api_two_profiles(tmp_path):
             assert hermes.invoke("doctor")["ok"]
             hermes.create(job, "Synthetic test context")
             hermes.create(job, "Synthetic test context")
-            assert hermes.invoke("inspect", job) == {"exists": True, "messages": 2, "archived": False}
+            info = hermes.invoke("inspect", job)
+            assert (info["exists"], info["messages"], info["archived"]) == (True, 2, False)
             assert hermes.archive_states([job["session_id"], "missing"]) == {
                 job["session_id"]: False, "missing": None}
+            assert hermes.unarchive(job["session_id"])["archived"] is False
+            assert hermes.find_session(subject="Synthetic subject", sent=[{"ts": 1.0, "to": []}]) is None
             ids.append(job["session_id"])
         finally:
             store.close()

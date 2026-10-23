@@ -57,6 +57,21 @@ class Store:
             CREATE TABLE IF NOT EXISTS seen_items (
                 account TEXT NOT NULL, item_id TEXT NOT NULL, PRIMARY KEY(account, item_id)
             );
+            -- Triage: one row per inbox item the sorter has seen, with its decision.
+            CREATE TABLE IF NOT EXISTS triage_items (
+                account TEXT NOT NULL, item_id TEXT NOT NULL, kind TEXT NOT NULL,
+                decision TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '',
+                payload TEXT NOT NULL DEFAULT '{}', briefed INTEGER NOT NULL DEFAULT 0,
+                created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(account, item_id)
+            );
+            -- Replies routed into the existing Hermes session that sent the original message.
+            CREATE TABLE IF NOT EXISTS followups (
+                id INTEGER PRIMARY KEY, event_key TEXT NOT NULL UNIQUE, source TEXT NOT NULL,
+                session_id TEXT NOT NULL, title TEXT NOT NULL, payload TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+                error TEXT NOT NULL DEFAULT '', created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
         """)
         if self.db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
             raise RuntimeError("Automation database is damaged; restore a backup")

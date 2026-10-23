@@ -35,6 +35,99 @@ def poll(config, store):
     return errors
 
 
+def run_triage(config, store, bridge, installed, blocked=()):
+    """Sorter step: mail and Inbox tasks get decisions; replies return to their sessions; briefs.
+
+    Returns (errors, failures). A source that failed to read keeps its cursor and retries later.
+    """
+    from . import triage
+    options = triage.settings(config)
+    if not options["enabled"]:
+        return [], 0
+    errors, failures = [], 0
+    for name in ("gmail", "proton"):
+        settings = config["sources"].get(name, {})
+        source = installed.get(name)
+        if not settings.get("enabled") or name in blocked or source is None or not hasattr(source, "inbox"):
+            continue
+        try:
+            candidates, key, cursor = source().inbox(config, store, limit=options["max_mail_per_run"])
+            if candidates:
+                account = candidates[0].get("account", "")
+                triage.triage_mail(store, config, bridge(), name, account, candidates, key, cursor)
+            else:
+                store.set_meta(key, cursor)
+        except Exception as exc:
+            errors.append(f"triage {name}: {exc}")
+    todoist = installed.get("todoist")
+    if (options["todoist"]["enabled"] and config["sources"].get("todoist", {}).get("enabled")
+            and "todoist" not in blocked and todoist is not None and hasattr(todoist, "inbox_tasks")):
+        try:
+            triage.triage_todoist(store, config, bridge(), todoist())
+        except Exception as exc:
+            errors.append(f"triage todoist: {exc}")
+    if store.db.execute("SELECT 1 FROM followups WHERE status IN ('pending','retry_pending')").fetchone():
+        failures += triage.process_followups(store, config, bridge())
+    triage.maybe_brief(store, config)
+    return errors, failures
+
+
+def triage_preview(config, store, home, days):
+    """Read-only: what the sorter would decide for the last `days` of mail and the current Inbox."""
+    from . import triage
+    hermes = Hermes(config, home)
+    installed = sources()
+    since_ms = int((time.time() - days * 86400) * 1000)
+    lines = [f"# Podgląd sortownika: ostatnie {days} dni", ""]
+    for name in ("gmail", "proton"):
+        if not config["sources"].get(name, {}).get("enabled") or name not in installed:
+            continue
+        candidates, _, _ = installed[name]().inbox(config, store, limit=400, since_ms=since_ms)
+        routed, unknown = [], []
+        for item in candidates:
+            session = hermes.find_session(thread_id=item.get("thread_id"), subject=item.get("subject"),
+                                          sent=item["sent"]) if item.get("sent") else None
+            (routed.append((item, session)) if session else unknown.append(item))
+        decisions = {}
+        for start in range(0, len(unknown), 25):
+            batch = unknown[start:start + 25]
+            for index, verdict in triage.classify_mail(hermes, config, batch).items():
+                decisions[start + index] = verdict
+        counts = {}
+        for verdict in decisions.values():
+            counts[verdict["decision"]] = counts.get(verdict["decision"], 0) + 1
+        lines += [f"## {name}: {len(candidates)} maili", "",
+                  f"Do sesji nadawcy (odpowiedzi): {len(routed)}; " +
+                  "; ".join(f"{key}: {value}" for key, value in sorted(counts.items())), ""]
+        for item, session in routed:
+            lines.append(f"- followup → `{session}` · {item['from']} · {item['subject']}")
+        for decision in ("session", "brief", "skip"):
+            rows = [(unknown[i], v) for i, v in sorted(decisions.items()) if v["decision"] == decision]
+            if rows:
+                lines += ["", f"### {decision} ({len(rows)})"]
+                lines += [f"- {item['date'][:16]} · {item['from']} · {item['subject']}: {v['summary']} "
+                          f"_({v['reason']})_" for item, v in rows]
+        lines.append("")
+    if config["sources"].get("todoist", {}).get("enabled") and "todoist" in installed:
+        adapter = installed["todoist"]()
+        tasks = [task for task in adapter.inbox_tasks(config["sources"]["todoist"]) if not task.get("parentId")]
+        outline = adapter.outline(config["sources"]["todoist"], store, 24)
+        decisions = triage.classify_tasks(hermes, config, tasks, outline) if tasks else {}
+        lines += [f"## Todoist Inbox: {len(tasks)} zadań", ""]
+        for task in tasks:
+            d = decisions[str(task["id"])]
+            extra = f" · pytanie: {d['question']}" + (f" (propozycja: {d['proposal']})" if d["proposal"] else "") \
+                if d["question"] else ""
+            lines.append(f"- **{task['content']}** → {d['project_path'] or 'Inbox'} · "
+                         f"{(d['priority'] or '-').upper()} · agent: {'tak' if d['agent'] else 'nie'}"
+                         f" ({d['agent_reason']}){extra}")
+    report = home / "triage-preview.md"
+    fd = os.open(report, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as stream:
+        stream.write("\n".join(lines) + "\n")
+    return report
+
+
 def eligible_tick(config, store):
     if config["desktop_only"]:
         result = subprocess.run(["pgrep", "-x", config["desktop_process"]],
@@ -86,6 +179,8 @@ def parser():
     commands.add_parser("run", help="Discover events and prepare pending jobs now")
     scan = commands.add_parser("scan", help="Discover events without starting Hermes or spending LLM tokens")
     scan.add_argument("--dry-run", action="store_true", help="Use a temporary state copy; do not advance baselines")
+    preview = commands.add_parser("triage-preview", help="Read-only: what the sorter would decide (spends LLM tokens)")
+    preview.add_argument("--days", type=int, default=14)
     source = commands.add_parser("source", help="Enable or disable an installed adapter")
     source.add_argument("action", choices=["list", "enable", "disable", "setup"])
     source.add_argument("name", nargs="?")
@@ -176,6 +271,14 @@ def dispatch(args, home, config, store):
                 raise ValueError("The session was deleted; it will not be recreated by retry")
             store.update(job["id"], status="retry_pending", error="")
         print("Queued. Run 'hermes-auto run' or wait for the next scheduled check.")
+    elif command == "triage-preview":
+        with tempfile.TemporaryDirectory(prefix="hermes-auto-preview-") as directory:
+            preview = Store(Path(directory), initialize=True)
+            try:
+                store.db.backup(preview.db)
+                print(triage_preview(config, preview, home, args.days))
+            finally:
+                preview.close()
     elif command == "scan" and args.dry_run:
         with tempfile.TemporaryDirectory(prefix="hermes-auto-preview-") as directory:
             temporary_home = Path(directory)
@@ -204,9 +307,13 @@ def dispatch(args, home, config, store):
             hermes = hermes or Hermes(config, home)
             return hermes
 
+        if command != "scan":
+            triage_errors, triage_failures = run_triage(config, store, bridge, sources(), blocked)
+            errors = errors + triage_errors
+            failures += triage_failures
         if command != "scan" and any(j["status"] in ("pending", "created", "retry_pending", "running", "creating")
                                      for j in store.rows()):
-            failures = process_jobs(store, config, bridge(), blocked_sources=blocked)
+            failures += process_jobs(store, config, bridge(), blocked_sources=blocked)
         if command != "scan":
             # Archiving a prepared session in Hermes closes its source item (Todoist: completes the task).
             finish_errors = sync_finished(store, config, bridge, sources(), blocked)

@@ -44,7 +44,8 @@ class Hermes:
             with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
                 process = subprocess.Popen(command, stdout=out, stderr=err, start_new_session=True)
                 try:
-                    process.wait(timeout=self.budget(job) + 30 if action == "run" else 90)
+                    process.wait(timeout=self.budget(job) + 30 if action == "run" else
+                                 240 if action == "classify" else 90)
                 except (subprocess.TimeoutExpired, KeyboardInterrupt):
                     os.killpg(process.pid, signal.SIGTERM)
                     try:
@@ -90,11 +91,25 @@ class Hermes:
                 return records[-1]
 
     def budget(self, job):
-        key = "agent_run_budget_seconds" if job and full_tools(job) else "run_budget_seconds"
+        key = ("agent_run_budget_seconds" if job and full_tools(job) and not job.get("deny_tools")
+               else "run_budget_seconds")
         return self.config[key]
 
     def exists(self, job):
         return self.invoke("inspect", job)["exists"]
+
+    def inspect(self, session_id):
+        return self.invoke("inspect", {"session_id": session_id})
+
+    def classify(self, system, user, max_tokens=4000):
+        """One model call through Hermes' configured provider; returns the parsed JSON reply."""
+        return self.invoke("classify", system=system, user=user, max_tokens=max_tokens)["result"]
+
+    def find_session(self, **query):
+        return self.invoke("find_session", **query)["session_id"]
+
+    def unarchive(self, session_id):
+        return self.invoke("unarchive", {"session_id": session_id})
 
     def archive_states(self, session_ids):
         """{session_id: True archived / False open / None missing}, one bridge process for all."""
@@ -105,10 +120,14 @@ class Hermes:
 
     def create(self, job, prompt):
         title = session_title(job)
-        message = ("Sesja jest gotowa. Automatyczne przygotowanie jest wyłączone; możesz zacząć rozmowę."
-                   if self.config["language"].lower() in ("polish", "polski", "pl") else
-                   "This session is ready. Automatic preparation is disabled; continue when you are ready.")
-        return self.invoke("create", job, title=title, prompt=prompt, open_message=message)
+        payload = json.loads(job.get("payload") or "{}")
+        message = payload.get("open_message") or (
+            "Sesja jest gotowa. Automatyczne przygotowanie jest wyłączone; możesz zacząć rozmowę."
+            if self.config["language"].lower() in ("polish", "polski", "pl") else
+            "This session is ready. Automatic preparation is disabled; continue when you are ready.")
+        hidden = bool(self.config.get("triage", {}).get("hide_sessions", False))
+        return self.invoke("create", job, title=title, prompt=prompt, open_message=message, hidden=hidden)
 
     def run(self, job, prompt):
-        return self.invoke("run", job, prompt=prompt, full_tools=full_tools(job))
+        deny = bool(job.get("deny_tools") or json.loads(job.get("payload") or "{}").get("deny_tools"))
+        return self.invoke("run", job, prompt=prompt, full_tools=full_tools(job), deny_tools=deny)

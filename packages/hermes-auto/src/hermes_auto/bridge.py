@@ -56,6 +56,130 @@ def desktop_parity(agent_class):
     agent_class.__init__ = desktop_init
 
 
+def deny_tool_execution(agent_class, allowed=frozenset()):
+    """Keep the session's normal tool list (and so its stored prompt) but refuse to execute tools.
+
+    Used when third-party mail enters a conversation: the model may ask for a tool, every call
+    outside `allowed` gets an error result instead of running, and the turn continues. Filtering
+    the tool list instead would rebuild the stored system prompt with a reduced toolset, and the
+    user's later turns in that session would lose their tools.
+    """
+    from agent.turn_tool_validation import _append_tool_error_results
+    original = agent_class._execute_tool_calls
+
+    def guarded(self, assistant_message, messages, *args, **kwargs):
+        calls = list(getattr(assistant_message, "tool_calls", None) or [])
+        blocked = [call for call in calls if call.function.name not in allowed]
+        if not blocked:
+            return original(self, assistant_message, messages, *args, **kwargs)
+        _append_tool_error_results(messages, calls, lambda call: json.dumps({
+            "error": "Tools are disabled for this automatic step (third-party mail). "
+                     "Answer from the conversation and the message only."}))
+        return None
+
+    agent_class._execute_tool_calls = guarded
+    init = agent_class.__init__
+
+    def quiet_init(self, *args, **kwargs):
+        kwargs["skip_background_review"] = True
+        init(self, *args, **kwargs)
+
+    agent_class.__init__ = quiet_init
+
+
+def parse_json_block(text):
+    """The first JSON value in a model reply, tolerating fences and prose around it."""
+    text = (text or "").strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+        text = text.rsplit("```", 1)[0]
+    decoder = json.JSONDecoder()
+    for start, char in enumerate(text):
+        if char in "[{":
+            try:
+                return decoder.raw_decode(text[start:])[0]
+            except ValueError:
+                continue
+    raise ValueError("Model reply contained no JSON")
+
+
+def classify(config, request):
+    from agent.auxiliary_client import call_llm
+    triage = config.get("triage", {})
+    route = {}
+    response = call_llm(task="hermes_auto_triage", provider=triage.get("provider") or "anthropic",
+                        model=triage.get("model") or "claude-sonnet-4-6",
+                        messages=[{"role": "system", "content": request["system"]},
+                                  {"role": "user", "content": request["user"]}],
+                        max_tokens=int(request.get("max_tokens") or 4000), temperature=0, timeout=180,
+                        route_info=route)
+    return {"result": parse_json_block(response.choices[0].message.content), "route": route}
+
+
+SUBJECT_PREFIX = ("re:", "fwd:", "fw:", "odp:", "pd:", "aw:", "wg:")
+
+
+def normalized_subject(subject):
+    text = " ".join(str(subject or "").split())
+    while text.casefold().startswith(SUBJECT_PREFIX):
+        text = text.split(":", 1)[1].strip()
+    return text
+
+
+def rowid_at(conn, timestamp):
+    """Smallest message rowid whose timestamp is >= `timestamp` (rowids grow with time)."""
+    lo, hi = conn.execute("SELECT MIN(id), MAX(id) FROM messages").fetchone()
+    if lo is None:
+        return 0
+    while lo < hi:
+        mid = (lo + hi) // 2
+        row = conn.execute("SELECT timestamp FROM messages WHERE id>=? ORDER BY id LIMIT 1", (mid,)).fetchone()
+        if row is None or row[0] >= timestamp:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
+def find_session(db_path, request):
+    """Which Hermes session sent the message this reply answers? Read-only, newest send first.
+
+    A send from a session leaves the subject or the recipient in that session's tool calls or
+    results within minutes of Gmail/Proton recording it as sent. Searching a bounded rowid window
+    around each send time keeps this to a few thousand rows instead of the whole history.
+    """
+    import sqlite3
+    conn = sqlite3.connect(Path(db_path).as_uri() + "?mode=ro", uri=True, timeout=10)
+    try:
+        subject = normalized_subject(request.get("subject"))
+        needles = [value for value in (request.get("thread_id"), subject if len(subject) >= 6 else "")
+                   if value]
+        for sent in sorted(request.get("sent", []), key=lambda item: -item["ts"]):
+            first = rowid_at(conn, sent["ts"] - 1800)
+            last = rowid_at(conn, sent["ts"] + 300)
+            terms = needles + [address for address in sent.get("to", []) if "@" in address]
+            if not terms:
+                continue
+            clauses = " OR ".join("instr(coalesce(content,''),?) OR instr(coalesce(tool_calls,''),?)"
+                                  for _ in terms)
+            params = [value for term in terms for value in (term, term)]
+            rows = conn.execute(
+                f"SELECT session_id, timestamp FROM messages WHERE id BETWEEN ? AND ? AND ({clauses})",
+                (first, last, *params)).fetchall()
+            sessions = {}
+            for session_id, timestamp in rows:
+                distance = abs(timestamp - sent["ts"])
+                sessions[session_id] = min(sessions.get(session_id, distance), distance)
+            excluded = set(request.get("exclude", []))
+            ranked = sorted((distance, session_id) for session_id, distance in sessions.items()
+                            if session_id not in excluded)
+            if ranked:
+                return ranked[0][1]
+        return None
+    finally:
+        conn.close()
+
+
 def main():
     request = json.loads(Path(sys.argv[1]).read_text())
     config = request["config"]
@@ -77,6 +201,11 @@ def main():
         import inspect
         assert callable(AIAgent._execute_tool_calls)
         assert "output_format" in inspect.signature(cli_main).parameters
+        # Sorter dependencies: no-tools turns and the classifier's model call.
+        from agent.turn_tool_validation import _append_tool_error_results
+        from agent.auxiliary_client import call_llm
+        assert callable(_append_tool_error_results) and callable(call_llm)
+        assert callable(db.set_session_hidden) and callable(db.set_session_archived)
         print(json.dumps({"ok": True, "python": sys.executable, "source": config["hermes_source"]}))
         db.close()
         return
@@ -89,12 +218,34 @@ def main():
         print(json.dumps({"states": states}))
         db.close()
         return
+    if action == "classify":
+        db.close()
+        print(json.dumps(classify(config, request), ensure_ascii=False))
+        return
+    if action == "find_session":
+        found = find_session(Path(config["hermes_home"]) / "state.db", request)
+        if found:
+            # A compression continuation carries the conversation on under a newer id.
+            found = db.resolve_resume_session_id(found) or found
+        print(json.dumps({"session_id": found}))
+        db.close()
+        return
     session = db.get_session(sid)
     if action == "inspect":
         print(json.dumps({"exists": session is not None,
                           "messages": session.get("message_count", 0) if session else 0,
-                          "archived": bool(session.get("archived")) if session else False}))
+                          "archived": bool(session.get("archived")) if session else False,
+                          "last_active": session.get("last_activity_at") if session else None}))
         db.close()
+        return
+    if action == "unarchive":
+        # Bring the user's conversation back before a reply lands in it.
+        if session is None:
+            raise RuntimeError("Target session is missing")
+        if session.get("archived"):
+            db.set_session_archived(sid, False)
+        db.close()
+        print(json.dumps({"session_id": sid, "archived": False}))
         return
     if action == "create":
         if session is None:
@@ -102,6 +253,9 @@ def main():
         if session is None or not session.get("title"):
             # A failed earlier create can leave an untitled session; finish it instead of skipping.
             db.set_session_title(sid, request["title"][:db.MAX_TITLE_LENGTH])
+        if request.get("hidden"):
+            # Listed in the Desktop "Auto" page instead of the main Sessions list.
+            db.set_session_hidden(sid, True)
         if job["mode"] == "open" and not db.get_messages(sid):
             db.append_message(sid, "user", content=request["prompt"])
             db.append_message(sid, "assistant", content=request["open_message"])
@@ -117,6 +271,14 @@ def main():
     # Only this worker's in-memory configuration changes. Interactive Hermes keeps its settings.
     # Unattended runs never get interactive approval: dangerous commands are denied.
     cli.CLI_CONFIG["approvals"] = {"mode": "manual", "single_query_mode": "deny"}
+    if request.get("deny_tools"):
+        # Third-party mail inside a normal session: the session keeps its full toolset and prompt,
+        # nothing but skill lookups executes during this turn.
+        desktop_parity(AIAgent)
+        deny_tool_execution(AIAgent, frozenset({"skill_view", "skills_list"}))
+        cli.main(query=request["prompt"], resume=sid, quiet=True, oneshot=True, output_format="stream-json",
+                 max_turns=config["max_turns"], run_budget=config["run_budget_seconds"])
+        return
     if request.get("full_tools"):
         # Todoist tasks and mail the user labelled for the agent: normal toolsets, skills and project rules.
         desktop_parity(AIAgent)

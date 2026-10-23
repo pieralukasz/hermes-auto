@@ -91,7 +91,8 @@ def poll_todoist(config, store, run=command_json, now=None):
     with store.db:
         live_ids = {str(task["id"]) for task in tasks}
         for row in store.db.execute("SELECT id,external_id,status FROM jobs WHERE source='todoist' "
-                                    "AND status IN ('pending','created','retry_pending')").fetchall():
+                                    "AND status IN ('pending','created','retry_pending') "
+                                    "AND json_extract(payload,'$.triage_run') IS NULL").fetchall():
             if row["external_id"] not in live_ids:
                 status = "deferred" if row["status"] == "pending" else "needs_attention"
                 store.db.execute("UPDATE jobs SET status=?,error=? WHERE id=?",
@@ -179,11 +180,91 @@ def finish_task(td, job, read=command_json, write=command_run):
     return "Archived in Hermes; task completed in Todoist"
 
 
+def inbox_project_id(td, read=command_json):
+    for project in items(read([td, "project", "list", "--all", "--json"])):
+        if "/project/inbox-" in str(project.get("url", "")) or project.get("inboxProject"):
+            return str(project["id"])
+    raise RuntimeError("Todoist Inbox project not found")
+
+
+def inbox_tasks(td, read=command_json):
+    return items(read([td, "task", "list", "--project", f"id:{inbox_project_id(td, read)}", "--all", "--json"]))
+
+
+def build_outline(td, read=command_json):
+    """Lists with their path, description, sections and a few task titles: the sorter's map."""
+    projects = items(read([td, "project", "list", "--all", "--json"]))
+    by_id = {str(project["id"]): project for project in projects}
+
+    def path(project):
+        names, seen = [], set()
+        while project and str(project["id"]) not in seen:
+            seen.add(str(project["id"]))
+            names.append(project["name"])
+            project = by_id.get(str(project.get("parentId"))) if project.get("parentId") else None
+        return " › ".join(reversed(names))
+
+    samples = {}
+    for task in items(read([td, "task", "list", "--all", "--json"])):
+        bucket = samples.setdefault(str(task.get("projectId")), [])
+        if len(bucket) < 6 and not task.get("parentId"):
+            bucket.append(" ".join(str(task.get("content", "")).split())[:80])
+    outline = []
+    for project in projects:
+        if "/project/inbox-" in str(project.get("url", "")) or project.get("isArchived"):
+            continue
+        sections = items(read([td, "section", "list", "--project", f"id:{project['id']}", "--all", "--json"]))
+        outline.append({"id": str(project["id"]), "path": path(project),
+                        "description": " ".join(str(project.get("description") or "").split()),
+                        "sections": [{"id": str(s["id"]), "name": s["name"]} for s in sections],
+                        "samples": samples.get(str(project["id"]), [])})
+    return {"projects": outline}
+
+
+def apply_decision(td, task, decision, agent_label, read=command_json, write=command_run):
+    """Move, prioritise and label one Inbox task; read it back. Returns what was changed."""
+    applied = {}
+    ref = f"id:{task['id']}"
+    if decision.get("project_id"):
+        command = [td, "task", "move", ref, "--project", f"id:{decision['project_id']}"]
+        if decision.get("section_id"):
+            command += ["--section", f"id:{decision['section_id']}"]
+        write(command)
+        applied["project_id"] = decision["project_id"]
+    if decision.get("priority"):
+        write([td, "task", "update", ref, "--priority", decision["priority"]])
+        applied["priority"] = decision["priority"]
+    recurring = bool((task.get("due") or {}).get("isRecurring"))
+    if decision.get("agent") and agent_label not in task.get("labels", []):
+        write([td, "task", "update", ref, "--labels", ",".join([*task.get("labels", []), agent_label])])
+        applied["agent"] = True
+        # No due date: the scheduled poller would never pick it up, so the sorter starts it now.
+        applied["run"] = not task.get("due") and not recurring
+    current = read([td, "task", "view", ref, "--full", "--json"])
+    if decision.get("project_id") and str(current.get("projectId")) != decision["project_id"]:
+        raise RuntimeError(f"Task {task['id']} did not move; check Todoist")
+    return applied
+
+
 class Source:
     @staticmethod
     def defaults():
         return {"enabled": True, "label": "hermes", "mode": "agent", "complete_on_archive": True,
                 "command": shutil.which("td") or "td"}
+
+    def inbox_tasks(self, settings):
+        return inbox_tasks(settings["command"])
+
+    def outline(self, settings, store, max_age_hours=24):
+        cached = store.get_meta("todoist_outline")
+        if cached and dt.datetime.now().timestamp() - cached["at"] < max_age_hours * 3600:
+            return cached["outline"]
+        outline = build_outline(settings["command"])
+        store.set_meta("todoist_outline", {"at": dt.datetime.now().timestamp(), "outline": outline})
+        return outline
+
+    def apply(self, settings, task, decision, agent_label):
+        return apply_decision(settings["command"], task, decision, agent_label)
 
     def finish(self, config, job):
         return finish_task(config["sources"]["todoist"]["command"], job)
