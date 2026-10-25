@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from .config import private_json
+from .config import model_route, private_json
 from .runner import full_tools
 
 # Hermes SessionDB.MAX_TITLE_LENGTH; a longer title makes session creation fail.
@@ -18,6 +18,15 @@ def deny_mode(job):
     """False (normal run), True (mail: plain reads only) or a named read profile such as "slack"."""
     value = job.get("deny_tools") or json.loads(job.get("payload") or "{}").get("deny_tools")
     return value if isinstance(value, str) and value else bool(value)
+
+
+def job_route(job, config):
+    """The `routes` rule for a job's runs (e.g. a work organisation's Slack and GitHub on its account)."""
+    try:
+        payload = json.loads((job or {}).get("payload") or "{}")
+    except ValueError:
+        payload = {}
+    return model_route(config, (job or {}).get("source", ""), payload if isinstance(payload, dict) else {})
 
 
 def session_title(job, limit=TITLE_LIMIT, prefix=""):
@@ -140,7 +149,8 @@ class Hermes:
         request = directory / "request.json"
         deny = deny_mode(job)
         private_json(request, {"action": "run", "config": self.config, "job": job, "prompt": prompt,
-                               "full_tools": full_tools(job), "deny_tools": deny})
+                               "full_tools": full_tools(job), "deny_tools": deny,
+                               "route": job_route(job, self.config)})
         command = [self.python, "-I", str(Path(__file__).with_name("bridge.py")), str(request)]
         script = 'umask 077; "$@" >"$OUT" 2>"$ERR"; echo $? >"$CODE.tmp" && mv "$CODE.tmp" "$CODE"'
         env = {**os.environ, "OUT": str(directory / "stdout"), "ERR": str(directory / "stderr"),
@@ -197,9 +207,9 @@ class Hermes:
     def inspect(self, session_id):
         return self.invoke("inspect", {"session_id": session_id})
 
-    def classify(self, system, user, max_tokens=4000):
-        """One model call through Hermes' configured provider; returns the parsed JSON reply."""
-        return self.invoke("classify", system=system, user=user, max_tokens=max_tokens)["result"]
+    def classify(self, system, user, max_tokens=4000, route=None):
+        """One model call through Hermes; `route` (provider/model) overrides the sorter's default model."""
+        return self.invoke("classify", system=system, user=user, max_tokens=max_tokens, route=route or {})["result"]
 
     def find_session(self, **query):
         return self.invoke("find_session", **query)["session_id"]
@@ -232,4 +242,5 @@ class Hermes:
 
     def run(self, job, prompt):
         deny = deny_mode(job)
-        return self.invoke("run", job, prompt=prompt, full_tools=full_tools(job), deny_tools=deny)
+        return self.invoke("run", job, prompt=prompt, full_tools=full_tools(job), deny_tools=deny,
+                           route=job_route(job, self.config))

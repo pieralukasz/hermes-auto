@@ -181,6 +181,14 @@ Instead of labelling threads and tasks yourself, let the sorter look at everythi
 - **Brief sections from local commands:** `triage.brief_sources` (e.g. a finance review) run at their brief time with `SINCE` set to their last success and print one JSON object: `title`, `summary` ("" = nothing new), `lines`, `questions` (`text`, `reason`, `proposal`), optional `propose_prompt`/`categories`/`context` (missing proposals are filled by one model call without tools), `evidence` (checked against `@czekam` tasks like mail) and `agent_note` (hidden instructions for the session). A failed run (server asleep) retries each check and posts on its own. You answer the questions in the brief session; the agent there applies them with full tools.
 - `hermes-auto triage-preview --days 14` shows what the sorter would decide for recent mail and the current Inbox, without changing anything (it does spend model tokens). The report is written to `triage-preview.md` in the automation home.
 - **Read at the source (`mark_read`, default on):** Gmail removes `UNREAD` from the specific shown message; Proton uses its captured INBOX UID and UIDVALIDITY (legacy marks without this identity stay `unsupported`). Slack marks DMs/group DMs only across a contiguous range of shown messages, never past an earlier item awaiting its session or brief. Channels, thread replies and GitHub notifications stay `unsupported` rather than hiding other unread content. Slack has no compare-and-set: a concurrent manual read may be moved backwards, making later messages unread again. Skipped noise is eligible immediately subject to the same ordering guard; failed sessions stay unread. Per-item results isolate failures and retry at most five times. Turning off marking or disabling a source cancels every pending mark (`disabled`), including marks waiting for unfinished jobs; re-enabling does not revive them.
+- **Separate accounts per organisation (`routes`):** the first matching rule picks the Hermes provider (and optionally model) for both the classifier and the session runs; everything unmatched keeps the sorter model and Hermes' default. `source` is the adapter, other keys compare with the event payload (case-insensitive). Replies in a thread ("↩") carry the same payload, so they stay on the same account.
+
+  ```json
+  "routes": [
+    {"match": {"source": "slack"}, "provider": "work-account"},
+    {"match": {"source": "github", "owner": "work-org"}, "provider": "work-account"}
+  ]
+  ```
 - Sessions appear in the normal Sessions list. Optional: `"hide_sessions": true` plus the Desktop plugin in `desktop-plugin/hermes-auto` (copy to `~/.hermes/desktop-plugins/hermes-auto`) moves them to a separate **Auto** page.
 
 ## Operate

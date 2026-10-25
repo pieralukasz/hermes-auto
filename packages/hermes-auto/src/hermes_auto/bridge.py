@@ -402,12 +402,20 @@ def parse_json_block(text):
     raise ValueError("Model reply contained no JSON")
 
 
+def route_kwargs(request):
+    """`cli.main` keyword arguments for the job's `routes` rule; empty keeps Hermes' configured model."""
+    route = request.get("route") or {}
+    return {key: route[key] for key in ("provider", "model") if route.get(key)}
+
+
 def classify(config, request):
     from agent.auxiliary_client import call_llm
     triage = config.get("triage", {})
+    chosen = route_kwargs(request)
     route = {}
-    response = call_llm(task="hermes_auto_triage", provider=triage.get("provider") or "anthropic",
-                        model=triage.get("model") or "claude-sonnet-5-5",
+    response = call_llm(task="hermes_auto_triage",
+                        provider=chosen.get("provider") or triage.get("provider") or "anthropic",
+                        model=chosen.get("model") or triage.get("model") or "claude-sonnet-5-5",
                         messages=[{"role": "system", "content": request["system"]},
                                   {"role": "user", "content": request["user"]}],
                         max_tokens=int(request.get("max_tokens") or 4000), temperature=0, timeout=180,
@@ -753,13 +761,15 @@ def main():
         research = profile in RESEARCH_PROFILES
         cli.main(query=request["prompt"], resume=sid, quiet=True, oneshot=True, output_format="stream-json",
                  max_turns=config["agent_max_turns" if research else "max_turns"],
-                 run_budget=config["agent_run_budget_seconds" if research else "run_budget_seconds"])
+                 run_budget=config["agent_run_budget_seconds" if research else "run_budget_seconds"],
+                 **route_kwargs(request))
         return
     if request.get("full_tools"):
         # Todoist tasks and mail the user labelled for the agent: normal toolsets, skills and project rules.
         desktop_parity(AIAgent)
         cli.main(query=request["prompt"], resume=sid, quiet=True, oneshot=True, output_format="stream-json",
-                 max_turns=config["agent_max_turns"], run_budget=config["agent_run_budget_seconds"])
+                 max_turns=config["agent_max_turns"], run_budget=config["agent_run_budget_seconds"],
+                 **route_kwargs(request))
         return
     allowed = {"web_search", "web_extract"} if job["mode"] in ("research", "agent") else set()
     guard_agent(AIAgent, allowed)
@@ -769,7 +779,7 @@ def main():
     cli.CLI_CONFIG["tool_search"] = {"enabled": "off"}
     cli.main(query=request["prompt"], resume=sid, quiet=True, oneshot=True,
              output_format="stream-json", toolsets="hermes-auto-preparation", ignore_rules=True,
-             max_turns=config["max_turns"], run_budget=config["run_budget_seconds"])
+             max_turns=config["max_turns"], run_budget=config["run_budget_seconds"], **route_kwargs(request))
 
 
 if __name__ == "__main__":

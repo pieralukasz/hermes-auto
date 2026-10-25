@@ -44,7 +44,33 @@ def read_config(home: Path) -> dict:
                 "agent_run_budget_seconds", "agent_max_turns"):
         if not isinstance(config[key], int) or isinstance(config[key], bool) or config[key] < 1:
             raise ValueError(f"{key} must be a positive integer")
+    routes = config.get("routes", [])
+    if not isinstance(routes, list) or not all(
+            isinstance(rule, dict) and isinstance(rule.get("match"), dict) and rule["match"]
+            and isinstance(rule.get("provider", ""), str) and isinstance(rule.get("model", ""), str)
+            and (rule.get("provider") or rule.get("model")) for rule in routes):
+        raise ValueError("routes must be a list of {match: {...}, provider and/or model}")
     return config
+
+
+ROUTE_FIELDS = ("provider", "model")
+
+
+def model_route(config: dict, source: str, data: dict | None = None) -> dict:
+    """Provider/model for one event: the first `routes` rule whose `match` fits, else {} (Hermes default).
+
+    A rule is {"match": {"source": "github", "owner": "acme"}, "provider": "...", "model": "..."}.
+    `source` is the adapter (the job's source or the item's kind); other keys compare with the event
+    payload, case-insensitively. This keeps one organisation's Slack and GitHub on its own account while
+    everything else stays on the default model. The classifier and the session runs use the same rule.
+    """
+    fields = {**(data or {}), "source": source}
+    for rule in config.get("routes") or []:
+        match = rule.get("match") or {}
+        if match and all(str(fields.get(key, "")).casefold() == str(value).casefold()
+                         for key, value in match.items()):
+            return {key: rule[key] for key in ROUTE_FIELDS if rule.get(key)}
+    return {}
 
 
 def private_json(path: Path, data: dict) -> None:

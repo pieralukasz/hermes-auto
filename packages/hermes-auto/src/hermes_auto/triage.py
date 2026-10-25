@@ -17,6 +17,8 @@ import secrets
 import uuid
 from email.utils import parseaddr
 
+from .config import model_route
+
 
 MAIL_DECISIONS = ("session", "brief", "skip")
 INTERNAL_SOURCES = ("brief", "questions", "proposals", "unblocked")
@@ -207,6 +209,18 @@ def classify_mail(hermes, config, items):
     """{index: {decision, reason, summary}} for each item; unknown decisions fall back to `brief`."""
     if not items:
         return {}
+    routes = [model_route(config, item.get("kind", ""), item) for item in items]
+    if any(route != routes[0] for route in routes):
+        # A work organisation's items are classified on its own account, the rest on the default one.
+        groups = {}
+        for index, route in enumerate(routes):
+            groups.setdefault(json.dumps(route, sort_keys=True), []).append(index)
+        decisions = {}
+        for indexes in groups.values():
+            part = classify_mail(hermes, config, [items[index] for index in indexes])
+            decisions.update({indexes[local]: verdict for local, verdict in part.items()})
+        return decisions
+    route = {"route": routes[0]} if routes[0] else {}
     triage = settings(config)
     if all(is_github(item) for item in items):
         system = (
@@ -220,7 +234,7 @@ def classify_mail(hermes, config, items):
                             "repo": item.get("place"), "reason": item.get("why"), "type": item.get("type"),
                             "text": str(item.get("body") or "")[:3000]} for index, item in enumerate(items)],
                           ensure_ascii=False)
-        return parse_decisions(hermes.classify(system, user, max_tokens=300 + 200 * len(items)), items)
+        return parse_decisions(hermes.classify(system, user, max_tokens=300 + 200 * len(items), **route), items)
     if all(is_slack(item) for item in items):
         system = (
             "Jesteś sortownikiem wiadomości Łukasza ze Slacka. Dla każdej rozmowy (wiadomości oznaczone NOWE, "
@@ -231,7 +245,7 @@ def classify_mail(hermes, config, items):
             '"summary": "jedno zdanie po polsku: kto, co, czego chce"}].')
         user = json.dumps([{"i": index, **slack_view(item)} for index, item in enumerate(items)],
                           ensure_ascii=False)
-        return parse_decisions(hermes.classify(system, user, max_tokens=300 + 200 * len(items)), items)
+        return parse_decisions(hermes.classify(system, user, max_tokens=300 + 200 * len(items), **route), items)
     system = (
         "Jesteś sortownikiem poczty Łukasza. Dla każdego maila wybierz decyzję: session, brief albo skip.\n"
         f"{triage['mail_criteria']}\n"
@@ -239,7 +253,7 @@ def classify_mail(hermes, config, items):
         '[{"i": 0, "decision": "session|brief|skip", "reason": "krótko po polsku", '
         '"summary": "jedno zdanie po polsku: kto, co, czego chce"}].')
     user = json.dumps([{"i": index, **mail_view(item)} for index, item in enumerate(items)], ensure_ascii=False)
-    return parse_decisions(hermes.classify(system, user, max_tokens=300 + 200 * len(items)), items)
+    return parse_decisions(hermes.classify(system, user, max_tokens=300 + 200 * len(items), **route), items)
 
 
 def slack_view(item):
