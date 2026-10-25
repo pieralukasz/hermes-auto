@@ -121,7 +121,7 @@ Instead of labelling threads and tasks yourself, let the sorter look at everythi
 ```json
 "triage": {
   "enabled": true,
-  "model": "claude-sonnet-4-6",
+  "model": "claude-sonnet-5-5",
   "brief_times": ["07:45", "16:30"],
   "todoist": {"apply": true, "settle_minutes": 15}
 }

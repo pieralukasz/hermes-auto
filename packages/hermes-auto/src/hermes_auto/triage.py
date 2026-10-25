@@ -27,7 +27,7 @@ ASSIGNABLE_PRIORITIES = ("p1", "p2", "p3")
 DEFAULTS = {
     "enabled": False,
     "provider": "anthropic",
-    "model": "claude-sonnet-4-6",
+    "model": "claude-sonnet-5-5",
     # True: created sessions are hidden from Sessions (for the optional Desktop "Auto" page plugin).
     "hide_sessions": False,
     "brief_times": ["07:45", "16:30"],

@@ -157,7 +157,7 @@ def classify(config, request):
     triage = config.get("triage", {})
     route = {}
     response = call_llm(task="hermes_auto_triage", provider=triage.get("provider") or "anthropic",
-                        model=triage.get("model") or "claude-sonnet-4-6",
+                        model=triage.get("model") or "claude-sonnet-5-5",
                         messages=[{"role": "system", "content": request["system"]},
                                   {"role": "user", "content": request["user"]}],
                         max_tokens=int(request.get("max_tokens") or 4000), temperature=0, timeout=180,
