@@ -9,10 +9,13 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [{name = "Lukasz Piera"}]
-dependencies = ["hermes-auto==0.1.0", "requests>=2.32,<3"]
+dependencies = ["hermes-auto==0.1.0", "requests>=2.32,<3", "websocket-client>=1.8,<2"]
 [project.urls]
 Repository = "https://github.com/pieralukasz/hermes-auto"
 Issues = "https://github.com/pieralukasz/hermes-auto/issues"
+
+[project.scripts]
+hermes-auto-slack-listen = "hermes_auto_slack.listener:main"
 
 [project.entry-points."hermes_auto.sources"]
 slack = "hermes_auto_slack:Source"

@@ -44,9 +44,12 @@ class Http:
         self.session = requests.Session()
         self.session.headers["Authorization"] = f"Bearer {token}"
 
-    def api(self, method, **params):
+    def api(self, method, _post=False, **params):
         for attempt in range(3):
-            response = self.session.get(API_URL + method, params=params, timeout=45)
+            if _post:
+                response = self.session.post(API_URL + method, data=params, timeout=45)
+            else:
+                response = self.session.get(API_URL + method, params=params, timeout=45)
             if response.status_code == 429 and attempt < 2:
                 time.sleep(min(int(response.headers.get("Retry-After") or 5), 30))
                 continue
@@ -228,6 +231,9 @@ class Slack:
             if key not in found or why == "thread":
                 found[key] = (channel_id, thread_ts, why)
 
+        # Conversations the Socket Mode listener saw: found even before search indexes them.
+        for hint in listener_hints(store, since):
+            add(hint["channel"], hint.get("thread_ts"), hint.get("why") or "dm")
         for channel_id, ts, thread_ts in self.search(store, "dm", "", "im,mpim", since):
             add(channel_id, thread_ts, "dm")
         for channel_id, ts, thread_ts in self.search(store, "mention", MENTION.format(me),
@@ -369,12 +375,31 @@ class Slack:
         return "\n".join(lines)
 
 
+def automation_home(store):
+    return Path(store.path).parent
+
+
+def listener_state(store):
+    try:
+        return json.loads((automation_home(store) / "slack-listener.json").read_text())
+    except (OSError, ValueError, AttributeError, TypeError):
+        return {}
+
+
+def listener_hints(store, since):
+    hints = listener_state(store).get("hints", {})
+    return [hint for hint in hints.values() if float(hint.get("ts") or 0) > since and hint.get("channel")]
+
+
 class Source:
     @staticmethod
     def defaults():
         return {"enabled": True, "token_file": str(Path.home() / ".hermes/mcp-tokens/slack.json"),
-                # Slack-only checks between the regular ones (seconds).
+                # Slack-only checks between the regular ones (seconds) without a live listener ...
                 "poll_seconds": 120,
+                # ... and while the Socket Mode listener is connected (it nudges on new messages).
+                "listener_poll_seconds": 900,
+                "app_token_command": ["security", "find-generic-password", "-s", "hermes-auto-slack-app", "-w"],
                 # A conversation is handed over after nobody wrote for this long.
                 "quiet_seconds": 90,
                 # Threads the user wrote in within this many days are followed.
@@ -382,6 +407,18 @@ class Source:
                 # link_only: private channels give author, place and link only; "full" passes the text.
                 "private_channels": "link_only",
                 "skip_channels": [], "context_messages": 8, "max_search_pages": 5}
+
+    def due(self, settings, store, last_poll, now):
+        """A Slack-only check is due: the listener saw something new, or the polling interval elapsed."""
+        settings = {**self.defaults(), **settings}
+        state = listener_state(store)
+        if float(state.get("nudge_at") or 0) > last_poll and now - float(state["nudge_at"]) >= settings["quiet_seconds"]:
+            return True
+        # Relax polling only once the listener has proven it receives events (subscriptions set up).
+        live = (state.get("connected") and now - float(state.get("heartbeat") or 0) < 300
+                and state.get("last_event_at"))
+        interval = settings["listener_poll_seconds"] if live else settings["poll_seconds"]
+        return now - last_poll >= interval
 
     def poll(self, config, store):
         """Nothing to watch by label: Slack candidates go through the sorter (`inbox`)."""

@@ -200,10 +200,20 @@ def retry_followup(store, hermes, followup_id):
 def fast_sources(config, store, now=None):
     """Sources with their own shorter `poll_seconds` (Slack) that are due between the regular checks."""
     now = time.time() if now is None else now
+    installed = sources()
     due = []
     for name, settings in config["sources"].items():
+        if not settings.get("enabled"):
+            continue
+        last = store.get_meta(f"last_poll:{name}", 0)
+        source = installed.get(name)
+        if source is not None and hasattr(source, "due"):
+            # The adapter decides (e.g. Slack: its listener saw a new message, or its own interval).
+            if source().due(settings, store, last, now):
+                due.append(name)
+            continue
         seconds = settings.get("poll_seconds")
-        if settings.get("enabled") and seconds and now - store.get_meta(f"last_poll:{name}", 0) >= seconds:
+        if seconds and now - last >= seconds:
             due.append(name)
     return due
 

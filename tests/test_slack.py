@@ -322,3 +322,105 @@ def test_slack_read_commands(command, allowed):
     if allowed and not command.startswith("td"):
         # Mail sessions keep their narrower list.
         assert read_only_command(command) is False
+
+
+# ── Socket Mode listener ────────────────────────────────────────────────────
+
+class Clock:
+    def __init__(self, now):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+
+def listener_with(tmp_path, fake, clock, ran):
+    from hermes_auto_slack.listener import Listener
+    return Listener(tmp_path, {}, http=fake, clock=clock, runner=lambda: ran.append(clock()) or (0, ""))
+
+
+def envelope(event, envelope_id="E1"):
+    return {"type": "events_api", "envelope_id": envelope_id, "payload": {"event": {"type": "message", **event}}}
+
+
+def test_listener_acks_hints_and_ticks_after_quiet(tmp_path):
+    from hermes_auto_slack.listener import read_state
+    fake, clock, ran = FakeSlack(), Clock(NOW), []
+    listener = listener_with(tmp_path, fake, clock, ran)
+    assert listener.handle({"type": "hello"}) is None and read_state(tmp_path)["connected"]
+    ack = listener.handle(envelope({"channel": "D1", "channel_type": "im", "user": "UCHRIS", "ts": "1.1",
+                                    "text": "hej"}))
+    assert ack == {"envelope_id": "E1"}
+    state = read_state(tmp_path)
+    assert state["hints"]["D1:"]["why"] == "dm" and "text" not in json.dumps(state)
+    clock.now += 30
+    listener.pump()
+    assert ran == []  # still within the quiet window
+    clock.now += 70
+    listener.pump()
+    assert ran == [NOW + 100]
+    listener.pump()
+    assert len(ran) == 1
+
+
+def test_listener_ignores_noise_and_follows_threads(tmp_path):
+    from hermes_auto_slack.listener import read_state
+    fake, clock, ran = FakeSlack(), Clock(NOW), []
+    fake.channel("C1", name="general")
+    fake.post("C1", "UOZ", "5.0", "watek kogos innego")
+    fake.post("C1", ME, "6.0", "moj watek")
+    fake.channels["C1"]["messages"][1]["subscribed"] = True
+    listener = listener_with(tmp_path, fake, clock, ran)
+    noise = [{"channel": "C1", "channel_type": "channel", "user": "UOZ", "ts": "7.0", "text": "bez wzmianki"},
+             {"channel": "C1", "channel_type": "channel", "user": "UOZ", "ts": "7.1", "text": "x", "bot_id": "B"},
+             {"channel": "D1", "channel_type": "im", "user": ME, "ts": "7.2", "text": "moja"},
+             {"channel": "C1", "channel_type": "channel", "user": "UOZ", "ts": "7.3", "text": "x",
+              "thread_ts": "5.0"},
+             {"channel": "D1", "channel_type": "im", "user": "UCHRIS", "ts": "7.4", "text": "x",
+              "subtype": "message_changed"}]
+    for event in noise:
+        listener.handle(envelope(event))
+    assert read_state(tmp_path).get("hints") is None
+    listener.handle(envelope({"channel": "C1", "channel_type": "channel", "user": "UOZ", "ts": "8.0",
+                              "text": "odp", "thread_ts": "6.0"}))
+    listener.handle(envelope({"channel": "C2", "channel_type": "channel", "user": "UOZ", "ts": "8.1",
+                              "text": f"<@{ME}> hej"}))
+    hints = read_state(tmp_path)["hints"]
+    assert hints["C1:6.0"]["why"] == "thread" and hints["C2:"]["why"] == "mention"
+
+
+def test_due_follows_listener_nudges_and_relaxes_polling(tmp_path):
+    from hermes_auto_slack.listener import write_state
+    store = Store(tmp_path, initialize=True)
+    try:
+        source = Source()
+        settings = {"enabled": True}
+        assert source.due(settings, store, NOW - 130, NOW)  # no listener: 120 s polling
+        write_state(tmp_path, {"connected": True, "heartbeat": NOW - 10})
+        assert source.due(settings, store, NOW - 130, NOW)  # connected, but no event seen yet: keep polling
+        write_state(tmp_path, {"connected": True, "heartbeat": NOW - 10, "last_event_at": NOW - 60})
+        assert not source.due(settings, store, NOW - 130, NOW)  # live listener: 900 s polling
+        write_state(tmp_path, {"connected": True, "heartbeat": NOW - 10, "last_event_at": NOW - 60,
+                               "nudge_at": NOW - 100})
+        assert source.due(settings, store, NOW - 130, NOW)
+        assert not source.due(settings, store, NOW - 50, NOW)  # already checked after the nudge
+    finally:
+        store.close()
+
+
+def test_listener_hint_finds_conversation_search_missed(tmp_path):
+    from hermes_auto_slack.listener import write_state
+    store = Store(tmp_path, initialize=True)
+    try:
+        fake = FakeSlack()
+        fake.channel("D9", is_im=True, user="UCHRIS", last_read="0")
+        key = baseline(store, fake)
+        fake.post("D9", "UCHRIS", f"{NOW + 10:.6f}", "swieza wiadomosc")
+        fake.mcp_search = lambda arguments: json.dumps({"results": "", "pagination_info": "End"})  # not indexed
+        assert slack_with(fake, NOW + 300).inbox({}, store)[0] == []
+        write_state(tmp_path, {"hints": {"D9:": {"channel": "D9", "thread_ts": None, "why": "dm",
+                                                 "ts": f"{NOW + 10:.6f}", "seen": NOW + 10}}})
+        candidates, _, _ = slack_with(fake, NOW + 300).inbox({}, store)
+        assert [c["thread_id"] for c in candidates] == ["D9"] and key
+    finally:
+        store.close()
