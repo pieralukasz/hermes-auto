@@ -14,6 +14,12 @@ from .runner import full_tools
 TITLE_LIMIT = 100
 
 
+def deny_mode(job):
+    """False (normal run), True (mail: plain reads only) or a named read profile such as "slack"."""
+    value = job.get("deny_tools") or json.loads(job.get("payload") or "{}").get("deny_tools")
+    return value if isinstance(value, str) and value else bool(value)
+
+
 def session_title(job, limit=TITLE_LIMIT, prefix=""):
     """`<prefix><title> · <source> · #<id>`, shortening only the task title so the suffix survives.
 
@@ -132,7 +138,7 @@ class Hermes:
         runs.mkdir(mode=0o700, exist_ok=True)
         directory = Path(tempfile.mkdtemp(prefix=f"job-{job['id']}-", dir=runs))
         request = directory / "request.json"
-        deny = bool(job.get("deny_tools") or json.loads(job.get("payload") or "{}").get("deny_tools"))
+        deny = deny_mode(job)
         private_json(request, {"action": "run", "config": self.config, "job": job, "prompt": prompt,
                                "full_tools": full_tools(job), "deny_tools": deny})
         command = [self.python, "-I", str(Path(__file__).with_name("bridge.py")), str(request)]
@@ -179,7 +185,9 @@ class Hermes:
             shutil.rmtree(directory, ignore_errors=True)
 
     def budget(self, job):
-        key = ("agent_run_budget_seconds" if job and full_tools(job) and not job.get("deny_tools")
+        # Slack sessions research before drafting (reads only), so they get the full agent budget.
+        key = ("agent_run_budget_seconds" if job and ((full_tools(job) and not job.get("deny_tools"))
+                                                      or deny_mode(job) == "slack")
                else "run_budget_seconds")
         return self.config[key]
 
@@ -223,5 +231,5 @@ class Hermes:
         return self.invoke("create", job, title=title, prompt=prompt, open_message=message, hidden=hidden)
 
     def run(self, job, prompt):
-        deny = bool(job.get("deny_tools") or json.loads(job.get("payload") or "{}").get("deny_tools"))
+        deny = deny_mode(job)
         return self.invoke("run", job, prompt=prompt, full_tools=full_tools(job), deny_tools=deny)

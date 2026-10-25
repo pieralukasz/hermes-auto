@@ -64,10 +64,83 @@ TODOIST_READS = {("today",), ("upcoming",), ("inbox",), ("completed",), ("activi
                  ("task", "list"), ("task", "view"), ("project", "list"), ("project", "view"),
                  ("section", "list"), ("label", "list"), ("filter", "list"), ("filter", "view")}
 READ_TOOLS = frozenset({"skill_view", "skills_list", "session_search"})
+# Slack sessions research before drafting: web reads too, and the read-only commands of `slack_read_command`.
+SLACK_READ_TOOLS = READ_TOOLS | {"web_search", "web_extract"}
+SLACK_MCP = "/skills/tap-in/tapin-slack/scripts/slack_mcp.py"
+SLACK_MCP_READS = {"slack_search_public", "slack_search_public_and_private", "slack_search_users",
+                   "slack_search_channels", "slack_read_channel", "slack_read_thread", "slack_read_canvas",
+                   "slack_read_user_profile", "slack_read_file", "slack_list_channel_members",
+                   "slack_list_user_channels"}
+GIT_READS = {"fetch", "log", "show", "diff", "grep", "blame", "branch", "status", "ls-files", "rev-parse",
+             "merge-base", "ls-remote", "cat-file", "shortlog", "describe"}
+# Options that write files, run programs or change configuration.
+GIT_UNSAFE = ("-c", "--config-env", "--exec-path", "--output", "-O", "--open-files-in-pager", "--ext-diff",
+              "--textconv", "--upload-pack", "--receive-pack", "--exec")
+# `git branch` lists only: these create, delete, rename, copy or reconfigure branches.
+BRANCH_UNSAFE = ("-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--move", "--copy", "--set-upstream-to", "-u",
+                 "--unset-upstream", "--edit-description", "-f", "--force", "--track", "-t", "--no-track")
+GH_READS = {("pr", "view"), ("pr", "list"), ("pr", "diff"), ("pr", "checks"), ("pr", "status"),
+            ("issue", "view"), ("issue", "list"), ("search", "prs"), ("search", "issues"), ("search", "code"),
+            ("search", "commits"), ("run", "list"), ("run", "view"), ("repo", "view"), ("release", "list"),
+            ("release", "view"), ("workflow", "list"), ("api",)}
+GH_UNSAFE = ("-X", "--method", "-f", "-F", "--field", "--raw-field", "--input", "-w", "--web", "--hostname")
+LINEAR_READS = {("issue", "view"), ("issue", "list"), ("issue", "query"), ("project", "view"),
+                ("project", "list"), ("team", "list"), ("cycle", "list"), ("cycle", "view"), ("api",)}
 
 
-def read_only_command(command):
+def git_read(tokens):
+    """`git [-C dir] <read subcommand> ...` without options that write, run programs or set config."""
+    args = tokens[1:]
+    if len(args) >= 2 and args[0] == "-C":
+        args = args[2:]
+    if not args or args[0] not in GIT_READS:
+        return False
+    rest = args[1:]
+    if args[0] == "branch" and any(not token.startswith("-") or token.split("=", 1)[0] in BRANCH_UNSAFE
+                                   for token in rest):
+        return False  # `git branch NAME` creates a branch
+    if args[0] == "fetch" and any(token.startswith("-") and token not in ("--prune", "-p", "-q", "--quiet", "--all")
+                                  for token in rest):
+        return False
+    return not any(token in GIT_UNSAFE or token.split("=", 1)[0] in GIT_UNSAFE for token in rest)
+
+
+def gh_read(tokens):
+    args = tokens[1:]
+    if not any(tuple(args[:len(read)]) == read for read in GH_READS):
+        return False
+    return not any(token in GH_UNSAFE or token.split("=", 1)[0] in GH_UNSAFE for token in args)
+
+
+def linear_read(tokens):
+    args = tokens[1:]
+    if not any(tuple(args[:len(read)]) == read for read in LINEAR_READS):
+        return False
+    if any(token in ("-w", "--web") for token in args):
+        return False
+    if args[0] == "api":
+        query = " ".join(args[1:]).strip()
+        return query.startswith(("query", "{")) and "mutation" not in query.lower()
+    return True
+
+
+def slack_read_command(tokens):
+    """Reads of the Slack session's research: Slack MCP reads, git, gh and Linear reads."""
+    program = Path(tokens[0]).name
+    if program in ("python", "python3") and len(tokens) >= 4 and tokens[1].endswith(SLACK_MCP):
+        return tokens[2] == "call" and tokens[3] in SLACK_MCP_READS and len(tokens) <= 5
+    if program == "git":
+        return git_read(tokens)
+    if program == "gh":
+        return gh_read(tokens)
+    if program == "linear":
+        return linear_read(tokens)
+    return False
+
+
+def read_only_command(command, profile=True):
     """True only for a single plain read command: calendar/Gmail reads via the Google script, Todoist reads.
+    With profile "slack" also the Slack session's research reads (`slack_read_command`).
 
     No shell syntax at all (pipes, redirects, substitutions, chaining), so the allowed program is the
     only thing that runs. Anything else is refused, however harmless it looks.
@@ -90,10 +163,12 @@ def read_only_command(command):
         return any(tuple(tokens[1:1 + len(read)]) == read for read in TODOIST_READS)
     if program in ("python", "python3") and len(tokens) >= 4 and tokens[1].endswith(GOOGLE_API):
         return (tokens[2], tokens[3]) in GOOGLE_READS
+    if profile == "slack":
+        return slack_read_command(tokens)
     return False
 
 
-def deny_tool_execution(agent_class, allowed=READ_TOOLS):
+def deny_tool_execution(agent_class, allowed=READ_TOOLS, profile=True):
     """Keep the session's normal tool list (and so its stored prompt) but execute only reads.
 
     Used when third-party mail enters a conversation: every call outside `allowed`, and every
@@ -115,15 +190,19 @@ def deny_tool_execution(agent_class, allowed=READ_TOOLS):
             arguments = json.loads(call.function.arguments or "{}")
         except (TypeError, ValueError):
             return False
-        return not arguments.get("background") and read_only_command(arguments.get("command"))
+        return not arguments.get("background") and read_only_command(arguments.get("command"), profile)
 
     def guarded(self, assistant_message, messages, *args, **kwargs):
         calls = list(getattr(assistant_message, "tool_calls", None) or [])
         if all(permitted(call) for call in calls):
             return original(self, assistant_message, messages, *args, **kwargs)
-        _append_tool_error_results(messages, calls, lambda call: json.dumps({
-            "error": "Only reads are allowed in this automatic step (third-party mail): calendar list, "
-                     "gmail search/get, td list/view/today, session_search, skills. Nothing ran in this batch."}))
+        refused = ("Only reads are allowed in this automatic step (third-party Slack messages): Slack MCP reads, "
+                   "git/gh/linear reads, web_search/web_extract, calendar list, td list/view, session_search, "
+                   "skills. Sending and writing wait for the user's explicit OK. Nothing ran in this batch."
+                   if profile == "slack" else
+                   "Only reads are allowed in this automatic step (third-party mail): calendar list, "
+                   "gmail search/get, td list/view/today, session_search, skills. Nothing ran in this batch.")
+        _append_tool_error_results(messages, calls, lambda call: json.dumps({"error": refused}))
         return None
 
     agent_class._execute_tool_calls = guarded
@@ -492,6 +571,13 @@ def main():
     # Only this worker's in-memory configuration changes. Interactive Hermes keeps its settings.
     # Unattended runs never get interactive approval: dangerous commands are denied.
     cli.CLI_CONFIG["approvals"] = {"mode": "manual", "single_query_mode": "deny"}
+    if request.get("deny_tools") == "slack":
+        # Slack messages: research with reads only (Slack, code, PRs, Linear, web), then a draft; nothing is sent.
+        desktop_parity(AIAgent)
+        deny_tool_execution(AIAgent, SLACK_READ_TOOLS, "slack")
+        cli.main(query=request["prompt"], resume=sid, quiet=True, oneshot=True, output_format="stream-json",
+                 max_turns=config["agent_max_turns"], run_budget=config["agent_run_budget_seconds"])
+        return
     if request.get("deny_tools"):
         # Third-party mail inside a normal session: the session keeps its full toolset and prompt,
         # only plain reads (calendar, Gmail search/get, Todoist, past sessions, skills) execute.

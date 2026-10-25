@@ -10,6 +10,7 @@ Four independently installable Python distributions live in this repository:
 | `hermes-auto-todoist` | Due tasks and recurring completion events through `td` | Core + authenticated Todoist CLI |
 | `hermes-auto-gmail` | Replies in labelled Gmail threads | Core + Google auth + requests |
 | `hermes-auto-proton` | Replies to labelled Proton conversations through Bridge | Core; Python's IMAP library |
+| `hermes-auto-slack` | Sorter source: DMs, mentions and replies in followed threads (read-only) | Core; `requests` |
 
 Installing Todoist does not install either mail adapter or their dependencies. The core discovers adapters through the `hermes_auto.sources` Python entry-point group. Adapters create durable events; they never start an agent themselves.
 
@@ -113,6 +114,24 @@ hermes-auto source setup proton
 ```
 
 Apply **`Hermes Watch`** to a message in a conversation (or **`Hermes Agent`**, `agent_mailbox`, for the full agent, as with Gmail). Replies are matched through RFC `Message-ID`, `In-Reply-To` and `References`, not subject similarity. As with Gmail, the first poll establishes a baseline. Missing/broken threading headers cannot be reliably matched; those messages will not trigger automatically. The adapter reads up to 256 KiB of raw MIME per reply and supplies at most 20,000 text characters to Hermes. MIME may contain attachment bytes, but attachments are not extracted or supplied to the model. Read-only mailboxes and `BODY.PEEK` preserve read flags.
+
+## Slack
+
+A sorter source (needs `triage.enabled`). It reads Slack with your user token (the Slack MCP OAuth token Hermes stores in `~/.hermes/mcp-tokens/slack.json`; scopes: history and read for channels, groups, im, mpim, `users:read`, and the MCP search scopes) and never posts.
+
+- **What counts:** DMs and group DMs, `@you` in channels, and replies in threads you follow (Slack subscribes you to threads you started, wrote in or were mentioned in). Bots, Slackbot, your own messages, edits and `@here`/`@channel` alone do not.
+- **Bursts:** messages of one conversation (a DM or a thread) are handed over together once nobody wrote for `quiet_seconds` (90). If you read or answered it in Slack before that, nothing opens.
+- **Decisions:** the classifier uses `triage.slack_criteria`: *session*, *brief* (a `## Slack` section) or *skip*. A later burst in the same conversation opens a `↩` session with the earlier one's context.
+- **Session:** the automatic step researches with reads only (Slack MCP reads, `git`/`gh`/`linear` reads, `web_search`/`web_extract`, calendar, Todoist, past sessions) and ends with who wants what, the findings and a reply draft. Sending, writing files and every other tool get an error result; the session keeps its full toolset for your next turn, so sending happens only after you say so there.
+- **Private channels:** `private_channels: "link_only"` (default) passes only author, place and link; `"full"` passes the text.
+- **Cadence:** `sources.slack.poll_seconds` (120) runs Slack-only checks between the regular `poll_seconds` checks. Slack text never reaches the waiting-task check (no Todoist comments from Slack).
+
+```bash
+python -m pip install ./packages/hermes-auto-slack
+hermes-auto source enable slack
+```
+
+The first check records a baseline; only later messages open sessions.
 
 ## Sorter (opt-in)
 

@@ -17,11 +17,15 @@ from .runner import process_jobs
 from .store import Store, locked
 
 
-def poll(config, store):
+MAIL_LIKE = ("gmail", "proton", "slack")
+
+
+def poll(config, store, only=None):
+    """Read every enabled source (or just `only`); returns errors as "name: message"."""
     installed = sources()
     errors = []
     for name, settings in config["sources"].items():
-        if not settings.get("enabled"):
+        if not settings.get("enabled") or (only is not None and name not in only):
             continue
         try:
             if name not in installed:
@@ -31,11 +35,16 @@ def poll(config, store):
             installed[name]().poll(config, store)
         except Exception as exc:
             errors.append(f"{name}: {exc}")
-    store.set_meta("source_errors", errors)
+    if only is None:
+        store.set_meta("source_errors", errors)
+    else:
+        # A partial check replaces only its own sources' errors.
+        kept = [error for error in store.get_meta("source_errors", []) if error.split(":", 1)[0] not in only]
+        store.set_meta("source_errors", kept + errors)
     return errors
 
 
-def run_triage(config, store, bridge, installed, blocked=()):
+def run_triage(config, store, bridge, installed, blocked=(), only=None):
     """Sorter step: mail and Inbox tasks get decisions; replies return to their sessions; briefs.
 
     Returns (errors, failures). A source that failed to read keeps its cursor and retries later.
@@ -46,24 +55,27 @@ def run_triage(config, store, bridge, installed, blocked=()):
         return [], 0
     errors, failures = [], 0
     new_mail = []
-    for name in ("gmail", "proton"):
+    for name in MAIL_LIKE:
         settings = config["sources"].get(name, {})
         source = installed.get(name)
         if not settings.get("enabled") or name in blocked or source is None or not hasattr(source, "inbox"):
+            continue
+        if only is not None and name not in only:
             continue
         try:
             candidates, key, cursor = source().inbox(config, store, limit=options["max_mail_per_run"])
             if candidates:
                 account = candidates[0].get("account", "")
                 report = triage.triage_mail(store, config, bridge(), name, account, candidates, key, cursor)
-                new_mail += [item for _, item, _ in report or []]
+                # Slack text never goes to Todoist comments (waiting check): DM content stays in sessions.
+                new_mail += [item for _, item, _ in report or [] if item.get("kind") != "slack"]
             else:
                 store.set_meta(key, cursor)
         except Exception as exc:
             errors.append(f"triage {name}: {exc}")
     todoist = installed.get("todoist")
     adapter = None
-    if (options["todoist"]["enabled"] and config["sources"].get("todoist", {}).get("enabled")
+    if (only is None and options["todoist"]["enabled"] and config["sources"].get("todoist", {}).get("enabled")
             and "todoist" not in blocked and todoist is not None and hasattr(todoist, "inbox_tasks")):
         # Separate steps: the sorter raises after queuing its plan when a stored decision still fails to apply
         # (retried next check); that must not skip proposals or the waiting check for this check's new mail.
@@ -183,6 +195,17 @@ def retry_followup(store, hermes, followup_id):
         mark("needs_attention", f"The reply already reached session {row['session_id']}; continue there by hand")
         raise ValueError(f"The reply is already in session {row['session_id']}; open it instead of retrying")
     mark("retry_pending", "")
+
+
+def fast_sources(config, store, now=None):
+    """Sources with their own shorter `poll_seconds` (Slack) that are due between the regular checks."""
+    now = time.time() if now is None else now
+    due = []
+    for name, settings in config["sources"].items():
+        seconds = settings.get("poll_seconds")
+        if settings.get("enabled") and seconds and now - store.get_meta(f"last_poll:{name}", 0) >= seconds:
+            due.append(name)
+    return due
 
 
 def eligible_tick(config, store):
@@ -370,13 +393,18 @@ def dispatch(args, home, config, store):
         if store.get_meta("paused", False):
             print("Paused")
             return 0
+        only = None
         if command == "tick" and not eligible_tick(config, store):
-            return 0
+            # Not time for a full check; a source with its own short interval (Slack) may still be due.
+            only = fast_sources(config, store) if not config["desktop_only"] or store.get_meta("desktop_seen") \
+                else []
+            if not only:
+                return 0
         if command != "scan":
             # Under the run lock anything still "running" was interrupted: jobs and replies alike go to
             # needs_attention before any work starts, so nothing is replayed without an explicit retry.
             store.recover()
-        errors = poll(config, store)
+        errors = poll(config, store, only)
         failures = 0
         blocked = [error.split(":", 1)[0] for error in errors]
         hermes = None
@@ -387,18 +415,22 @@ def dispatch(args, home, config, store):
             return hermes
 
         if command != "scan":
-            triage_errors, triage_failures = run_triage(config, store, bridge, sources(), blocked)
+            triage_errors, triage_failures = run_triage(config, store, bridge, sources(), blocked, only)
             errors = errors + triage_errors
             failures += triage_failures
         if command != "scan" and any(j["status"] in ("pending", "created", "retry_pending", "running", "creating")
                                      for j in store.rows()):
             failures += process_jobs(store, config, bridge(), blocked_sources=blocked)
-        if command != "scan":
+        if command != "scan" and only is None:
             # Archiving a prepared session in Hermes closes its source item (Todoist: completes the task).
             finish_errors = sync_finished(store, config, bridge, sources(), blocked)
             failures += len(finish_errors)
             errors = errors + finish_errors
-        store.set_meta("last_poll", time.time())
+        stamp = time.time()
+        if only is None:
+            store.set_meta("last_poll", stamp)
+        for name in (only if only is not None else config["sources"]):
+            store.set_meta(f"last_poll:{name}", stamp)
         store.backup()
         counts = {}
         for job in store.rows():
