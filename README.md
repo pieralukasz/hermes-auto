@@ -113,6 +113,8 @@ Example `sources.proton` configuration (fill in your own values):
 hermes-auto source setup proton
 ```
 
+Instant mail (optional): `hermes-auto-proton-listen` keeps an IMAP IDLE session on INBOX (read-only, through the same Bridge login). On new mail it records only the time in `proton-listener.json` and runs `hermes-auto tick` after `listen_quiet_seconds` (15); the Proton source's `due` makes that a Proton-only check. `hermes-auto-proton-listen check` tests Bridge and IDLE, `install-launchd` installs `io.github.hermes-auto.proton-listener` (KeepAlive). Regular checks stay as the fallback.
+
 Apply **`Hermes Watch`** to a message in a conversation (or **`Hermes Agent`**, `agent_mailbox`, for the full agent, as with Gmail). Replies are matched through RFC `Message-ID`, `In-Reply-To` and `References`, not subject similarity. As with Gmail, the first poll establishes a baseline. Missing/broken threading headers cannot be reliably matched; those messages will not trigger automatically. The adapter reads up to 256 KiB of raw MIME per reply and supplies at most 20,000 text characters to Hermes. MIME may contain attachment bytes, but attachments are not extracted or supplied to the model. Read-only mailboxes and `BODY.PEEK` preserve read flags.
 
 ## Slack

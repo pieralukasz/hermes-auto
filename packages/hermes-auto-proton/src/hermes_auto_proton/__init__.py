@@ -213,7 +213,19 @@ class Source:
         return {"enabled": True, "host": "127.0.0.1", "port": 1143, "username": "",
                 "certificate": "", "password_command": [], "own_addresses": [],
                 "watch_mailbox": "Labels/Hermes Watch", "agent_mailbox": "Labels/Hermes Agent",
-                "all_mailbox": "All Mail", "mode": "draft"}
+                "all_mailbox": "All Mail", "mode": "draft",
+                # IMAP IDLE listener: check this long after the last new mail arrived (seconds).
+                "listen_quiet_seconds": 15}
+
+    def due(self, settings, store, last_poll, now):
+        """A Proton-only check between the regular ones: only when the IDLE listener saw new mail."""
+        from hermes_auto.listening import nudged
+        try:
+            home = Path(store.path).parent
+        except (AttributeError, TypeError):
+            return False
+        quiet = float({**self.defaults(), **settings}["listen_quiet_seconds"])
+        return nudged(home, "proton", last_poll, now, quiet)
 
     def poll(self, config, store):
         settings = config["sources"]["proton"]

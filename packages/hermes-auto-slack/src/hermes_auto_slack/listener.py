@@ -15,38 +15,27 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
 
+from hermes_auto import listening
+from hermes_auto.listening import TickPump, log
+
 from . import Http, Source, read_token
 
-STATE = "slack-listener.json"
+NAME = "slack"
 KEEP_HINTS_SECONDS = 86400 * 3
 
 
-def state_path(home):
-    return Path(home) / STATE
-
-
 def read_state(home):
-    try:
-        return json.loads(state_path(home).read_text())
-    except (OSError, ValueError):
-        return {}
+    return listening.read_state(home, NAME)
 
 
 def write_state(home, data):
-    path = state_path(home)
-    fd, temporary = tempfile.mkstemp(dir=str(path.parent), prefix=".slack-listener-")
-    with os.fdopen(fd, "w") as stream:
-        json.dump(data, stream)
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, path)
+    listening.write_state(home, NAME, data)
 
 
 def app_token(settings):
@@ -64,11 +53,9 @@ class Listener:
         self.settings = {**Source.defaults(), **settings}
         self.http = http or Http(read_token(self.settings["token_file"]))
         self.clock = clock
-        self.runner = runner or self.run_tick
+        self.ticks = TickPump(runner or (lambda: listening.run_tick(self.home)), clock)
         self.me = self.http.api("auth.test")["user_id"]
         self.followed = {}  # (channel, thread_ts) -> (followed, checked_at)
-        self.lock = threading.Lock()
-        self.due_at = None
         # Health without content: how many events arrived since start, and when the last one did.
         self.events, self.last_event = 0, None
 
@@ -135,8 +122,8 @@ class Listener:
 
     def hint(self, channel, thread_ts, why, ts):
         now = self.clock()
-        with self.lock:
-            state = read_state(self.home)
+
+        def change(state):
             hints = {k: v for k, v in state.get("hints", {}).items() if now - v.get("seen", 0) < KEEP_HINTS_SECONDS}
             key = f"{channel}:{thread_ts or ''}"
             old = hints.get(key, {})
@@ -144,43 +131,21 @@ class Listener:
             hints[key] = {"channel": channel, "thread_ts": thread_ts, "seen": now, "ts": ts,
                           "why": "thread" if "thread" in (old.get("why"), why) else why}
             state.update(hints=hints, nudge_at=now, heartbeat=now)
-            write_state(self.home, state)
-            self.due_at = now + float(self.settings["quiet_seconds"]) + 5
+
+        listening.update_state(self.home, NAME, change)
+        self.ticks.schedule(now + float(self.settings["quiet_seconds"]) + 5)
 
     def beat(self, connected=None):
-        with self.lock:
-            state = read_state(self.home)
+        def change(state):
             state["heartbeat"] = self.clock()
             state["events_since_start"], state["last_event_at"] = self.events, self.last_event
             if connected is not None:
                 state["connected"] = connected
-            write_state(self.home, state)
 
-    # ── Ticks ───────────────────────────────────────────────────────────
-
-    def run_tick(self):
-        entry = Path(sys.executable).parent / "hermes-auto"
-        command = [str(entry) if entry.exists() else "hermes-auto", "--home", str(self.home), "tick"]
-        result = subprocess.run(command, capture_output=True, text=True, timeout=900)
-        return result.returncode, result.stderr[-300:]
+        listening.update_state(self.home, NAME, change)
 
     def pump(self):
-        """Run a tick once the latest conversation went quiet; a busy run lock retries in 30 s."""
-        with self.lock:
-            due = self.due_at
-        if due is None or self.clock() < due:
-            return
-        with self.lock:
-            self.due_at = None
-        code, error = self.runner()
-        if code and "Another hermes-auto operation" in (error or ""):
-            with self.lock:
-                self.due_at = self.due_at or self.clock() + 30
-        log(f"tick exit={code}")
-
-
-def log(message):
-    print(time.strftime("%Y-%m-%d %H:%M:%S"), message, flush=True)
+        self.ticks.pump()
 
 
 def serve(home, settings):
@@ -227,27 +192,6 @@ def serve(home, settings):
         time.sleep(backoff)
 
 
-def install_launchd(home):
-    import plistlib
-    entry = Path(sys.executable).parent / "hermes-auto-slack-listen"
-    agent = Path.home() / "Library/LaunchAgents/io.github.hermes-auto.slack-listener.plist"
-    payload = {
-        "Label": "io.github.hermes-auto.slack-listener",
-        "ProgramArguments": [str(entry), "--home", str(home)],
-        "RunAtLoad": True, "KeepAlive": True, "ThrottleInterval": 30,
-        "EnvironmentVariables": {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(Path.home())},
-        "StandardOutPath": str(Path(home) / "slack-listener.log"),
-        "StandardErrorPath": str(Path(home) / "slack-listener.log"),
-    }
-    agent.parent.mkdir(parents=True, exist_ok=True)
-    agent.write_bytes(plistlib.dumps(payload))
-    os.chmod(agent, 0o600)
-    domain = f"gui/{os.getuid()}"
-    subprocess.run(["launchctl", "bootout", f"{domain}/io.github.hermes-auto.slack-listener"], capture_output=True)
-    subprocess.run(["launchctl", "bootstrap", domain, str(agent)], check=True)
-    print(agent)
-
-
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Slack Socket Mode listener for Hermes Auto")
     parser.add_argument("--home", type=Path, default=Path.home() / ".config/hermes-auto")
@@ -257,7 +201,7 @@ def main(argv=None):
     config = json.loads((home / "config.json").read_text())
     settings = config.get("sources", {}).get("slack", {})
     if args.command == "install-launchd":
-        install_launchd(home)
+        print(listening.install_launchd(home, NAME, "hermes-auto-slack-listen"))
         return 0
     if args.command == "check":
         token = app_token({**Source.defaults(), **settings})

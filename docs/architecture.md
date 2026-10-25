@@ -21,7 +21,9 @@ The package has no exactly-once side-effect guarantee across an LLM and external
 
 Provider details stay in adapters. The core's `observe_stream` is provider-neutral: mark first observations as a baseline; persist seen item IDs and eligible events atomically. Gmail uses provider thread/message IDs. Proton maps RFC reply chains into stream/message IDs. Todoist uses task IDs plus the latest available completion timestamp for recurring occurrences.
 
-Limits in 0.1: synchronous preparation with a configurable per-run cap; no push/webhook server; no attachment extraction; no cross-mail-provider deduplication. Adapter polling is intentionally opt-in. Versions are aligned for this first release, but distributions and dependencies are separate.
+Push listeners (`hermes_auto.listening`, opt-in services per adapter: Slack Socket Mode, Proton IMAP IDLE) never touch the database; they write `<name>-listener.json` (times and ids, no text) and run `tick`; an adapter's optional `due(settings, store, last_poll, now)` turns that tick into a check of that source only (`fast_sources`).
+
+Limits in 0.1: synchronous preparation with a configurable per-run cap; no inbound webhook server; no attachment extraction; no cross-mail-provider deduplication. Adapter polling is intentionally opt-in. Versions are aligned for this first release, but distributions and dependencies are separate.
 
 ## Sorter (`triage`, opt-in)
 

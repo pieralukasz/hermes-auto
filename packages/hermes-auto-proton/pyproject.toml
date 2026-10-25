@@ -14,5 +14,8 @@ dependencies = ["hermes-auto==0.1.0"]
 Repository = "https://github.com/pieralukasz/hermes-auto"
 Issues = "https://github.com/pieralukasz/hermes-auto/issues"
 
+[project.scripts]
+hermes-auto-proton-listen = "hermes_auto_proton.listener:main"
+
 [project.entry-points."hermes_auto.sources"]
 proton = "hermes_auto_proton:Source"

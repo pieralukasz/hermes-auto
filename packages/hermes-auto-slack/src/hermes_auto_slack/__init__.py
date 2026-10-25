@@ -380,9 +380,10 @@ def automation_home(store):
 
 
 def listener_state(store):
+    from hermes_auto.listening import read_state
     try:
-        return json.loads((automation_home(store) / "slack-listener.json").read_text())
-    except (OSError, ValueError, AttributeError, TypeError):
+        return read_state(automation_home(store), "slack")
+    except (AttributeError, TypeError):
         return {}
 
 
@@ -411,13 +412,12 @@ class Source:
     def due(self, settings, store, last_poll, now):
         """A Slack-only check is due: the listener saw something new, or the polling interval elapsed."""
         settings = {**self.defaults(), **settings}
+        from hermes_auto.listening import live
         state = listener_state(store)
         if float(state.get("nudge_at") or 0) > last_poll and now - float(state["nudge_at"]) >= settings["quiet_seconds"]:
             return True
         # Relax polling only once the listener has proven it receives events (subscriptions set up).
-        live = (state.get("connected") and now - float(state.get("heartbeat") or 0) < 300
-                and state.get("last_event_at"))
-        interval = settings["listener_poll_seconds"] if live else settings["poll_seconds"]
+        interval = settings["listener_poll_seconds"] if live(state, now) else settings["poll_seconds"]
         return now - last_poll >= interval
 
     def poll(self, config, store):
