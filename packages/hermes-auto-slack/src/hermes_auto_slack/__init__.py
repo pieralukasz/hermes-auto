@@ -393,6 +393,37 @@ def listener_hints(store, since):
 
 
 class Source:
+    def mark_read(self, config, items, http=None):
+        """Move Slack's read marker to an item's last message once it appears in a Hermes session or brief.
+
+        DMs and group DMs: always (never backwards). Channel mentions: only when that message is still the
+        channel's latest, so no unrelated unread messages are hidden. Thread replies: Slack has no public API
+        for thread read state, so they are left as they are.
+        """
+        import subprocess
+        settings = {**self.defaults(), **config["sources"].get("slack", {})}
+        if http is None:
+            result = subprocess.run(list(settings["mark_token_command"]), capture_output=True, text=True, timeout=30)
+            if result.returncode or not result.stdout.strip():
+                raise SlackError("No Slack mark-read token (mark_token_command)")
+            http = Http(result.stdout.strip())
+        latest = {}
+        for item in items:
+            channel, ts = item.get("channel"), item.get("ts")
+            if not channel or not ts or item.get("thread_ts"):
+                continue
+            if float(ts) > float(latest.get(channel, {}).get("ts", 0)):
+                latest[channel] = item
+        for channel, item in latest.items():
+            info = http.api("conversations.info", channel=channel)["channel"]
+            if float(info.get("last_read") or 0) >= float(item["ts"]):
+                continue
+            if not (info.get("is_im") or info.get("is_mpim")):
+                newest = http.api("conversations.history", channel=channel, limit=1).get("messages") or [{}]
+                if float(newest[0].get("ts") or 0) > float(item["ts"]):
+                    continue
+            http.api("conversations.mark", _post=True, channel=channel, ts=item["ts"])
+
     @staticmethod
     def defaults():
         return {"enabled": True, "token_file": str(Path.home() / ".hermes/mcp-tokens/slack.json"),
@@ -401,6 +432,9 @@ class Source:
                 # ... and while the Socket Mode listener is connected (it nudges on new messages).
                 "listener_poll_seconds": 900,
                 "app_token_command": ["security", "find-generic-password", "-s", "hermes-auto-slack-app", "-w"],
+                # User token of the "Lucas Hermes Agent" app with im/mpim/channels/groups:write, used only for
+                # conversations.mark (the MCP token cannot mark read).
+                "mark_token_command": ["security", "find-generic-password", "-s", "hermes-auto-slack-user", "-w"],
                 # A conversation is handed over after nobody wrote for this long.
                 "quiet_seconds": 90,
                 # Threads the user wrote in within this many days are followed.

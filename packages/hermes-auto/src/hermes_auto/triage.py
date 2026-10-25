@@ -31,7 +31,7 @@ DEFAULTS = {
     # True: created sessions are hidden from Sessions (for the optional Desktop "Auto" page plugin).
     "hide_sessions": False,
     # Mark mail, notifications and messages read at the source once they appear in a Hermes session
-    # or brief (skipped items and failed sessions stay unread).
+    # or brief, and skipped noise right away (failed sessions stay unread).
     "mark_read": True,
     "brief_times": ["07:45", "16:30"],
     # Extra brief sections from local commands (e.g. a finance review): [{"name", "command": [...], "times":
@@ -483,11 +483,13 @@ def triage_mail(store, config, hermes, source, account, candidates, cursor_key=N
                           payload))
         report.append(("followup", item, session))
 
-    def mark_later(item):
-        # Read at the source once the session showing it is ready (replies: their "↩" session).
+    def mark_later(item, now=False):
+        # Read at the source once the session showing it is ready (replies: their "↩" session);
+        # skipped noise (`now`) right away, it never gets a session.
         if triage_options["mark_read"]:
             store.db.execute("INSERT OR IGNORE INTO read_marks(source,account,item_id,job_key,payload) "
-                             "VALUES (?,?,?,?,?)", (source, account, item["id"], f"{identity}:{item['id']}",
+                             "VALUES (?,?,?,?,?)", (source, account, item["id"],
+                                                    "" if now else f"{identity}:{item['id']}",
                                                     json.dumps(item, ensure_ascii=False)))
 
     def remember(item, session):
@@ -523,6 +525,8 @@ def triage_mail(store, config, hermes, source, account, candidates, cursor_key=N
                 if job:
                     remember(item, job[0])
                 mark_later(item)
+            if verdict["decision"] == "skip":
+                mark_later(item, now=True)
             store.db.execute("INSERT OR IGNORE INTO triage_items(account,item_id,kind,decision,reason,summary,"
                              "payload,briefed) VALUES (?,?,?,?,?,?,?,?)",
                              (identity, item["id"], kind_of(item), verdict["decision"], verdict["reason"],
@@ -615,14 +619,14 @@ MAX_READ_ATTEMPTS = 5
 
 
 def flush_read_marks(store, config, installed, blocked=()):
-    """Mark items read at their source once the session or brief that shows them is ready.
+    """Mark items read at their source once the session or brief that shows them is ready (skipped: at once).
 
     Sources without `mark_read` (e.g. Slack, whose token cannot mark read) are recorded as unsupported.
     Returns a list of error strings; a failing source retries at the next checks.
     """
     rows = [dict(row) for row in store.db.execute(
-        "SELECT r.* FROM read_marks r WHERE r.status='pending' AND (SELECT status FROM jobs j "
-        "WHERE j.event_key=r.job_key ORDER BY generation DESC LIMIT 1) IN (?,?)", READ_GATE)]
+        "SELECT r.* FROM read_marks r WHERE r.status='pending' AND (r.job_key='' OR (SELECT status FROM jobs j "
+        "WHERE j.event_key=r.job_key ORDER BY generation DESC LIMIT 1) IN (?,?))", READ_GATE)]
     errors, groups = [], {}
     for row in rows:
         groups.setdefault(row["source"], []).append(row)
@@ -656,8 +660,8 @@ def flush_read_marks(store, config, installed, blocked=()):
 
 def read_marks_waiting(store):
     return bool(store.db.execute(
-        "SELECT 1 FROM read_marks r WHERE r.status='pending' AND (SELECT status FROM jobs j "
-        "WHERE j.event_key=r.job_key ORDER BY generation DESC LIMIT 1) IN (?,?) LIMIT 1", READ_GATE).fetchone())
+        "SELECT 1 FROM read_marks r WHERE r.status='pending' AND (r.job_key='' OR (SELECT status FROM jobs j "
+        "WHERE j.event_key=r.job_key ORDER BY generation DESC LIMIT 1) IN (?,?)) LIMIT 1", READ_GATE).fetchone())
 
 
 # ── Brief ────────────────────────────────────────────────────────────────────
