@@ -19,3 +19,4 @@ Issues = "https://github.com/pieralukasz/hermes-auto/issues"
 [project.scripts]
 hermes-auto = "hermes_auto.cli:main"
 hermes-auto-hooks-listen = "hermes_auto.hooks:main"
+hermes-auto-relay = "hermes_auto.relay:main"

@@ -140,13 +140,13 @@ def test_listener_baseline_conditional_requests_and_nudge(tmp_path):
     listener = GitHubListener(tmp_path, {}, session=session, clock=lambda: NOW + 50,
                               runner=lambda: ran.append(1) or (0, ""))
     assert listener.check() == 60
-    assert listing(tmp_path).get("nudge_at") is None  # first answer is the baseline
+    assert listener.events == 1  # first answer after a start: one catch-up check
     listener.check()
     assert session.headers_sent[1] == {"If-Modified-Since": "Sun, 25 Oct 2026 07:00:00 GMT"}
     listener.check()
-    assert listing(tmp_path).get("nudge_at") is None  # only a watched-repo update
+    assert listener.events == 1  # only a watched-repo update
     listener.check()
-    assert listing(tmp_path)["nudge_at"] == NOW + 50 and listener.events == 1
+    assert listing(tmp_path)["nudge_at"] == NOW + 50 and listener.events == 2
 
 
 def listing(home):

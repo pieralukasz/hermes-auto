@@ -137,15 +137,23 @@ hermes-auto source enable slack
 
 The first check records a baseline; only later messages open sessions.
 
-## Push gateway (Gmail)
+## Push gateway (Gmail, Todoist)
 
-`gateway/` is a Cloudflare Worker for webhooks that need a public address. Gmail push: `users.watch` publishes to a Pub/Sub topic, a push subscription posts to the Worker, the Worker hands an ids-only event to `hermes-auto-hooks-listen` (core, extra `hooks`) over an outbound WebSocket, which nudges a Gmail-only check. Set `sources.gmail.push_topic`; the Gmail adapter renews the watch daily in `poll` (configuration only, no mail is changed). The regular checks stay as the fallback.
+`gateway/` is a Cloudflare Worker for webhooks that need a public address. Todoist: an App Management app ("Hermes Auto") with a webhook to `/todoist` for `item:*` events; the Worker checks `X-Todoist-Hmac-SHA256` against the app's client secret (`wrangler secret put TODOIST_CLIENT_SECRET`). Webhooks fire only for users who authorized the app. Gmail push: `users.watch` publishes to a Pub/Sub topic, a push subscription posts to the Worker, the Worker hands an ids-only event to `hermes-auto-hooks-listen` (core, extra `hooks`) over an outbound WebSocket, which nudges a Gmail-only check. Set `sources.gmail.push_topic`; the Gmail adapter renews the watch daily in `poll` (configuration only, no mail is changed). The regular checks stay as the fallback.
 
 ## GitHub
 
-A sorter source for your notifications (`GET /notifications` with the `gh` token; read-only, never marks anything read). Each notification thread is one conversation: review requests, mentions, comments, assignments, CI results. `reason: subscribed` (repositories you only watch) is skipped (`skip_reasons`). Already read on GitHub, or the latest comment is yours: no session. Decisions use `triage.github_criteria`; sessions get the same read-only research profile as Slack and never comment, review, merge or push on their own.
+A sorter source for your notifications (`GET /notifications` with the `gh` token; the only write is marking a thread read once it appears in a Hermes session or brief, see `triage.mark_read`). Each notification thread is one conversation: review requests, mentions, comments, assignments, CI results. `reason: subscribed` (repositories you only watch) is skipped (`skip_reasons`). Already read on GitHub, or the latest comment is yours: no session. Decisions use `triage.github_criteria`; sessions get the same read-only research profile as Slack and never comment, review, merge or push on their own.
 
 GitHub has no push for account notifications; `hermes-auto-github-listen` polls with `If-Modified-Since` at GitHub's `X-Poll-Interval` (60 s; a 304 is free) and nudges a GitHub-only check. Without it, `poll_seconds` (300) applies.
+
+## Relay queue and push mode (always-on server)
+
+With an always-on machine (e.g. a home server on Tailscale), the listeners that need a permanent connection run there and the Mac only reads a queue:
+
+- On the server: `hermes-auto-relay serve` keeps a SQLite queue (`relay-queue.sqlite3`, ids only, 7 days) on `relay.host:relay.port` with a bearer token (`relay.token_command`). The Slack, GitHub and gateway listeners run there with `relay.publish_url` set, so they publish to the queue instead of running a tick. Example systemd user units: `hermes-auto-relay.service`, `hermes-auto-slack.service`, `hermes-auto-github.service`, `hermes-auto-hooks.service`.
+- On the Mac: `hermes-auto-relay client` (`install-launchd`: `io.github.hermes-auto.relay-client`) long-polls `/events?since=<seq>`; after sleep it receives everything queued, in order, and nudges the matching sources. `relay.again_after` asks for one more check later (Todoist: 960 s, after `settle_minutes`). If the relay stays unreachable for `relay.fallback_seconds` (1800), it nudges all `relay.sources` so the Mac checks them itself.
+- `"poll_sources": false` ends periodic source checks: a source is read only when its listener, webhook or timer says so (`due`). The periodic tick keeps local upkeep only (finished runs, archive → done, briefs). Todoist also checks at a new day and when a timed task becomes due; Gmail renews its watch daily. Proton stays on the Mac: its listener checks once after every (re)connect, so mail that came during sleep is read on wake.
 
 ## Sorter (opt-in)
 
@@ -168,6 +176,7 @@ Instead of labelling threads and tasks yourself, let the sorter look at everythi
 - **Waiting tasks:** with new mail, one model call checks whether a mail delivers what an `@czekam`/`@zablokowane` task waits for (title, description, last comments). Ready: one "Odblokowane: …" session offering to drop `@czekam` (and start it if it has `hermes`). Partly: a Todoist comment on the task, no question. Each mail speaks up at most once per task.
 - **Brief sections from local commands:** `triage.brief_sources` (e.g. a finance review) run at their brief time with `SINCE` set to their last success and print one JSON object: `title`, `summary` ("" = nothing new), `lines`, `questions` (`text`, `reason`, `proposal`), optional `propose_prompt`/`categories`/`context` (missing proposals are filled by one model call without tools), `evidence` (checked against `@czekam` tasks like mail) and `agent_note` (hidden instructions for the session). A failed run (server asleep) retries each check and posts on its own. You answer the questions in the brief session; the agent there applies them with full tools.
 - `hermes-auto triage-preview --days 14` shows what the sorter would decide for recent mail and the current Inbox, without changing anything (it does spend model tokens). The report is written to `triage-preview.md` in the automation home.
+- **Read at the source (`mark_read`, default on):** once the session or brief that shows an item is ready, the item is marked read where it came from: Gmail (remove `UNREAD`), Proton (`\Seen` via Bridge), GitHub (notification thread read). Skipped items and failed sessions stay unread. Slack has no mark-read with the current token, so Slack items are recorded as `unsupported`. Pending marks live in the `read_marks` table and retry five times.
 - Sessions appear in the normal Sessions list. Optional: `"hide_sessions": true` plus the Desktop plugin in `desktop-plugin/hermes-auto` (copy to `~/.hermes/desktop-plugins/hermes-auto`) moves them to a separate **Auto** page.
 
 ## Operate

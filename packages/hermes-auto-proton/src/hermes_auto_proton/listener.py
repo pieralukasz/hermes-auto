@@ -150,6 +150,8 @@ def serve(home, settings):
             client, lines = listener.connect()
             log("idle")
             listener.beat(connected=True)
+            # After a start, a wake-up or a dropped connection: check Proton once for what came meanwhile.
+            listener.arrived()
             backoff = 5
             while True:
                 listener.idle_round(lines)

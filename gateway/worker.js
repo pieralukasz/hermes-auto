@@ -45,6 +45,24 @@ export default {
       return new Response(null, { status: 204 });
     }
 
+    if (url.pathname === "/todoist" && request.method === "POST") {
+      // Todoist signs each delivery: base64 HMAC-SHA256 of the raw body with the app's client secret.
+      const body = await request.text();
+      if (!env.TODOIST_CLIENT_SECRET) return new Response("not configured", { status: 503 });
+      const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(env.TODOIST_CLIENT_SECRET),
+        { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+      const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(body)));
+      const expected = new TextEncoder().encode(btoa(String.fromCharCode(...mac)));
+      const given = new TextEncoder().encode(request.headers.get("X-Todoist-Hmac-SHA256") || "");
+      if (expected.length !== given.length || !crypto.subtle.timingSafeEqual(expected, given)) {
+        return new Response("forbidden", { status: 403 });
+      }
+      let event = null;
+      try { event = JSON.parse(body)?.event_name ?? null; } catch {}
+      await hub(env).fetch("https://hub/publish", { method: "POST", body: JSON.stringify({ source: "todoist", event }) });
+      return new Response(null, { status: 200 });
+    }
+
     if (url.pathname === "/listen") {
       const auth = request.headers.get("Authorization") || "";
       if (!(await matches(auth.replace(/^Bearer /, ""), env.LISTEN_SHA256))) {

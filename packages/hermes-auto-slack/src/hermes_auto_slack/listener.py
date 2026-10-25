@@ -22,12 +22,11 @@ import time
 from pathlib import Path
 
 from hermes_auto import listening
-from hermes_auto.listening import TickPump, log
+from hermes_auto.listening import LocalSink, log, sink_from_config
 
 from . import Http, Source, read_token
 
 NAME = "slack"
-KEEP_HINTS_SECONDS = 86400 * 3
 
 
 def read_state(home):
@@ -48,12 +47,13 @@ def app_token(settings):
 
 
 class Listener:
-    def __init__(self, home, settings, http=None, clock=time.time, runner=None):
+    def __init__(self, home, settings, http=None, clock=time.time, runner=None, sink=None):
         self.home = Path(home)
         self.settings = {**Source.defaults(), **settings}
         self.http = http or Http(read_token(self.settings["token_file"]))
         self.clock = clock
-        self.ticks = TickPump(runner or (lambda: listening.run_tick(self.home)), clock)
+        # Where events go: this machine's automation (LocalSink) or the relay queue (RelaySink).
+        self.sink = sink or LocalSink(self.home, {NAME: float(self.settings["quiet_seconds"]) + 5}, runner, clock)
         self.me = self.http.api("auth.test")["user_id"]
         self.followed = {}  # (channel, thread_ts) -> (followed, checked_at)
         # Health without content: how many events arrived since start, and when the last one did.
@@ -121,19 +121,8 @@ class Listener:
         return ack
 
     def hint(self, channel, thread_ts, why, ts):
-        now = self.clock()
-
-        def change(state):
-            hints = {k: v for k, v in state.get("hints", {}).items() if now - v.get("seen", 0) < KEEP_HINTS_SECONDS}
-            key = f"{channel}:{thread_ts or ''}"
-            old = hints.get(key, {})
-            # A followed thread outranks a single mention in it (every reply then counts).
-            hints[key] = {"channel": channel, "thread_ts": thread_ts, "seen": now, "ts": ts,
-                          "why": "thread" if "thread" in (old.get("why"), why) else why}
-            state.update(hints=hints, nudge_at=now, heartbeat=now)
-
-        listening.update_state(self.home, NAME, change)
-        self.ticks.schedule(now + float(self.settings["quiet_seconds"]) + 5)
+        # Ids only; a followed thread outranks a single mention in it (merged by the sink).
+        self.sink.emit(NAME, hint={"channel": channel, "thread_ts": thread_ts, "why": why, "ts": ts})
 
     def beat(self, connected=None):
         def change(state):
@@ -145,13 +134,15 @@ class Listener:
         listening.update_state(self.home, NAME, change)
 
     def pump(self):
-        self.ticks.pump()
+        self.sink.pump()
 
 
-def serve(home, settings):
+def serve(home, settings, config=None):
     import websocket
 
-    listener = Listener(home, settings)
+    full = {**Source.defaults(), **settings}
+    listener = Listener(home, settings, sink=sink_from_config(home, config or {},
+                                                              {NAME: float(full["quiet_seconds"]) + 5}))
     token = app_token(listener.settings)
     stop = threading.Event()
 
@@ -208,7 +199,7 @@ def main(argv=None):
         print(json.dumps({"app_token": "ok", "socket": bool(Http(token).api("apps.connections.open",
                                                                          _post=True).get("url"))}))
         return 0
-    serve(home, settings)
+    serve(home, settings, config)
     return 0
 
 

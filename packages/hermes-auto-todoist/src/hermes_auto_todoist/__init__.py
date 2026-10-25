@@ -56,6 +56,15 @@ def due_time_reached(task, now=None):
     return current >= due
 
 
+def due_timestamp(task):
+    """Unix time of a timed due date (floating times are local), else None."""
+    value = (task.get("due") or {}).get("date") or ""
+    if "T" not in value:
+        return None
+    due = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return (due if due.tzinfo else due.astimezone()).timestamp()
+
+
 def poll_todoist(config, store, run=command_json, now=None):
     td = config["td_command"]
     label = config["todoist"]["label"]
@@ -66,6 +75,9 @@ def poll_todoist(config, store, run=command_json, now=None):
                         f"({opt_in}) & (today | overdue) & !@czekam & !@zablokowane", "--all", "--json"]))
     # Before its due time a task is treated like one scheduled later: not yet opted in.
     tasks = [task for task in listed if due_time_reached(task, now)]
+    # Push mode has no periodic polling: remember when the next timed task becomes due (`Source.due`).
+    upcoming = [due_timestamp(task) for task in listed if not due_time_reached(task, now)]
+    store.set_meta("todoist:next_due_at", min([t for t in upcoming if t], default=None))
     recurring = [t for t in tasks if (t.get("due") or {}).get("isRecurring")]
     completions = {}
     if recurring:
@@ -327,6 +339,23 @@ class Source:
 
     def finish(self, config, job):
         return finish_task(config["sources"]["todoist"]["command"], job)
+
+    def due(self, settings, store, last_poll, now):
+        """Todoist-only check: a webhook arrived (or its Inbox settle wake-up passed), a new day began
+        (date-only tasks become due), or a timed task's due time passed since the last check."""
+        from pathlib import Path
+
+        from hermes_auto.listening import nudged
+        try:
+            home = Path(store.path).parent
+        except (AttributeError, TypeError):
+            return False
+        if nudged(home, "todoist", last_poll, now, 5):
+            return True
+        if last_poll and dt.date.fromtimestamp(last_poll) != dt.date.fromtimestamp(now):
+            return True
+        upcoming = store.get_meta("todoist:next_due_at")
+        return bool(upcoming) and last_poll < float(upcoming) <= now
 
     def poll(self, config, store):
         source = config["sources"]["todoist"]

@@ -51,9 +51,99 @@ def update_state(home, name, change):
 
 
 def nudged(home, name, last_poll, now, quiet):
-    """True when the listener saw something after the source's last check and it has been quiet since."""
-    nudge_at = float(read_state(home, name).get("nudge_at") or 0)
-    return nudge_at > last_poll and now - nudge_at >= quiet
+    """True when the listener saw something after the source's last check and it has been quiet since,
+    or a requested later wake-up (`wakes`, e.g. the Todoist Inbox settle time) passed since that check."""
+    state = read_state(home, name)
+    nudge_at = float(state.get("nudge_at") or 0)
+    if nudge_at > last_poll and now - nudge_at >= quiet:
+        return True
+    return any(last_poll < float(at) <= now for at in state.get("wakes", []))
+
+
+KEEP_HINTS_SECONDS = 86400 * 3
+
+
+class LocalSink:
+    """Events land on this machine: record them for the source's `due` and run a tick after `quiet`.
+
+    `hint` (Slack: {channel, thread_ts, why, ts}) is kept so the source finds the conversation even before
+    search indexes it; `wake_after` asks for one more check that many seconds later.
+    """
+
+    def __init__(self, home, quiet=None, runner=None, clock=time.time):
+        self.home = Path(home)
+        self.quiet = quiet or {}
+        self.clock = clock
+        self.ticks = TickPump(runner or (lambda: run_tick(self.home)), clock)
+
+    def emit(self, source, hint=None, wake_after=None):
+        now = self.clock()
+
+        def change(state):
+            state.update(nudge_at=now, heartbeat=now, last_event_at=now,
+                         events_since_start=int(state.get("events_since_start") or 0) + 1)
+            if hint and hint.get("channel"):
+                hints = {k: v for k, v in state.get("hints", {}).items()
+                         if now - float(v.get("seen", 0)) < KEEP_HINTS_SECONDS}
+                key = f"{hint['channel']}:{hint.get('thread_ts') or ''}"
+                old = hints.get(key, {})
+                why = "thread" if "thread" in (old.get("why"), hint.get("why")) else hint.get("why")
+                hints[key] = {**hint, "why": why, "seen": now}
+                state["hints"] = hints
+            if wake_after:
+                state["wakes"] = [at for at in state.get("wakes", []) if now - float(at) < 86400] \
+                    + [now + float(wake_after)]
+
+        update_state(self.home, source, change)
+        self.ticks.schedule(now + float(self.quiet.get(source, 10)))
+        if wake_after:
+            self.ticks.schedule(now + float(wake_after))
+
+    def pump(self):
+        self.ticks.pump()
+
+
+class RelaySink:
+    """Events go to the relay queue on another machine (`hermes-auto-relay serve`); nothing runs here."""
+
+    def __init__(self, url, token, session=None):
+        self.url, self.token = url.rstrip("/"), token
+        self.session = session
+
+    def emit(self, source, hint=None, wake_after=None):
+        import json as _json
+        import urllib.request
+        body = _json.dumps({"source": source, "hint": hint}).encode()
+        request = urllib.request.Request(self.url + "/publish", data=body, method="POST", headers={
+            "Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
+        for attempt in range(5):
+            try:
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    if response.status == 200:
+                        return
+            except OSError as exc:
+                log(f"relay publish failed ({type(exc).__name__}), retrying")
+            time.sleep(2 * (attempt + 1))
+        raise RuntimeError("Relay did not accept the event")
+
+    def pump(self):
+        pass
+
+
+def read_secret(command):
+    result = subprocess.run([os.path.expanduser(part) for part in command], capture_output=True, text=True,
+                            timeout=30)
+    if result.returncode or not result.stdout.strip():
+        raise RuntimeError(f"No secret from {command[0]}")
+    return result.stdout.strip()
+
+
+def sink_from_config(home, config, quiet=None):
+    """RelaySink when `relay.publish_url` is set (a listener on the always-on server), else LocalSink."""
+    relay = config.get("relay", {})
+    if relay.get("publish_url"):
+        return RelaySink(relay["publish_url"], read_secret(relay["token_command"]))
+    return LocalSink(home, quiet)
 
 
 def live(state, now, stale=300):

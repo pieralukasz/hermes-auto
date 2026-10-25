@@ -15,7 +15,7 @@ import time
 from pathlib import Path
 
 from hermes_auto import listening
-from hermes_auto.listening import TickPump, log
+from hermes_auto.listening import LocalSink, log, sink_from_config
 
 from . import API, Source, gh_token
 
@@ -23,7 +23,7 @@ NAME = "github"
 
 
 class GitHubListener:
-    def __init__(self, home, settings, session=None, clock=time.time, runner=None):
+    def __init__(self, home, settings, session=None, clock=time.time, runner=None, sink=None):
         self.home = Path(home)
         self.settings = {**Source.defaults(), **settings}
         if session is None:
@@ -33,7 +33,7 @@ class GitHubListener:
                                     "Accept": "application/vnd.github+json"})
         self.session = session
         self.clock = clock
-        self.ticks = TickPump(runner or (lambda: listening.run_tick(self.home)), clock)
+        self.sink = sink or LocalSink(self.home, {NAME: float(self.settings["listen_quiet_seconds"])}, runner, clock)
         self.modified = None
         self.events, self.last_event = 0, None
         self.seen = None  # newest updated_at seen; the first answer is the baseline
@@ -52,7 +52,8 @@ class GitHubListener:
         skip = set(self.settings.get("skip_reasons", []))
         newest = max([item["updated_at"] for item in response.json() if item.get("reason") not in skip],
                      default=self.seen or "")
-        if self.seen is not None and newest > self.seen:
+        # First answer after a (re)start: check GitHub once for whatever came while this was not running.
+        if self.seen is None or newest > self.seen:
             self.arrived()
         self.seen = max(newest, self.seen or "")
         self.beat(True)
@@ -62,9 +63,7 @@ class GitHubListener:
         now = self.clock()
         self.events += 1
         self.last_event = now
-        listening.update_state(self.home, NAME, lambda state: state.update(
-            nudge_at=now, heartbeat=now, events_since_start=self.events, last_event_at=now))
-        self.ticks.schedule(now + float(self.settings["listen_quiet_seconds"]))
+        self.sink.emit(NAME)
 
     def beat(self, connected):
         now = self.clock()
@@ -74,13 +73,15 @@ class GitHubListener:
             last_event_at=self.last_event or now))
 
 
-def serve(home, settings):
-    listener = GitHubListener(home, settings)
+def serve(home, settings, config=None):
+    full = {**Source.defaults(), **settings}
+    listener = GitHubListener(home, settings, sink=sink_from_config(
+        home, config or {}, {NAME: float(full["listen_quiet_seconds"])}))
     stop = threading.Event()
 
     def pumping():
         while not stop.is_set():
-            listener.ticks.pump()
+            listener.sink.pump()
             stop.wait(1)
 
     threading.Thread(target=pumping, daemon=True).start()
@@ -104,7 +105,8 @@ def main(argv=None):
     parser.add_argument("command", nargs="?", default="serve", choices=["serve", "install-launchd", "check"])
     args = parser.parse_args(argv)
     home = args.home.expanduser().resolve()
-    settings = json.loads((home / "config.json").read_text()).get("sources", {}).get(NAME, {})
+    config = json.loads((home / "config.json").read_text())
+    settings = config.get("sources", {}).get(NAME, {})
     if args.command == "install-launchd":
         print(listening.install_launchd(home, NAME, "hermes-auto-github-listen"))
         return 0
@@ -112,7 +114,7 @@ def main(argv=None):
         listener = GitHubListener(home, settings)
         print(json.dumps({"github": "ok", "poll_interval": listener.check()}))
         return 0
-    serve(home, settings)
+    serve(home, settings, config)
     return 0
 
 

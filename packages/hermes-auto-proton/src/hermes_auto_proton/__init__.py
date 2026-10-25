@@ -94,6 +94,17 @@ class Proton:
         if kind != "OK":
             raise RuntimeError(f"Proton mailbox {mailbox!r} is unavailable; check Bridge and labels")
 
+    def mark_seen(self, message_ids):
+        kind, _ = self.client.select('"INBOX"')
+        if kind != "OK":
+            raise RuntimeError("Proton INBOX is unavailable for marking read")
+        for message_id in message_ids:
+            quoted = '"' + str(message_id).replace("\\", "").replace('"', "") + '"'
+            for uid in self.search("HEADER", "Message-ID", quoted):
+                kind, _ = self.client.uid("store", uid, "+FLAGS", "(\\Seen)")
+                if kind != "OK":
+                    raise RuntimeError("Proton mark read failed")
+
     def search(self, *criteria):
         kind, data = self.client.uid("search", None, *criteria)
         if kind != "OK":
@@ -240,6 +251,14 @@ class Source:
         client = Proton(settings)
         try:
             return client.inbox(settings, store, limit=limit, since_ms=since_ms)
+        finally:
+            client.close()
+
+    def mark_read(self, config, items):
+        """Set \\Seen (by Message-ID, in INBOX) on mail shown in a Hermes session or brief."""
+        client = Proton(config["sources"]["proton"])
+        try:
+            client.mark_seen([item["id"] for item in items])
         finally:
             client.close()
 

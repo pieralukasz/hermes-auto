@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 
 from . import listening
-from .listening import TickPump, log
+from .listening import LocalSink, log, sink_from_config
 
 NAME = "hooks"
 DEFAULTS = {"url": "wss://hooks.lucaspiera.com/listen",
@@ -34,11 +34,11 @@ def secret(settings):
 
 
 class HooksClient:
-    def __init__(self, home, settings, clock=time.time, runner=None):
+    def __init__(self, home, settings, clock=time.time, runner=None, sink=None):
         self.home = Path(home)
         self.settings = {**DEFAULTS, **settings}
         self.clock = clock
-        self.ticks = TickPump(runner or (lambda: listening.run_tick(self.home)), clock)
+        self.sink = sink or LocalSink(self.home, self.settings["quiet_seconds"], runner, clock)
 
     def since(self):
         return int(listening.read_state(self.home, NAME).get("seq") or 0)
@@ -59,14 +59,7 @@ class HooksClient:
                                                                             last_event_at=now))
         if not source:
             return None
-
-        def nudge(state):
-            state.update(nudge_at=now, heartbeat=now, connected=True, last_event_at=now,
-                         events_since_start=int(state.get("events_since_start") or 0) + 1)
-
-        listening.update_state(self.home, source, nudge)
-        quiet = float(self.settings["quiet_seconds"].get(source, 10))
-        self.ticks.schedule(now + quiet)
+        self.sink.emit(source)
         return source
 
     def beat(self, connected):
@@ -74,17 +67,18 @@ class HooksClient:
         listening.update_state(self.home, NAME, lambda state: state.update(connected=connected, heartbeat=now))
 
 
-def serve(home, settings):
+def serve(home, settings, config=None):
     import websocket
 
-    client = HooksClient(home, settings)
+    client = HooksClient(home, settings, sink=sink_from_config(home, config or {},
+                                                               {**DEFAULTS, **settings}["quiet_seconds"]))
     token = secret(client.settings)
     stop = threading.Event()
 
     def pumping():
         last = 0.0
         while not stop.is_set():
-            client.ticks.pump()
+            client.sink.pump()
             if time.time() - last > 60 and listening.read_state(client.home, NAME).get("connected"):
                 client.beat(True)
                 last = time.time()
@@ -114,11 +108,12 @@ def main(argv=None):
     parser.add_argument("command", nargs="?", default="serve", choices=["serve", "install-launchd"])
     args = parser.parse_args(argv)
     home = args.home.expanduser().resolve()
-    settings = json.loads((home / "config.json").read_text()).get("hooks", {})
+    config = json.loads((home / "config.json").read_text())
+    settings = config.get("hooks", {})
     if args.command == "install-launchd":
         print(listening.install_launchd(home, NAME, "hermes-auto-hooks-listen"))
         return 0
-    serve(home, settings)
+    serve(home, settings, config)
     return 0
 
 

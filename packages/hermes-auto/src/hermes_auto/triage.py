@@ -30,6 +30,9 @@ DEFAULTS = {
     "model": "claude-sonnet-5-5",
     # True: created sessions are hidden from Sessions (for the optional Desktop "Auto" page plugin).
     "hide_sessions": False,
+    # Mark mail, notifications and messages read at the source once they appear in a Hermes session
+    # or brief (skipped items and failed sessions stay unread).
+    "mark_read": True,
     "brief_times": ["07:45", "16:30"],
     # Extra brief sections from local commands (e.g. a finance review): [{"name", "command": [...], "times":
     # ["07:45"], "timeout": 180}]. The command gets SINCE (ISO time of its last success) and prints the JSON
@@ -444,6 +447,7 @@ def triage_mail(store, config, hermes, source, account, candidates, cursor_key=N
     Returns a list of (decision, item, detail) for reporting.
     """
     identity = f"{source}:{account}"
+    triage_options = settings(config)
     new = [item for item in candidates
            if not store.db.execute("SELECT 1 FROM triage_items WHERE account=? AND item_id=?",
                                    (identity, item["id"])).fetchone()
@@ -472,11 +476,19 @@ def triage_mail(store, config, hermes, source, account, candidates, cursor_key=N
                          "VALUES (?,?,?,?,?)", (f"{identity}:{item['id']}", source, session,
                                                 item.get("subject") or "Odpowiedź", payload))
         remember(item, session)
+        mark_later(item)
         store.db.execute("INSERT OR IGNORE INTO triage_items(account,item_id,kind,decision,reason,summary,"
                          "payload) VALUES (?,?,?,?,?,?,?)",
                          (identity, item["id"], kind_of(item), "followup", f"Odpowiedź do sesji {session}", "",
                           payload))
         report.append(("followup", item, session))
+
+    def mark_later(item):
+        # Read at the source once the session showing it is ready (replies: their "↩" session).
+        if triage_options["mark_read"]:
+            store.db.execute("INSERT OR IGNORE INTO read_marks(source,account,item_id,job_key,payload) "
+                             "VALUES (?,?,?,?,?)", (source, account, item["id"], f"{identity}:{item['id']}",
+                                                    json.dumps(item, ensure_ascii=False)))
 
     def remember(item, session):
         # Later messages in this conversation continue in the same session.
@@ -510,6 +522,7 @@ def triage_mail(store, config, hermes, source, account, candidates, cursor_key=N
                                        (event_key,)).fetchone()
                 if job:
                     remember(item, job[0])
+                mark_later(item)
             store.db.execute("INSERT OR IGNORE INTO triage_items(account,item_id,kind,decision,reason,summary,"
                              "payload,briefed) VALUES (?,?,?,?,?,?,?,?)",
                              (identity, item["id"], kind_of(item), verdict["decision"], verdict["reason"],
@@ -593,6 +606,58 @@ def process_followups(store, config, hermes):
                              "WHERE id=?", (str(exc), row["id"]))
             store.db.commit()
     return failures
+
+
+# ── Read at the source ───────────────────────────────────────────────────────
+
+READ_GATE = ("ready", "done")
+MAX_READ_ATTEMPTS = 5
+
+
+def flush_read_marks(store, config, installed, blocked=()):
+    """Mark items read at their source once the session or brief that shows them is ready.
+
+    Sources without `mark_read` (e.g. Slack, whose token cannot mark read) are recorded as unsupported.
+    Returns a list of error strings; a failing source retries at the next checks.
+    """
+    rows = [dict(row) for row in store.db.execute(
+        "SELECT r.* FROM read_marks r WHERE r.status='pending' AND (SELECT status FROM jobs j "
+        "WHERE j.event_key=r.job_key ORDER BY generation DESC LIMIT 1) IN (?,?)", READ_GATE)]
+    errors, groups = [], {}
+    for row in rows:
+        groups.setdefault(row["source"], []).append(row)
+    for name, marks in groups.items():
+        source = installed.get(name)
+        if name in blocked:
+            continue
+        if source is None or not hasattr(source, "mark_read"):
+            with store.db:
+                store.db.executemany("UPDATE read_marks SET status='unsupported' WHERE source=? AND account=? "
+                                     "AND item_id=?", [(m["source"], m["account"], m["item_id"]) for m in marks])
+            continue
+        try:
+            source().mark_read(config, [json.loads(m["payload"]) for m in marks])
+            status, error = "done", ""
+        except Exception as exc:  # noqa: BLE001 - retried; the session itself is fine
+            status, error = None, str(exc)[:300]
+            errors.append(f"mark read {name}: {error}")
+        with store.db:
+            for m in marks:
+                if status:
+                    store.db.execute("UPDATE read_marks SET status=?, error='' WHERE source=? AND account=? "
+                                     "AND item_id=?", (status, m["source"], m["account"], m["item_id"]))
+                else:
+                    store.db.execute("UPDATE read_marks SET attempts=attempts+1, error=?, status=CASE WHEN "
+                                     "attempts+1>=? THEN 'failed' ELSE 'pending' END WHERE source=? AND account=? "
+                                     "AND item_id=?", (error, MAX_READ_ATTEMPTS, m["source"], m["account"],
+                                                       m["item_id"]))
+    return errors
+
+
+def read_marks_waiting(store):
+    return bool(store.db.execute(
+        "SELECT 1 FROM read_marks r WHERE r.status='pending' AND (SELECT status FROM jobs j "
+        "WHERE j.event_key=r.job_key ORDER BY generation DESC LIMIT 1) IN (?,?) LIMIT 1", READ_GATE).fetchone())
 
 
 # ── Brief ────────────────────────────────────────────────────────────────────
@@ -785,6 +850,11 @@ def maybe_brief(store, config, now=None, hermes=None, adapter=None):
             for row in rows:
                 store.db.execute("UPDATE triage_items SET briefed=1 WHERE account=? AND item_id=?",
                                  (row["account"], row["item_id"]))
+                source_name, _, account = row["account"].partition(":")
+                if triage["mark_read"] and row["decision"] == "brief" and row["kind"] != "todoist":
+                    store.db.execute("INSERT OR IGNORE INTO read_marks(source,account,item_id,job_key,payload) "
+                                     "VALUES (?,?,?,?,?)", (source_name, account, row["item_id"], f"brief:{slot}",
+                                                            row["payload"]))
     if errors:
         raise RuntimeError(errors[0])
     return title

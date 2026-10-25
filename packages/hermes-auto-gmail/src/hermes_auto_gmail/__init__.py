@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import time
 from pathlib import Path
 from email.utils import getaddresses, parseaddr
@@ -34,6 +35,14 @@ class Gmail:
         if not response.ok:
             raise RuntimeError(f"Gmail read failed ({response.status_code}); check OAuth access")
         return response.json()
+
+    def mark_read(self, message_ids):
+        for start in range(0, len(message_ids), 1000):
+            response = self.http.post("https://gmail.googleapis.com/gmail/v1/users/me/messages/batchModify",
+                                      json={"ids": message_ids[start:start + 1000], "removeLabelIds": ["UNREAD"]},
+                                      timeout=45)
+            if not response.ok:
+                raise RuntimeError(f"Gmail mark read failed ({response.status_code})")
 
     def thread_ids(self, label):
         threads = []
@@ -216,6 +225,12 @@ class Source:
             home = Path(store.path).parent
         except (AttributeError, TypeError):
             return False
+        if settings.get("push_topic"):
+            # Push stops silently when the watch lapses: renew it daily even without new mail.
+            renewed = [json.loads(row[0]).get("renewed", 0) for row in store.db.execute(
+                "SELECT value FROM meta WHERE key LIKE 'gmail_watch:%'")]
+            if not renewed or now - max(renewed) >= 86400:
+                return True
         return nudged(home, "gmail", last_poll, now, float(settings.get("push_quiet_seconds", 10)))
 
     def poll(self, config, store):
@@ -225,6 +240,10 @@ class Source:
     def inbox(self, config, store, limit=40, since_ms=None):
         settings = config["sources"]["gmail"]
         return Gmail(settings).inbox(settings, store, limit=limit, since_ms=since_ms)
+
+    def mark_read(self, config, items):
+        """Remove UNREAD from messages shown in a Hermes session or brief."""
+        Gmail(config["sources"]["gmail"]).mark_read([item["id"] for item in items])
 
     def setup(self, config):
         settings = config["sources"]["gmail"]

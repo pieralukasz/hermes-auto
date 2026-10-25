@@ -1,7 +1,7 @@
 """GitHub source for the sorter: the user's notifications (review requests, mentions, comments, CI ...).
 
-Reads `GET /notifications` with the user's `gh` token, never writes (no mark-as-read, comments or
-reviews). Each notification thread is one conversation; a new update in it is a new candidate.
+Reads `GET /notifications` with the user's `gh` token. The only write is marking a notification thread
+read once it appears in a Hermes session or brief (no comments or reviews). Each notification thread is one conversation; a new update in it is a new candidate.
 Notifications the user already read on GitHub are marked read, so the sorter opens nothing. Watched
 repositories (`reason: subscribed`) are left out unless configured otherwise.
 """
@@ -56,6 +56,11 @@ class Http:
         if not response.ok:
             raise RuntimeError(f"GitHub read failed ({response.status_code}) for {url.split('?')[0]}")
         return response.json()
+
+    def mark_thread_read(self, thread_id):
+        response = self.session.patch(f"{API}/notifications/threads/{thread_id}", timeout=45)
+        if response.status_code not in (205, 304, 404):
+            raise RuntimeError(f"GitHub mark read failed ({response.status_code})")
 
 
 class GitHub:
@@ -168,6 +173,12 @@ class Source:
     def inbox(self, config, store, limit=40, since_ms=None):
         settings = {**self.defaults(), **config["sources"]["github"]}
         return GitHub(settings).inbox(config, store, limit=limit, since_ms=since_ms)
+
+    def mark_read(self, config, items):
+        settings = {**self.defaults(), **config["sources"]["github"]}
+        http = Http(gh_token(settings["token_command"]))
+        for thread in dict.fromkeys(str(item["thread_id"]) for item in items):
+            http.mark_thread_read(thread)
 
     def setup(self, config):
         GitHub({**self.defaults(), **config["sources"]["github"]}).http.get("/user")

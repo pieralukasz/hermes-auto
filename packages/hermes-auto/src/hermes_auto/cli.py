@@ -75,7 +75,9 @@ def run_triage(config, store, bridge, installed, blocked=(), only=None):
             errors.append(f"triage {name}: {exc}")
     todoist = installed.get("todoist")
     adapter = None
-    if (only is None and options["todoist"]["enabled"] and config["sources"].get("todoist", {}).get("enabled")
+    # Todoist steps run on full checks, Todoist-only checks, and whenever new mail may resolve @czekam.
+    todoist_turn = only is None or "todoist" in only or bool(new_mail)
+    if (todoist_turn and options["todoist"]["enabled"] and config["sources"].get("todoist", {}).get("enabled")
             and "todoist" not in blocked and todoist is not None and hasattr(todoist, "inbox_tasks")):
         # Separate steps: the sorter raises after queuing its plan when a stored decision still fails to apply
         # (retried next check); that must not skip proposals or the waiting check for this check's new mail.
@@ -216,6 +218,17 @@ def fast_sources(config, store, now=None):
         if seconds and now - last >= seconds:
             due.append(name)
     return due
+
+
+def brief_due(config, store, now=None):
+    """A brief time passed since the last brief (push mode has no periodic check to notice it)."""
+    from . import triage
+    options = triage.settings(config)
+    if not options["enabled"]:
+        return False
+    import datetime as dt
+    slot = triage.current_slot(options["brief_times"], now or dt.datetime.now())
+    return bool(slot) and store.get_meta("brief_slot") != slot
 
 
 def eligible_tick(config, store):
@@ -403,13 +416,28 @@ def dispatch(args, home, config, store):
         if store.get_meta("paused", False):
             print("Paused")
             return 0
-        only = None
-        if command == "tick" and not eligible_tick(config, store):
-            # Not time for a full check; a source with its own short interval (Slack) may still be due.
-            only = fast_sources(config, store) if not config["desktop_only"] or store.get_meta("desktop_seen") \
-                else []
-            if not only:
+        # `only`: sources to read (None = all); `local`: also run local upkeep (archive -> done, last_poll).
+        only, local = None, True
+        if command == "tick":
+            full = eligible_tick(config, store)
+            if config["desktop_only"] and not store.get_meta("desktop_seen"):
                 return 0
+            if config.get("poll_sources", True) is False:
+                # Push mode: a source is read only when its listener, webhook or timer says so (`due`);
+                # the periodic check keeps only local upkeep (sessions, archive, briefs).
+                only = fast_sources(config, store)
+                local = full or brief_due(config, store)
+                from . import triage as _triage
+                busy = _triage.read_marks_waiting(store) or any(
+                    j["status"] in ("pending", "created", "retry_pending", "running", "creating") for j in store.rows())
+                if not only and not local and not busy:
+                    return 0
+            elif not full:
+                # Not time for a full check; a source with its own interval or a listener nudge may be due.
+                only = fast_sources(config, store)
+                if not only:
+                    return 0
+                local = False
         if command != "scan":
             # Under the run lock anything still "running" was interrupted: jobs and replies alike go to
             # needs_attention before any work starts, so nothing is replayed without an explicit retry.
@@ -431,13 +459,17 @@ def dispatch(args, home, config, store):
         if command != "scan" and any(j["status"] in ("pending", "created", "retry_pending", "running", "creating")
                                      for j in store.rows()):
             failures += process_jobs(store, config, bridge(), blocked_sources=blocked)
-        if command != "scan" and only is None:
+        if command != "scan":
+            from . import triage as _triage
+            read_errors = _triage.flush_read_marks(store, config, sources(), blocked)
+            errors = errors + read_errors
+        if command != "scan" and local:
             # Archiving a prepared session in Hermes closes its source item (Todoist: completes the task).
             finish_errors = sync_finished(store, config, bridge, sources(), blocked)
             failures += len(finish_errors)
             errors = errors + finish_errors
         stamp = time.time()
-        if only is None:
+        if local:
             store.set_meta("last_poll", stamp)
         for name in (only if only is not None else config["sources"]):
             store.set_meta(f"last_poll:{name}", stamp)

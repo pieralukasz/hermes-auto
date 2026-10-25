@@ -64,6 +64,13 @@ class Store:
                 payload TEXT NOT NULL DEFAULT '{}', briefed INTEGER NOT NULL DEFAULT 0,
                 created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(account, item_id)
             );
+            -- Source items to mark read once the Hermes session (or brief) showing them is ready.
+            CREATE TABLE IF NOT EXISTS read_marks (
+                source TEXT NOT NULL, account TEXT NOT NULL, item_id TEXT NOT NULL, job_key TEXT NOT NULL,
+                payload TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+                error TEXT NOT NULL DEFAULT '', created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(source, account, item_id)
+            );
             -- Replies routed into the existing Hermes session that sent the original message.
             CREATE TABLE IF NOT EXISTS followups (
                 id INTEGER PRIMARY KEY, event_key TEXT NOT NULL UNIQUE, source TEXT NOT NULL,

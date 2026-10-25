@@ -34,10 +34,10 @@ def test_gateway_events_nudge_their_source_once(tmp_path):
     assert client.since() == 1
     state = listening.read_state(tmp_path, "gmail")
     assert state["nudge_at"] == 1000.0 and state["events_since_start"] == 1 and "historyId" not in state
-    client.ticks.pump()
+    client.sink.pump()
     assert ran == []
     clock.now += 10
-    client.ticks.pump()
+    client.sink.pump()
     assert ran == [1010.0]
     assert client.handle("pong") is None
 
