@@ -253,7 +253,8 @@ def test_plan_escapes_markdown_in_task_text(store):
     sort(store, config, hermes, adapter)
     sort(store, config, hermes, adapter)
     text = plan_text(plans(store)[0])
-    assert unescaped(r"!?\[|\]\(|<img", text) == []
+    assert unescaped(r"\]\(|<img", text) == []
+    assert "\\(" not in text and "\\[" not in text  # Desktop renders these as math
 
 
 # ── Mail: LinkedIn identity, dead sessions, starvation, recovery ─────────────
@@ -381,7 +382,8 @@ def test_brief_escapes_markdown_from_mail():
         "subject": "![x](https://evil.test/p.gif?u=1) [Zaloguj](https://evil.test) <img src=x>",
         "url": "https://mail.google.com/mail/u/0/#inbox/abc"})}]
     text = triage.render_brief(rows, cfg())
-    assert unescaped(r"\[|\]\(|<", text) == ["[", "]("]  # only the checked "otwórz" link
+    assert unescaped(r"\]\(|<", text) == ["]("]  # only the checked "otwórz" link
+    assert "\\(" not in text and "\\[" not in text  # Desktop renders these as math
     assert "[otwórz](https://mail.google.com/mail/u/0/#inbox/abc)" in text
 
 
@@ -390,3 +392,10 @@ def test_brief_drops_unsafe_links():
         "from": "a@b.test", "subject": "x", "url": "javascript:alert(1)) ![p](https://evil.test/p.gif"})}]
     text = triage.render_brief(rows, cfg())
     assert "otwórz" not in text and "evil.test" not in text
+
+
+def test_md_keeps_parentheses_and_escapes_math_openers():
+    text = triage.md("aclari.pl 711,17 USD (Revolut USD, 24.10) [x] $5 a $6")
+    assert "(Revolut USD, 24.10)" in text
+    assert "\\(" not in text and "\\[" not in text
+    assert "\\$5" in text and "\\]" in text

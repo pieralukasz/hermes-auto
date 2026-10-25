@@ -143,7 +143,10 @@ def polish(config):
 # ── Untrusted text ───────────────────────────────────────────────────────────
 
 CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u2028\u2029]")
-MARKDOWN = re.compile(r"([\\`*_\[\]()<>#|~])")
+# Escape only what breaks out of plain text. Not "(", ")" or "[": Hermes Desktop renders \( \) and
+# \[ \] as LaTeX math, so escaped parentheses turned brief lines into formulas. An escaped "]" alone
+# already prevents [text](url) links and ![img](url); "$" is escaped against $...$ inline math.
+MARKDOWN = re.compile(r"([\\`*_\]<>#|~$])")
 SAFE_URL = re.compile(r"https://[A-Za-z0-9.-]+(?:[:/?#][A-Za-z0-9\-._~:/?#@!$&'*+,;=%]*)?")
 
 

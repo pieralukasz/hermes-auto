@@ -2,6 +2,7 @@
 checks, Desktop-owned sessions). Each test pins behaviour that either side alone did not cover."""
 import copy
 import json
+import re
 import sys
 
 import pytest
@@ -140,7 +141,7 @@ def test_proposals_escape_markdown_in_task_text(store, config):
                                          "projectId": "P-home", "description": "![x](https://evil.test/p.png)"}]
     triage.propose_agent_tasks(store, config, adapter)
     message = json.loads(store.rows()[-1]["payload"])["open_message"]
-    assert "](https://evil" not in message and "\\[to\\]" in message
+    assert not re.search(r"(?<!\\)\]\(https://evil", message) and "[to\\]" in message and "\\[" not in message
 
 
 # ── Context excludes the automation's own sessions ──────────────────────────
@@ -252,8 +253,8 @@ def test_waiting_check_escapes_third_party_text(store, config):
                             {"task_id": "X", "mail": 0, "ready": False, "got": "a\nOd: ktoś", "missing": "b\nc"}]])
     triage.check_waiting(store, config, hermes, adapter, [evil])
     message = json.loads(store.rows()[0]["payload"])["open_message"]
-    assert "](https://evil" not in message and "**Pilne**" not in message
-    assert "\\[kliknij\\]" in message and "\\!\\[p\\]" not in message and "!\\[p\\]" in message
+    assert not re.search(r"(?<!\\)\]\(https://evil", message) and "**Pilne**" not in message
+    assert "[kliknij\\]" in message and "![p\\]" in message and "\\[" not in message
     assert adapter.comments[0][1].count("\n") == 0
 
 
