@@ -66,6 +66,8 @@ TODOIST_READS = {("today",), ("upcoming",), ("inbox",), ("completed",), ("activi
 READ_TOOLS = frozenset({"skill_view", "skills_list", "session_search"})
 # Slack sessions research before drafting: web reads too, and the read-only commands of `slack_read_command`.
 SLACK_READ_TOOLS = READ_TOOLS | {"web_search", "web_extract"}
+# Research read profiles (Slack, GitHub); "slack" is kept for sessions queued before the rename.
+RESEARCH_PROFILES = ("research", "slack")
 SLACK_MCP = "/skills/tap-in/tapin-slack/scripts/slack_mcp.py"
 SLACK_MCP_READS = {"slack_search_public", "slack_search_public_and_private", "slack_search_users",
                    "slack_search_channels", "slack_read_channel", "slack_read_thread", "slack_read_canvas",
@@ -163,7 +165,7 @@ def read_only_command(command, profile=True):
         return any(tuple(tokens[1:1 + len(read)]) == read for read in TODOIST_READS)
     if program in ("python", "python3") and len(tokens) >= 4 and tokens[1].endswith(GOOGLE_API):
         return (tokens[2], tokens[3]) in GOOGLE_READS
-    if profile == "slack":
+    if profile in RESEARCH_PROFILES:
         return slack_read_command(tokens)
     return False
 
@@ -196,10 +198,10 @@ def deny_tool_execution(agent_class, allowed=READ_TOOLS, profile=True):
         calls = list(getattr(assistant_message, "tool_calls", None) or [])
         if all(permitted(call) for call in calls):
             return original(self, assistant_message, messages, *args, **kwargs)
-        refused = ("Only reads are allowed in this automatic step (third-party Slack messages): Slack MCP reads, "
+        refused = ("Only reads are allowed in this automatic step (third-party messages): Slack MCP reads, "
                    "git/gh/linear reads, web_search/web_extract, calendar list, td list/view, session_search, "
                    "skills. Sending and writing wait for the user's explicit OK. Nothing ran in this batch."
-                   if profile == "slack" else
+                   if profile in RESEARCH_PROFILES else
                    "Only reads are allowed in this automatic step (third-party mail): calendar list, "
                    "gmail search/get, td list/view/today, session_search, skills. Nothing ran in this batch.")
         _append_tool_error_results(messages, calls, lambda call: json.dumps({"error": refused}))
@@ -571,10 +573,10 @@ def main():
     # Only this worker's in-memory configuration changes. Interactive Hermes keeps its settings.
     # Unattended runs never get interactive approval: dangerous commands are denied.
     cli.CLI_CONFIG["approvals"] = {"mode": "manual", "single_query_mode": "deny"}
-    if request.get("deny_tools") == "slack":
+    if request.get("deny_tools") in RESEARCH_PROFILES:
         # Slack messages: research with reads only (Slack, code, PRs, Linear, web), then a draft; nothing is sent.
         desktop_parity(AIAgent)
-        deny_tool_execution(AIAgent, SLACK_READ_TOOLS, "slack")
+        deny_tool_execution(AIAgent, SLACK_READ_TOOLS, request["deny_tools"])
         cli.main(query=request["prompt"], resume=sid, quiet=True, oneshot=True, output_format="stream-json",
                  max_turns=config["agent_max_turns"], run_budget=config["agent_run_budget_seconds"])
         return

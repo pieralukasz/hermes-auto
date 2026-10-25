@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+[project]
+name = "hermes-auto-github"
+version = "0.1.0"
+description = "Hermes sessions for your GitHub notifications (sorter source, read-only)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{name = "Lukasz Piera"}]
+dependencies = ["hermes-auto==0.1.0", "requests>=2.32,<3"]
+[project.urls]
+Repository = "https://github.com/pieralukasz/hermes-auto"
+Issues = "https://github.com/pieralukasz/hermes-auto/issues"
+
+[project.scripts]
+hermes-auto-github-listen = "hermes_auto_github.listener:main"
+
+[project.entry-points."hermes_auto.sources"]
+github = "hermes_auto_github:Source"

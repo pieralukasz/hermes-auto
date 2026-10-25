@@ -187,7 +187,7 @@ class Hermes:
     def budget(self, job):
         # Slack sessions research before drafting (reads only), so they get the full agent budget.
         key = ("agent_run_budget_seconds" if job and ((full_tools(job) and not job.get("deny_tools"))
-                                                      or deny_mode(job) == "slack")
+                                                      or deny_mode(job) in ("research", "slack"))
                else "run_budget_seconds")
         return self.config[key]
 

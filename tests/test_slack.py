@@ -218,7 +218,7 @@ def test_sorter_opens_research_session_that_never_sends(store, config):
     system, user = fake.prompts[0]
     assert "Slacka" in system and user[0]["where"] == "DM"
     job = store.rows()[0]
-    assert job["source"] == "slack" and deny_mode(job) == "slack"
+    assert job["source"] == "slack" and deny_mode(job) == "research"
     prompt = prompt_for(job, config)
     assert "NIGDY sam nie odpowiadaj" in prompt and "research" in prompt and "SLACK-" in prompt
     row = store.db.execute("SELECT kind FROM triage_items").fetchone()
@@ -230,7 +230,7 @@ def test_sorter_opens_research_session_that_never_sends(store, config):
     assert fake2.prompts == []  # routed, not classified
     triage.process_followups(store, config, fake2)
     newest = store.rows()[-1]
-    assert newest["title"].startswith("↩ ") and deny_mode(newest) == "slack"
+    assert newest["title"].startswith("↩ ") and deny_mode(newest) == "research"
     assert "ciąg dalszy rozmowy ze Slacka" in prompt_for(newest, config)
 
 

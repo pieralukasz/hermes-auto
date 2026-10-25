@@ -11,6 +11,7 @@ Four independently installable Python distributions live in this repository:
 | `hermes-auto-gmail` | Replies in labelled Gmail threads | Core + Google auth + requests |
 | `hermes-auto-proton` | Replies to labelled Proton conversations through Bridge | Core; Python's IMAP library |
 | `hermes-auto-slack` | Sorter source: DMs, mentions and replies in followed threads (read-only) | Core; `requests` |
+| `hermes-auto-github` | Sorter source: your GitHub notifications (read-only) | Core; `requests` |
 
 Installing Todoist does not install either mail adapter or their dependencies. The core discovers adapters through the `hermes_auto.sources` Python entry-point group. Adapters create durable events; they never start an agent themselves.
 
@@ -135,6 +136,12 @@ hermes-auto source enable slack
 ```
 
 The first check records a baseline; only later messages open sessions.
+
+## GitHub
+
+A sorter source for your notifications (`GET /notifications` with the `gh` token; read-only, never marks anything read). Each notification thread is one conversation: review requests, mentions, comments, assignments, CI results. `reason: subscribed` (repositories you only watch) is skipped (`skip_reasons`). Already read on GitHub, or the latest comment is yours: no session. Decisions use `triage.github_criteria`; sessions get the same read-only research profile as Slack and never comment, review, merge or push on their own.
+
+GitHub has no push for account notifications; `hermes-auto-github-listen` polls with `If-Modified-Since` at GitHub's `X-Poll-Interval` (60 s; a 304 is free) and nudges a GitHub-only check. Without it, `poll_seconds` (300) applies.
 
 ## Sorter (opt-in)
 
