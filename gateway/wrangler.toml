@@ -1,0 +1,19 @@
+name = "hermes-hooks"
+main = "worker.js"
+compatibility_date = "2025-10-01"
+account_id = "b6faeb99725d7aa7973a9eb77bb95485"
+workers_dev = false
+routes = [{ pattern = "hooks.lucaspiera.com", custom_domain = true }]
+
+# Hashes only (SHA-256 of the secrets kept in the Mac keychain: hermes-auto-hooks-listen, hermes-auto-hooks-gmail).
+[vars]
+LISTEN_SHA256 = "91a391197d7074e3020f922792ccfe6bd631b7941a518db1cc50bcdab1ff2879"
+GMAIL_TOKEN_SHA256 = "a36e28954dac1ae55492439d1139e3aa45f5c20ff7dac06f9fe87e5891090627"
+
+[[durable_objects.bindings]]
+name = "HUB"
+class_name = "Hub"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Hub"]

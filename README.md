@@ -137,6 +137,10 @@ hermes-auto source enable slack
 
 The first check records a baseline; only later messages open sessions.
 
+## Push gateway (Gmail)
+
+`gateway/` is a Cloudflare Worker for webhooks that need a public address. Gmail push: `users.watch` publishes to a Pub/Sub topic, a push subscription posts to the Worker, the Worker hands an ids-only event to `hermes-auto-hooks-listen` (core, extra `hooks`) over an outbound WebSocket, which nudges a Gmail-only check. Set `sources.gmail.push_topic`; the Gmail adapter renews the watch daily in `poll` (configuration only, no mail is changed). The regular checks stay as the fallback.
+
 ## GitHub
 
 A sorter source for your notifications (`GET /notifications` with the `gh` token; read-only, never marks anything read). Each notification thread is one conversation: review requests, mentions, comments, assignments, CI results. `reason: subscribed` (repositories you only watch) is skipped (`skip_reasons`). Already read on GitHub, or the latest comment is yours: no session. Decisions use `triage.github_criteria`; sessions get the same read-only research profile as Slack and never comment, review, merge or push on their own.

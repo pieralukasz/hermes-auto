@@ -10,9 +10,12 @@ requires-python = ">=3.11"
 license = "MIT"
 authors = [{name = "Lukasz Piera"}]
 dependencies = []
+[project.optional-dependencies]
+hooks = ["websocket-client>=1.8,<2"]
 [project.urls]
 Repository = "https://github.com/pieralukasz/hermes-auto"
 Issues = "https://github.com/pieralukasz/hermes-auto/issues"
 
 [project.scripts]
 hermes-auto = "hermes_auto.cli:main"
+hermes-auto-hooks-listen = "hermes_auto.hooks:main"

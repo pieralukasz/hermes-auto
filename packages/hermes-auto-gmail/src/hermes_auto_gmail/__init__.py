@@ -140,8 +140,30 @@ class Gmail:
             "url": f"https://mail.google.com/mail/u/{account}/#all/{thread_id}", "sent": sent,
         }
 
+    def renew_watch(self, config, store, account, now=None):
+        """Keep Gmail push (users.watch -> Pub/Sub `push_topic`) alive: renew daily, before the 7-day expiry.
+
+        Configuration only; reads and changes no mail. Without `push_topic` nothing happens.
+        """
+        topic = config.get("push_topic")
+        if not topic:
+            return None
+        now = time.time() if now is None else now
+        key = f"gmail_watch:{account}"
+        state = store.get_meta(key) or {}
+        if state.get("topic") == topic and now - float(state.get("renewed", 0)) < 86400:
+            return state
+        response = self.http.post("https://gmail.googleapis.com/gmail/v1/users/me/watch", timeout=45,
+                                  json={"topicName": topic, "labelIds": ["INBOX"], "labelFilterBehavior": "include"})
+        if not response.ok:
+            raise RuntimeError(f"Gmail watch failed ({response.status_code}); check the Pub/Sub topic permission")
+        state = {"topic": topic, "renewed": now, "expiration": int(response.json().get("expiration", 0)) / 1000}
+        store.set_meta(key, state)
+        return state
+
     def poll(self, config, store):
         account = self.get("profile")["emailAddress"]
+        self.renew_watch(config, store, account)
         own = [account, *config.get("own_addresses", [])]
         labels = {item["name"]: item["id"] for item in self.get("labels").get("labels", [])}
         if config["label"] not in labels:
@@ -186,6 +208,15 @@ class Source:
     def defaults():
         return {"enabled": True, "label": "Hermes/Watch", "agent_label": "Hermes/Agent", "mode": "draft",
                 "token_file": str(Path.home() / ".hermes/google_token.json"), "own_addresses": []}
+
+    def due(self, settings, store, last_poll, now):
+        """A Gmail-only check between the regular ones: only when the gateway pushed a change."""
+        from hermes_auto.listening import nudged
+        try:
+            home = Path(store.path).parent
+        except (AttributeError, TypeError):
+            return False
+        return nudged(home, "gmail", last_poll, now, float(settings.get("push_quiet_seconds", 10)))
 
     def poll(self, config, store):
         settings = config["sources"]["gmail"]
