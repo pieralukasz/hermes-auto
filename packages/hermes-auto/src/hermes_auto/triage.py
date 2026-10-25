@@ -57,8 +57,13 @@ DEFAULTS = {
         "w Twojej sieci”), webinary, automatyczne raporty bez znaczenia."),
     "slack_criteria": (
         "Slack to praca Łukasza w Tap In (Gigaverse, Kova): web/mobile frontend, frontend-common, showcase, "
-        "Shopify. Każda wiadomość jest do niego: DM, grupa DM, oznaczenie @Łukasz albo odpowiedź w wątku, "
-        "który obserwuje.\n"
+        "Shopify. Wiadomość jest do niego (DM, grupa DM, oznaczenie @Łukasz, odpowiedź w wątku, który obserwuje) "
+        "albo, gdy why=channel, to nowy post na kanale, który obserwuje (np. #bugs-and-suggestions), "
+        "niekoniecznie do niego.\n"
+        "why=channel: session, gdy to zgłoszenie błędu, prośba lub pytanie, które może dotyczyć jego obszaru "
+        "(web, frontend-common, showcase, Shopify, wygląd aplikacji, maili i marki) albo nie da się tego wykluczyć; "
+        "brief, gdy wyraźnie dotyczy tylko innego obszaru (natywna aplikacja mobilna, backend) lub ktoś już to "
+        "przejął; skip tylko dla szumu.\n"
         "session: ktoś pyta, prosi, czeka na jego odpowiedź, decyzję, review, poprawkę lub informację; zgłasza "
         "błąd lub problem dotyczący jego pracy; proponuje termin; odpowiada na jego pytanie tak, że sprawa idzie "
         "dalej (także gdy treść jest niejasna).\n"
@@ -329,7 +334,9 @@ def slack_block(item):
 def slack_session_prompt(item, reason, config):
     reason = one_line(reason, 300)
     why = {"dm": "napisał do mnie na Slacku", "mention": "oznaczył mnie na Slacku",
-           "thread": "odpisał w moim wątku na Slacku"}.get(item.get("why"), "napisał do mnie na Slacku")
+           "thread": "odpisał w moim wątku na Slacku",
+           "channel": f"napisał na obserwowanym kanale {one_line(item.get('place'), 80)} na Slacku"
+           }.get(item.get("why"), "napisał do mnie na Slacku")
     note = (f"(Automat: ktoś {why} (Tap In, workspace Gigaverse)" + (f": {reason}" if reason else "") + ". "
             + (SLACK_PRIVATE_PL if item.get("redacted") else SLACK_NOTICE_PL))
     if item.get("followup_of"):

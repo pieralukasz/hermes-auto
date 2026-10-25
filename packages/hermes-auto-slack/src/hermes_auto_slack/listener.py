@@ -83,7 +83,7 @@ class Listener:
         return followed
 
     def classify(self, event):
-        """Why this message concerns the user ("dm", "mention", "thread"), or None."""
+        """Why this message concerns the user ("dm", "mention", "thread", "channel"), or None."""
         if event.get("type") != "message" or event.get("bot_id"):
             return None
         if event.get("subtype") not in (None, "thread_broadcast", "file_share", "me_message"):
@@ -101,6 +101,8 @@ class Listener:
             return "dm"
         if f"<@{self.me}>" in (event.get("text") or ""):
             return "mention"
+        if channel in (self.settings.get("watch_channels") or []) and thread_ts in (None, event.get("ts")):
+            return "channel"
         if thread_ts and thread_ts != event.get("ts") and self.thread_followed(channel, thread_ts):
             return "thread"
         return None
@@ -125,6 +127,8 @@ class Listener:
             thread_ts = event.get("thread_ts") if event.get("thread_ts") != event.get("ts") else None
             if why == "dm" and event.get("thread_ts"):
                 thread_ts = event["thread_ts"]
+            if why == "channel":
+                thread_ts = event.get("ts")  # each watched post is its own conversation
             self.hint(channel, thread_ts, why, event.get("ts"))
         return ack
 

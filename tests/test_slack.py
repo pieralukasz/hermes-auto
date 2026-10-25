@@ -432,3 +432,69 @@ def test_slack_zero_interval_disables_own_polling(tmp_path):
         assert not Source().due({"poll_seconds": 0, "listener_poll_seconds": 0}, store, NOW - 4000, NOW)
     finally:
         store.close()
+
+
+def test_watched_channel_posts_become_separate_candidates(store):
+    fake = FakeSlack()
+    fake.channel("C9", name="bugs-and-suggestions", last_read="0")
+    fake.post("C9", "UOZ", f"{NOW - 100:.6f}", "stary bug sprzed baseline")
+    settings = {**Source.defaults(), "token_file": "unused", "watch_channels": ["C9"]}
+
+    def inbox(now):
+        return Slack(settings, http=fake, now=lambda: now).inbox({}, store)
+
+    _, key, cursor = inbox(NOW)
+    store.set_meta(key, cursor)
+    fake.post("C9", "UOZ", f"{NOW + 5:.6f}", "logo jest przezroczyste na czarnym tle")
+    fake.post("C9", "UCHRIS", f"{NOW + 6:.6f}", "checkout nie dziala")
+    fake.post("C9", "UBOT", f"{NOW + 7:.6f}", "bot", bot_id="B1")
+    fake.post("C9", "UCHRIS", f"{NOW + 8:.6f}", "odpowiedz pod bugiem", thread=f"{NOW + 5:.6f}")
+    fake.post("C9", "UOZ", f"{NOW + 9:.6f}", f"<@{ME}> to chyba twoje")
+    candidates, _, cursor = inbox(NOW + 300)
+    by_text = {c["snippet"]: c for c in candidates}
+    assert set(by_text) == {"logo jest przezroczyste na czarnym tle", "checkout nie dziala", f"<@{ME}> to chyba twoje"}
+    logo = by_text["logo jest przezroczyste na czarnym tle"]
+    assert logo["why"] == "channel" and logo["place"] == "#bugs-and-suggestions" and not logo["read"]
+    assert logo["thread_id"] == f"C9:{NOW + 5:.6f}" and "?thread_ts=" not in logo["url"]
+    assert by_text[f"<@{ME}> to chyba twoje"]["why"] == "mention"  # never twice
+    store.set_meta(key, cursor)
+    assert inbox(NOW + 600)[0] == []  # handed over once
+    # Read in Slack before the sorter got to it: marked read, no session.
+    fake.post("C9", "UOZ", f"{NOW + 700:.6f}", "kolejny bug")
+    fake.channels["C9"]["last_read"] = f"{NOW + 700:.6f}"
+    candidates, _, _ = inbox(NOW + 1000)
+    assert [c["read"] for c in candidates] == [True]
+
+
+def test_unwatched_channel_posts_stay_out(store):
+    fake = FakeSlack()
+    fake.channel("C9", name="bugs-and-suggestions", last_read="0")
+    key = baseline(store, fake)
+    fake.post("C9", "UOZ", f"{NOW + 5:.6f}", "bug")
+    assert slack_with(fake, NOW + 300).inbox({}, store)[0] == [] and key
+
+
+def test_listener_hints_watched_channel_posts(tmp_path):
+    from hermes_auto_slack.listener import Listener, read_state
+    fake, clock, ran = FakeSlack(), Clock(NOW), []
+    fake.channel("C9", name="bugs-and-suggestions")
+    fake.post("C9", "UOZ", "5.0", "bug")
+    listener = Listener(tmp_path, {"watch_channels": ["C9"]}, http=fake, clock=clock,
+                        runner=lambda: ran.append(clock()) or (0, ""))
+    listener.handle(envelope({"channel": "C9", "channel_type": "channel", "user": "UOZ", "ts": "6.0", "text": "bug"}))
+    listener.handle(envelope({"channel": "C9", "channel_type": "channel", "user": "UOZ", "ts": "7.0", "text": "x",
+                              "thread_ts": "5.0"}))  # reply under someone else's post: not his thread
+    listener.handle(envelope({"channel": "C8", "channel_type": "channel", "user": "UOZ", "ts": "8.0", "text": "x"}))
+    hints = read_state(tmp_path)["hints"]
+    assert set(hints) == {"C9:6.0"} and hints["C9:6.0"]["why"] == "channel"
+
+
+def test_watched_channel_session_prompt_says_where(store, config):
+    item = {**slack_item(), "why": "channel", "place": "#bugs-and-suggestions", "dm": False,
+            "id": "C9:1.0@1.0", "thread_id": "C9:1.0", "channel": "C9", "thread_ts": "1.0"}
+    fake = Fake(replies=[[{"i": 0, "decision": "session", "reason": "bug w webie", "summary": "Oz zglasza bug"}]])
+    triage.triage_mail(store, config, fake, "slack", "TACME", [item], "k", {"since": 1})
+    system, user = fake.prompts[0]
+    assert "why=channel" in system and user[0]["why"] == "channel"
+    prompt = prompt_for(store.rows()[0], config)
+    assert "obserwowanym kanale #bugs-and-suggestions" in prompt and "NIGDY sam nie odpowiadaj" in prompt

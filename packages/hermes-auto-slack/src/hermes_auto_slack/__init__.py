@@ -1,8 +1,9 @@
 """Slack source for the sorter: everything addressed to the user becomes a mail-like candidate.
 
-What counts: direct messages and group DMs, @mentions of the user in channels, and replies in
+What counts: direct messages and group DMs, @mentions of the user in channels, replies in
 threads the user follows (Slack subscribes you to threads you started, wrote in or were mentioned
-in). Bots, Slackbot, the user's own messages, edits, joins and @here/@channel alone never count.
+in), and every new top-level post in the channels listed in `watch_channels` (e.g. a bug-report
+channel), each post its own candidate. Bots, Slackbot, the user's own messages, edits, joins and @here/@channel alone never count.
 
 Messages of one conversation (a DM, or a thread) are handed over as one burst once nobody has
 written for `quiet_seconds`; if the user read or answered it in Slack before that, the candidate is
@@ -242,6 +243,11 @@ class Slack:
         for channel_id, ts, thread_ts in self.search(store, "mention", MENTION.format(me),
                                                      "public_channel,private_channel", since):
             add(channel_id, thread_ts, "mention")
+        # Watched channels: every new top-level post is its own conversation (keyed by its ts).
+        for channel_id in self.settings.get("watch_channels") or []:
+            for message in self.history(channel_id, since, pages=1):
+                if message.get("thread_ts") in (None, message.get("ts")) and is_human(message, me):
+                    add(channel_id, message["ts"], "channel")
         horizon = self.now() - 86400 * int(self.settings["thread_days"])
         for channel_id in self.my_channels(store):
             if channel_id in skip:
@@ -265,6 +271,9 @@ class Slack:
             return False
         if channel_info.get("is_im") or channel_info.get("is_mpim"):
             return True
+        if why == "channel":
+            # The watched post itself; a post mentioning him comes as a "mention" instead (no duplicate).
+            return message.get("ts") == thread_ts and MENTION.format(me) not in (message.get("text") or "")
         if MENTION.format(me) in (message.get("text") or ""):
             return True
         # Channel thread the user follows: every human reply counts (the parent itself only if it mentions him).
@@ -331,9 +340,9 @@ class Slack:
             place = "grupa DM"
         else:
             place = "#" + (info.get("name") or channel_id) + (" (prywatny)" if private else "")
-        where = place + (" · wątek" if thread_ts and not info.get("is_im") else "")
+        where = place + (" · wątek" if thread_ts and not info.get("is_im") and why != "channel" else "")
         # Read in Slack or answered there after the burst: he has seen it.
-        if thread_ts:
+        if thread_ts and why != "channel":
             # A thread has its own read marker on the parent (followed threads only).
             parent = next((m for m in messages if m.get("ts") == thread_ts), {})
             last_read = float(parent.get("last_read") or 0)
@@ -484,7 +493,10 @@ class Source:
                 "thread_days": 14,
                 # link_only: private channels give author, place and link only; "full" passes the text.
                 "private_channels": "link_only",
-                "skip_channels": [], "context_messages": 8, "max_search_pages": 5}
+                "skip_channels": [],
+                # Channel ids whose every new top-level post goes to the sorter, mention or not.
+                "watch_channels": [],
+                "context_messages": 8, "max_search_pages": 5}
 
     def due(self, settings, store, last_poll, now):
         """A Slack-only check is due: the listener saw something new, or the polling interval elapsed."""
