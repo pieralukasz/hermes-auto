@@ -424,3 +424,11 @@ def test_listener_hint_finds_conversation_search_missed(tmp_path):
         assert [c["thread_id"] for c in candidates] == ["D9"] and key
     finally:
         store.close()
+
+
+def test_slack_zero_interval_disables_own_polling(tmp_path):
+    store = Store(tmp_path, initialize=True)
+    try:
+        assert not Source().due({"poll_seconds": 0, "listener_poll_seconds": 0}, store, NOW - 4000, NOW)
+    finally:
+        store.close()

@@ -418,7 +418,8 @@ class Source:
             return True
         # Relax polling only once the listener has proven it receives events (subscriptions set up).
         interval = settings["listener_poll_seconds"] if live(state, now) else settings["poll_seconds"]
-        return now - last_poll >= interval
+        # 0 = no Slack-only polling at all: the listener nudges and the regular checks are the fallback.
+        return bool(interval) and now - last_poll >= interval
 
     def poll(self, config, store):
         """Nothing to watch by label: Slack candidates go through the sorter (`inbox`)."""

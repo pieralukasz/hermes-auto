@@ -160,7 +160,7 @@ class Source:
             return True
         if live(read_state(home, "github"), now):
             return False  # the listener nudges; the regular checks are the fallback
-        return now - last_poll >= settings["poll_seconds"]
+        return bool(settings["poll_seconds"]) and now - last_poll >= settings["poll_seconds"]
 
     def poll(self, config, store):
         """Nothing to watch by label: GitHub candidates go through the sorter (`inbox`)."""

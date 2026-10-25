@@ -162,3 +162,7 @@ def test_due_polls_without_listener_and_waits_for_nudge_with_it(store, tmp_path)
                                                "nudge_at": NOW - 30})
     assert source.due({}, store, NOW - 400, NOW)
     assert json.dumps(listing(tmp_path))
+
+
+def test_zero_interval_disables_own_polling(store):
+    assert not Source().due({"poll_seconds": 0}, store, NOW - 4000, NOW)
