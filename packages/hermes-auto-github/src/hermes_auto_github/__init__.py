@@ -1,8 +1,9 @@
 """GitHub source for the sorter: the user's notifications (review requests, mentions, comments, CI ...).
 
-Reads `GET /notifications` with the user's `gh` token. The only write is marking a notification thread
-read once it appears in a Hermes session or brief (no comments or reviews). Each notification thread is one conversation; a new update in it is a new candidate.
-Notifications the user already read on GitHub are marked read, so the sorter opens nothing. Watched
+Reads `GET /notifications` with the user's `gh` token and never writes: no comments, no reviews, and no
+marking read (GitHub can only mark a whole thread read, which could hide an update nobody has shown yet).
+Each notification thread is one conversation; a new update in it is a new candidate.
+Notifications the user already read on GitHub are recorded as read, so the sorter opens nothing. Watched
 repositories (`reason: subscribed`) are left out unless configured otherwise.
 """
 from __future__ import annotations
@@ -14,6 +15,8 @@ import time
 
 API = "https://api.github.com"
 OVERLAP_SECONDS = 300
+# True while notifications cut off by `limit` remain: push mode polls again soon (see cli.fast_sources).
+BACKLOG = "source_backlog:github"
 
 
 def gh_token(command):
@@ -57,11 +60,6 @@ class Http:
             raise RuntimeError(f"GitHub read failed ({response.status_code}) for {url.split('?')[0]}")
         return response.json()
 
-    def mark_thread_read(self, thread_id):
-        response = self.session.patch(f"{API}/notifications/threads/{thread_id}", timeout=45)
-        if response.status_code not in (205, 304, 404):
-            raise RuntimeError(f"GitHub mark read failed ({response.status_code})")
-
 
 class GitHub:
     def __init__(self, settings, http=None, now=None):
@@ -71,7 +69,7 @@ class GitHub:
 
     def notifications(self, since):
         items, page = [], 1
-        while page <= 10:
+        while True:
             batch = self.http.get("/notifications", all="true", since=iso(since), per_page=50, page=page) or []
             items += batch
             if len(batch) < 50:
@@ -85,6 +83,8 @@ class GitHub:
         cursor = store.get_meta(key) if since_ms is None else {"since": since_ms / 1000, "handed": {}}
         now = self.now()
         if cursor is None:
+            if since_ms is None:
+                store.set_meta(BACKLOG, False)
             return [], key, {"since": now, "start": now, "handed": {}}
         since = float(cursor["since"])
         handed = dict(cursor.get("handed", {}))
@@ -100,13 +100,17 @@ class GitHub:
                 continue
             fresh.append((updated, item))
         fresh.sort(key=lambda pair: pair[0])
+        if since_ms is None:
+            store.set_meta(BACKLOG, len(fresh) > limit)
+        # Notifications cut off by `limit` hold the cursor (the next read starts OVERLAP_SECONDS before it).
+        new_since = min(now, fresh[limit][0]) if len(fresh) > limit else now
         fresh = fresh[:limit]
         candidates = [self.candidate(me, item) for _, item in fresh]
         for updated, item in fresh:
             handed[item["id"]] = updated
         horizon = now - 86400 * 30
         handed = {k: v for k, v in handed.items() if v >= horizon}
-        return candidates, key, {"since": now, "start": float(cursor.get("start", 0)), "handed": handed}
+        return candidates, key, {"since": new_since, "start": float(cursor.get("start", 0)), "handed": handed}
 
     def candidate(self, me, item):
         subject = item.get("subject", {})
@@ -175,10 +179,12 @@ class Source:
         return GitHub(settings).inbox(config, store, limit=limit, since_ms=since_ms)
 
     def mark_read(self, config, items):
-        settings = {**self.defaults(), **config["sources"]["github"]}
-        http = Http(gh_token(settings["token_command"]))
-        for thread in dict.fromkeys(str(item["thread_id"]) for item in items):
-            http.mark_thread_read(thread)
+        """GitHub notifications stay unread: every item is reported "unsupported".
+
+        GitHub only marks a whole notification thread read (PATCH /notifications/threads/{id}); an update that
+        lands after the shown one would be read with it, and checking `updated_at` first cannot close that race.
+        """
+        return {item["id"]: "unsupported" for item in items}
 
     def setup(self, config):
         GitHub({**self.defaults(), **config["sources"]["github"]}).http.get("/user")

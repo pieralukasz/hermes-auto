@@ -58,96 +58,256 @@ def desktop_parity(agent_class):
 
 
 SHELL_META = set(";|&<>`$\n\r\\(){}")
-GOOGLE_API = "/skills/productivity/google-workspace/scripts/google_api.py"
+GOOGLE_API = "skills/productivity/google-workspace/scripts/google_api.py"
 GOOGLE_READS = {("calendar", "list"), ("gmail", "search"), ("gmail", "get"), ("gmail", "labels")}
 TODOIST_READS = {("today",), ("upcoming",), ("inbox",), ("completed",), ("activity",),
                  ("task", "list"), ("task", "view"), ("project", "list"), ("project", "view"),
                  ("section", "list"), ("label", "list"), ("filter", "list"), ("filter", "view")}
 READ_TOOLS = frozenset({"skill_view", "skills_list", "session_search"})
-# Slack sessions research before drafting: web reads too, and the read-only commands of `slack_read_command`.
-SLACK_READ_TOOLS = READ_TOOLS | {"web_search", "web_extract"}
+# Unattended research cannot send private context to arbitrary web endpoints.
+SLACK_READ_TOOLS = READ_TOOLS
 # Research read profiles (Slack, GitHub); "slack" is kept for sessions queued before the rename.
 RESEARCH_PROFILES = ("research", "slack")
-SLACK_MCP = "/skills/tap-in/tapin-slack/scripts/slack_mcp.py"
+# Tools each deny profile may execute. "private" (redacted private Slack content) and any unknown
+# profile execute nothing.
+PROFILE_TOOLS = {True: READ_TOOLS, "research": SLACK_READ_TOOLS, "slack": SLACK_READ_TOOLS}
+SLACK_MCP = "skills/tap-in/tapin-slack/scripts/slack_mcp.py"
 SLACK_MCP_READS = {"slack_search_public", "slack_search_public_and_private", "slack_search_users",
                    "slack_search_channels", "slack_read_channel", "slack_read_thread", "slack_read_canvas",
                    "slack_read_user_profile", "slack_read_file", "slack_list_channel_members",
                    "slack_list_user_channels"}
-GIT_READS = {"fetch", "log", "show", "diff", "grep", "blame", "branch", "status", "ls-files", "rev-parse",
-             "merge-base", "ls-remote", "cat-file", "shortlog", "describe"}
-# Options that write files, run programs or change configuration.
-GIT_UNSAFE = ("-c", "--config-env", "--exec-path", "--output", "-O", "--open-files-in-pager", "--ext-diff",
-              "--textconv", "--upload-pack", "--receive-pack", "--exec")
-# `git branch` lists only: these create, delete, rename, copy or reconfigure branches.
-BRANCH_UNSAFE = ("-d", "-D", "-m", "-M", "-c", "-C", "--delete", "--move", "--copy", "--set-upstream-to", "-u",
-                 "--unset-upstream", "--edit-description", "-f", "--force", "--track", "-t", "--no-track")
-GH_READS = {("pr", "view"), ("pr", "list"), ("pr", "diff"), ("pr", "checks"), ("pr", "status"),
-            ("issue", "view"), ("issue", "list"), ("search", "prs"), ("search", "issues"), ("search", "code"),
-            ("search", "commits"), ("run", "list"), ("run", "view"), ("repo", "view"), ("release", "list"),
-            ("release", "view"), ("workflow", "list"), ("api",)}
-GH_UNSAFE = ("-X", "--method", "-f", "-F", "--field", "--raw-field", "--input", "-w", "--web", "--hostname")
-LINEAR_READS = {("issue", "view"), ("issue", "list"), ("issue", "query"), ("project", "view"),
-                ("project", "list"), ("team", "list"), ("cycle", "list"), ("cycle", "view"), ("api",)}
+# Programs given by path must live here; a bare name resolves through the worker's own PATH.
+TRUSTED_BIN = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin")
 
 
-def git_read(tokens):
-    """`git [-C dir] <read subcommand> ...` without options that write, run programs or set config."""
+def grammar(flags=(), values=(), patterns=(), equals_only=False):
+    """Options a read subcommand accepts: plain flags, options taking one value, attached-value regexes.
+
+    Anything else that starts with `-` is refused, so an unknown or ambiguous option never runs.
+    """
+    return {"flags": frozenset(flags), "values": frozenset(values),
+            "patterns": tuple(re.compile(pattern) for pattern in patterns), "equals_only": equals_only}
+
+
+def split_options(args, spec, value_ok=lambda option, value: True):
+    """Positional arguments of `args` under `spec`, or None when an option is not in the grammar.
+
+    Value options take `--name=value`, or `--name value` unless the grammar is `equals_only`.
+    Attached short values (`-XPOST`, `-Ovim`) only pass through an explicit pattern.
+    """
+    positionals, index = [], 0
+    while index < len(args):
+        token = args[index]
+        index += 1
+        if token == "--":
+            positionals.extend(args[index:])
+            break
+        if not token.startswith("-") or token == "-":
+            positionals.append(token)
+        elif token in spec["flags"] or any(pattern.fullmatch(token) for pattern in spec["patterns"]):
+            continue
+        elif token.startswith("--") and token.split("=", 1)[0] in spec["values"] and "=" in token:
+            option, value = token.split("=", 1)
+            if not value_ok(option, value):
+                return None
+        elif token in spec["values"] and not spec["equals_only"]:
+            if index >= len(args) or args[index].startswith("-") or not value_ok(token, args[index]):
+                return None
+            index += 1
+        else:
+            return None
+    return positionals
+
+
+TD_OUTPUT = ("--json", "--ndjson", "--ids-only", "--full", "--raw", "--show-urls")
+TD_PAGE = ("--limit", "--cursor")
+TD_LIST = grammar(TD_OUTPUT + ("--all",), TD_PAGE)
+TD_READS = {
+    ("today",): grammar(TD_OUTPUT + ("--all", "--any-assignee", "--personal"), TD_PAGE + ("--workspace",)),
+    ("upcoming",): grammar(TD_OUTPUT + ("--all", "--any-assignee", "--personal"), TD_PAGE + ("--workspace",)),
+    ("inbox",): TD_LIST,
+    ("task", "list"): grammar(TD_OUTPUT + ("--all", "--unassigned", "--personal"),
+                              TD_PAGE + ("--project", "--parent", "--label", "--priority", "--due", "--filter",
+                                         "--assignee", "--workspace")),
+    ("task", "view"): grammar(TD_OUTPUT + ("--include-children",)),
+    ("project", "list"): grammar(TD_OUTPUT + ("--all", "--personal"), TD_PAGE + ("--search",)),
+    ("project", "view"): grammar(TD_OUTPUT + ("--detailed", "--include-children")),
+    ("comment", "list"): grammar(TD_OUTPUT + ("--all", "-P", "--project"), ("--limit", "--lines")),
+    ("section", "list"): grammar(TD_OUTPUT + ("--all",), ("--project", "--search", "--limit")),
+    ("label", "list"): grammar(TD_OUTPUT + ("--all",), ("--search", "--limit")),
+    ("filter", "list"): grammar(TD_OUTPUT),
+    ("filter", "view"): grammar(TD_OUTPUT + ("--all",), TD_PAGE + ("--sort", "--sort-order")),
+}
+
+
+def todoist_read(tokens):
     args = tokens[1:]
-    if len(args) >= 2 and args[0] == "-C":
-        args = args[2:]
-    if not args or args[0] not in GIT_READS:
+    for prefix, spec in TD_READS.items():
+        if tuple(args[:len(prefix)]) != prefix:
+            continue
+        positional = split_options(args[len(prefix):], spec)
+        if positional is None or any(value.startswith("-") for value in positional):
+            return False
+        count = 1 if prefix[-1] == "view" or prefix == ("comment", "list") else 0
+        return len(positional) == count
+    return False
+
+
+def hermes_homes():
+    homes = {os.path.normpath(os.path.expanduser("~/.hermes"))}
+    if os.environ.get("HERMES_HOME"):
+        homes.add(os.path.normpath(os.environ["HERMES_HOME"]))
+    return homes
+
+
+def literal_path(token, words):
+    """Absolute path of an unquoted `token`, or None.
+
+    A quoted `~` stays literal in the shell and would resolve against the working directory, so the
+    token has to appear verbatim among the command's words. `..` components are refused.
+    """
+    if token not in words:
+        return None
+    path = os.path.expanduser(token)
+    if not os.path.isabs(path) or ".." in path.split("/"):
+        return None
+    return os.path.normpath(path)
+
+
+def trusted_program(token, words, name):
+    """`name` itself, or `name` at an absolute path inside TRUSTED_BIN."""
+    if token == name:
+        return True
+    path = literal_path(token, words)
+    return path is not None and path in {os.path.join(directory, name) for directory in TRUSTED_BIN}
+
+
+def trusted_python(token, words):
+    if token in ("python", "python3"):
+        return True
+    path = literal_path(token, words)
+    venvs = {os.path.join(home, "hermes-agent/venv/bin", name) for home in hermes_homes()
+             for name in ("python", "python3")}
+    return path is not None and path in venvs | {os.path.normpath(sys.executable), "/usr/bin/python3",
+                                                 "/opt/homebrew/bin/python3"}
+
+
+def skill_script(tokens, words, relative):
+    """`python <hermes home>/<relative> ...` with a trusted interpreter and the exact skill script."""
+    if len(tokens) < 4 or not trusted_python(tokens[0], words):
         return False
-    rest = args[1:]
-    if args[0] == "branch" and any(not token.startswith("-") or token.split("=", 1)[0] in BRANCH_UNSAFE
-                                   for token in rest):
-        return False  # `git branch NAME` creates a branch
-    if args[0] == "fetch" and any(token.startswith("-") and token not in ("--prune", "-p", "-q", "--quiet", "--all")
-                                  for token in rest):
-        return False
-    return not any(token in GIT_UNSAFE or token.split("=", 1)[0] in GIT_UNSAFE for token in rest)
+    return literal_path(tokens[1], words) in {os.path.join(home, relative) for home in hermes_homes()}
+
+
+GH_REPO = re.compile(r"[\w.-]+/[\w.-]+")
+GH_ENDPOINT = re.compile(r"/?[A-Za-z0-9_.{}/-]+(\?[A-Za-z0-9_.,%+=&-]*)?")
+REPO = ("--repo", "-R")
+GH_READS = {
+    ("pr", "view"): grammar(("--comments", "-c"), REPO + ("--json",)),
+    ("pr", "list"): grammar((), REPO + ("--json", "--limit", "-L", "--state", "-s", "--author", "-A", "--label",
+                                        "-l", "--assignee", "-a", "--search", "-S", "--base", "-B", "--head",
+                                        "-H")),
+    ("pr", "diff"): grammar(("--patch", "--name-only"), REPO + ("--color",)),
+    ("pr", "checks"): grammar(("--required",), REPO + ("--json",)),
+    ("pr", "status"): grammar((), REPO + ("--json",)),
+    ("issue", "view"): grammar(("--comments", "-c"), REPO + ("--json",)),
+    ("issue", "list"): grammar((), REPO + ("--json", "--limit", "-L", "--state", "-s", "--author", "-A",
+                                           "--label", "-l", "--assignee", "-a", "--search", "-S", "--milestone",
+                                           "-m", "--mention")),
+    ("search", "prs"): grammar((), ("--repo", "-R", "--owner", "--limit", "-L", "--state", "--author", "--label",
+                                    "--json", "--sort", "--order", "--language")),
+    ("search", "issues"): grammar((), ("--repo", "-R", "--owner", "--limit", "-L", "--state", "--author",
+                                       "--label", "--json", "--sort", "--order", "--language")),
+    ("search", "code"): grammar((), ("--repo", "-R", "--owner", "--limit", "-L", "--language", "--filename",
+                                     "--extension", "--json")),
+    ("search", "commits"): grammar((), ("--repo", "-R", "--owner", "--limit", "-L", "--author", "--json")),
+    ("run", "list"): grammar((), REPO + ("--json", "--limit", "-L", "--branch", "-b", "--workflow", "--status",
+                                         "-s", "--event", "-e", "--user", "-u")),
+    ("run", "view"): grammar(("--log", "--log-failed", "--verbose", "-v", "--exit-status"),
+                             REPO + ("--json", "--job", "-j", "--attempt", "-a")),
+    ("repo", "view"): grammar((), ("--json", "--branch", "-b")),
+    ("release", "list"): grammar((), REPO + ("--json", "--limit", "-L")),
+    ("release", "view"): grammar((), REPO + ("--json",)),
+    ("workflow", "list"): grammar(("--all", "-a"), REPO + ("--json", "--limit", "-L")),
+}
+# `gh api` stays a GET: no fields, input, method, headers, host or jq/template options.
+GH_API = grammar(("--paginate", "--include", "-i", "--slurp"))
+
+
+def gh_value(option, value):
+    if option in ("--repo", "-R"):
+        return bool(GH_REPO.fullmatch(value))
+    return "://" not in value
+
+
+def github_argument(token):
+    return "://" not in token or token.startswith("https://github.com/")
 
 
 def gh_read(tokens):
+    """`gh <group> <read command>` or `gh api <GET endpoint>` with only the options in its grammar."""
     args = tokens[1:]
-    if not any(tuple(args[:len(read)]) == read for read in GH_READS):
+    if args[:1] == ["api"]:
+        positionals = split_options(args[1:], GH_API)
+        return (positionals is not None and len(positionals) == 1 and bool(GH_ENDPOINT.fullmatch(positionals[0]))
+                and not positionals[0].lstrip("/").startswith("graphql"))
+    spec = GH_READS.get(tuple(args[:2]))
+    if spec is None:
         return False
-    return not any(token in GH_UNSAFE or token.split("=", 1)[0] in GH_UNSAFE for token in args)
+    positionals = split_options(args[2:], spec, gh_value)
+    if tuple(args[:2]) == ("repo", "view"):
+        return (positionals is not None and len(positionals) == 1
+                and bool(GH_REPO.fullmatch(positionals[0].removeprefix("https://github.com/"))))
+    return positionals is not None and all(github_argument(token) for token in positionals)
+
+
+LINEAR_LIST = grammar(("--json", "-j", "--no-pager"), ("--team", "--limit"))
+LINEAR_READS = {
+    ("issue", "view"): grammar(("--json", "-j", "--no-pager", "--no-comments", "--no-download")),
+    ("issue", "list"): grammar(("--json", "-j", "--no-pager", "--all-states", "--all-assignees", "-A",
+                                "--unassigned", "-U"),
+                               ("--state", "-s", "--assignee", "--sort", "--team", "--project", "--limit")),
+    ("issue", "query"): LINEAR_LIST, ("project", "view"): LINEAR_LIST, ("project", "list"): LINEAR_LIST,
+    ("team", "list"): LINEAR_LIST, ("cycle", "list"): LINEAR_LIST, ("cycle", "view"): LINEAR_LIST,
+}
 
 
 def linear_read(tokens):
     args = tokens[1:]
-    if not any(tuple(args[:len(read)]) == read for read in LINEAR_READS):
-        return False
-    if any(token in ("-w", "--web") for token in args):
-        return False
-    if args[0] == "api":
-        query = " ".join(args[1:]).strip()
+    if args[:1] == ["api"]:
+        # One GraphQL query and nothing else: no variables, no options.
+        query = args[1].strip() if len(args) == 2 else ""
         return query.startswith(("query", "{")) and "mutation" not in query.lower()
-    return True
+    spec = LINEAR_READS.get(tuple(args[:2]))
+    if tuple(args[:2]) == ("issue", "view") and "--no-download" not in args[2:]:
+        return False
+    return spec is not None and split_options(args[2:], spec) is not None
 
 
-def slack_read_command(tokens):
-    """Reads of the Slack session's research: Slack MCP reads, git, gh and Linear reads."""
-    program = Path(tokens[0]).name
-    if program in ("python", "python3") and len(tokens) >= 4 and tokens[1].endswith(SLACK_MCP):
+def slack_read_command(tokens, words=None):
+    """Reads of the Slack session's research: trusted Slack, GitHub and Linear commands."""
+    words = set(tokens) if words is None else words
+    if skill_script(tokens, words, SLACK_MCP):
         return tokens[2] == "call" and tokens[3] in SLACK_MCP_READS and len(tokens) <= 5
-    if program == "git":
-        return git_read(tokens)
-    if program == "gh":
+    if trusted_program(tokens[0], words, "gh"):
         return gh_read(tokens)
-    if program == "linear":
+    if trusted_program(tokens[0], words, "linear"):
         return linear_read(tokens)
     return False
 
 
 def read_only_command(command, profile=True):
     """True only for a single plain read command: calendar/Gmail reads via the Google script, Todoist reads.
-    With profile "slack" also the Slack session's research reads (`slack_read_command`).
+    With a research profile also the Slack session's research reads (`slack_read_command`). Profile
+    "private" and unknown profiles allow no command.
 
     No shell syntax at all (pipes, redirects, substitutions, chaining), so the allowed program is the
-    only thing that runs. Anything else is refused, however harmless it looks.
+    only thing that runs. Programs and scripts must be the trusted ones, and their options must be in an
+    explicit read grammar. Anything else is refused, however harmless it looks.
     """
     import shlex
+    if profile is not True and profile not in RESEARCH_PROFILES:
+        return False
     text = str(command or "").strip()
     # Single-quoted text is literal in sh (Todoist filters use `|` and `&`); everything else may not
     # contain shell syntax.
@@ -160,26 +320,29 @@ def read_only_command(command, profile=True):
         return False
     if not tokens:
         return False
-    program = Path(tokens[0]).name
-    if program == "td":
-        return any(tuple(tokens[1:1 + len(read)]) == read for read in TODOIST_READS)
-    if program in ("python", "python3") and len(tokens) >= 4 and tokens[1].endswith(GOOGLE_API):
+    words = set(text.split())
+    if trusted_program(tokens[0], words, "td"):
+        return todoist_read(tokens)
+    if skill_script(tokens, words, GOOGLE_API):
         return (tokens[2], tokens[3]) in GOOGLE_READS
     if profile in RESEARCH_PROFILES:
-        return slack_read_command(tokens)
+        return slack_read_command(tokens, words)
     return False
 
 
-def deny_tool_execution(agent_class, allowed=READ_TOOLS, profile=True):
+def deny_tool_execution(agent_class, allowed=None, profile=True):
     """Keep the session's normal tool list (and so its stored prompt) but execute only reads.
 
-    Used when third-party mail enters a conversation: every call outside `allowed`, and every
-    terminal command that is not a plain read (`read_only_command`), gets an error result instead
-    of running, and the turn continues. Filtering the tool list instead would rebuild the stored
-    system prompt with a reduced toolset, and the user's later turns in that session would lose
-    their tools.
+    Used when third-party content enters a conversation: every call outside `allowed` (by default the
+    profile's PROFILE_TOOLS; none for "private" or an unknown profile), and every terminal command that
+    is not a plain read (`read_only_command`), gets an error result instead of running, and the turn
+    continues. Wrappers such as tool_call, execute_code and delegate_task are never allowed. Filtering
+    the tool list instead would rebuild the stored system prompt with a reduced toolset, and the user's
+    later turns in that session would lose their tools.
     """
     from agent.turn_tool_validation import _append_tool_error_results
+    if allowed is None:
+        allowed = PROFILE_TOOLS.get(profile, frozenset())
     original = agent_class._execute_tool_calls
 
     def permitted(call):
@@ -194,16 +357,22 @@ def deny_tool_execution(agent_class, allowed=READ_TOOLS, profile=True):
             return False
         return not arguments.get("background") and read_only_command(arguments.get("command"), profile)
 
+    if profile in RESEARCH_PROFILES:
+        refused = ("Only reads are allowed in this automatic step (third-party messages): Slack MCP reads, "
+                   "gh/linear reads, calendar list, td list/view, session_search and skills. Local git and "
+                   "arbitrary web access are disabled. Sending and writing wait for the user's explicit OK. "
+                   "Nothing ran in this batch.")
+    elif profile is True:
+        refused = ("Only reads are allowed in this automatic step (third-party mail): calendar list, "
+                   "gmail search/get, td list/view/today, session_search, skills. Nothing ran in this batch.")
+    else:
+        refused = ("No tools run in this automatic step (private third-party content): answer from the "
+                   "conversation only. Nothing ran in this batch.")
+
     def guarded(self, assistant_message, messages, *args, **kwargs):
         calls = list(getattr(assistant_message, "tool_calls", None) or [])
         if all(permitted(call) for call in calls):
             return original(self, assistant_message, messages, *args, **kwargs)
-        refused = ("Only reads are allowed in this automatic step (third-party messages): Slack MCP reads, "
-                   "git/gh/linear reads, web_search/web_extract, calendar list, td list/view, session_search, "
-                   "skills. Sending and writing wait for the user's explicit OK. Nothing ran in this batch."
-                   if profile in RESEARCH_PROFILES else
-                   "Only reads are allowed in this automatic step (third-party mail): calendar list, "
-                   "gmail search/get, td list/view/today, session_search, skills. Nothing ran in this batch.")
         _append_tool_error_results(messages, calls, lambda call: json.dumps({"error": refused}))
         return None
 
@@ -573,20 +742,18 @@ def main():
     # Only this worker's in-memory configuration changes. Interactive Hermes keeps its settings.
     # Unattended runs never get interactive approval: dangerous commands are denied.
     cli.CLI_CONFIG["approvals"] = {"mode": "manual", "single_query_mode": "deny"}
-    if request.get("deny_tools") in RESEARCH_PROFILES:
-        # Slack messages: research with reads only (Slack, code, PRs, Linear, web), then a draft; nothing is sent.
+    profile = request.get("deny_tools")
+    if profile:
+        # Third-party content inside a normal session: the session keeps its full toolset and prompt.
+        # Research profiles (Slack, GitHub) run reads only (Slack, code, PRs, Linear, web) and draft; mail
+        # runs plain reads (calendar, Gmail search/get, Todoist, past sessions, skills); "private" and
+        # unknown profiles execute no tool. Nothing is sent.
         desktop_parity(AIAgent)
-        deny_tool_execution(AIAgent, SLACK_READ_TOOLS, request["deny_tools"])
+        deny_tool_execution(AIAgent, profile=profile)
+        research = profile in RESEARCH_PROFILES
         cli.main(query=request["prompt"], resume=sid, quiet=True, oneshot=True, output_format="stream-json",
-                 max_turns=config["agent_max_turns"], run_budget=config["agent_run_budget_seconds"])
-        return
-    if request.get("deny_tools"):
-        # Third-party mail inside a normal session: the session keeps its full toolset and prompt,
-        # only plain reads (calendar, Gmail search/get, Todoist, past sessions, skills) execute.
-        desktop_parity(AIAgent)
-        deny_tool_execution(AIAgent)
-        cli.main(query=request["prompt"], resume=sid, quiet=True, oneshot=True, output_format="stream-json",
-                 max_turns=config["max_turns"], run_budget=config["run_budget_seconds"])
+                 max_turns=config["agent_max_turns" if research else "max_turns"],
+                 run_budget=config["agent_run_budget_seconds" if research else "run_budget_seconds"])
         return
     if request.get("full_tools"):
         # Todoist tasks and mail the user labelled for the agent: normal toolsets, skills and project rules.

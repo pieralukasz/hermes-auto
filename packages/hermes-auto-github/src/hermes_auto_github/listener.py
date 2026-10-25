@@ -48,13 +48,13 @@ class GitHubListener:
             return interval
         if not response.ok:
             raise RuntimeError(f"GitHub notifications failed ({response.status_code})")
-        self.modified = response.headers.get("Last-Modified") or self.modified
         skip = set(self.settings.get("skip_reasons", []))
         newest = max([item["updated_at"] for item in response.json() if item.get("reason") not in skip],
                      default=self.seen or "")
         # First answer after a (re)start: check GitHub once for whatever came while this was not running.
         if self.seen is None or newest > self.seen:
-            self.arrived()
+            self.arrived()  # raises when the sink refused it: the cursors below stay, the change comes again
+        self.modified = response.headers.get("Last-Modified") or self.modified
         self.seen = max(newest, self.seen or "")
         self.beat(True)
         return interval
@@ -71,6 +71,9 @@ class GitHubListener:
         listening.update_state(self.home, NAME, lambda state: state.update(
             heartbeat=now, connected=connected, events_since_start=self.events,
             last_event_at=self.last_event or now))
+        beat = getattr(self.sink, "beat", None)
+        if beat:
+            beat([NAME], connected)
 
 
 def serve(home, settings, config=None):
@@ -79,12 +82,7 @@ def serve(home, settings, config=None):
         home, config or {}, {NAME: float(full["listen_quiet_seconds"])}))
     stop = threading.Event()
 
-    def pumping():
-        while not stop.is_set():
-            listener.sink.pump()
-            stop.wait(1)
-
-    threading.Thread(target=pumping, daemon=True).start()
+    threading.Thread(target=listening.keep_pumping, args=(stop, listener.sink.pump), daemon=True).start()
     log("polling notifications")
     backoff = 30
     while True:

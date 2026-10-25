@@ -94,16 +94,27 @@ class Proton:
         if kind != "OK":
             raise RuntimeError(f"Proton mailbox {mailbox!r} is unavailable; check Bridge and labels")
 
-    def mark_seen(self, message_ids):
+    def mark_seen(self, items):
         kind, _ = self.client.select('"INBOX"')
         if kind != "OK":
             raise RuntimeError("Proton INBOX is unavailable for marking read")
-        for message_id in message_ids:
-            quoted = '"' + str(message_id).replace("\\", "").replace('"', "") + '"'
-            for uid in self.search("HEADER", "Message-ID", quoted):
-                kind, _ = self.client.uid("store", uid, "+FLAGS", "(\\Seen)")
-                if kind != "OK":
-                    raise RuntimeError("Proton mark read failed")
+        validity, _ = self.inbox_status()
+        results = {}
+        for item in items:
+            key = item["id"]
+            uid = item.get("imap_uid")
+            if not uid or item.get("imap_uidvalidity") != validity:
+                results[key] = "unsupported"
+                continue
+            target = str(int(uid)).encode()
+            if target not in self.search("UID", target.decode()):
+                results[key] = "unsupported"
+                continue
+            kind, _ = self.client.uid("store", target, "+FLAGS", "(\\Seen)")
+            if kind != "OK":
+                raise RuntimeError("Proton mark read failed")
+            results[key] = "done"
+        return results
 
     def search(self, *criteria):
         kind, data = self.client.uid("search", None, *criteria)
@@ -149,6 +160,7 @@ class Proton:
             return [], key, {"validity": validity, "uid": uid_next - 1}
         else:
             uids = [int(uid) for uid in self.search("UID", f"{cursor['uid'] + 1}:*") if int(uid) > cursor["uid"]]
+        backlog = len(uids) > limit
         uids = sorted(uids)[:limit]
         # BODY.PEEK leaves the Seen flag alone, so this is what the user has already opened.
         seen = {int(uid) for uid in self.search("UID", f"{uids[0]}:{uids[-1]}", "SEEN")} if uids else set()
@@ -157,12 +169,15 @@ class Proton:
             item = parse_candidate(self.fetch(str(uid).encode()), own)
             if item:
                 item["account"] = account
+                item["imap_uid"], item["imap_uidvalidity"] = uid, validity
                 item["read"] = uid in seen
                 candidates.append(item)
         if any(item["refs"] for item in candidates):
             self.select(config.get("sent_mailbox", "Sent"))
             for item in candidates:
                 for ref in item["refs"][-3:]:
+                    if not ref.isascii():
+                        continue  # IMAP SEARCH arguments use ASCII; malformed references are not lookup keys.
                     quoted = '"' + ref.replace('\\', '\\\\').replace('"', '\\"') + '"'
                     for uid in self.search("HEADER", "Message-ID", quoted):
                         sent = BytesParser(policy=email.policy.default).parsebytes(self.fetch(uid, headers=True))
@@ -174,6 +189,8 @@ class Proton:
                                                                       str(sent.get("Cc", ""))]) if address]
                         item["sent"].append({"ts": stamp, "to": to})
         new_cursor = {"validity": validity, "uid": uids[-1] if uids else (cursor or {}).get("uid", uid_next - 1)}
+        if since_ms is None:
+            store.set_meta("source_backlog:proton", backlog)
         return candidates, key, new_cursor
 
     def poll(self, config, store):
@@ -194,7 +211,7 @@ class Proton:
             for uid in self.search("ALL"):
                 message = BytesParser(policy=email.policy.default).parsebytes(self.fetch(uid, headers=True))
                 root = root_id(message)
-                if root:
+                if root and root.isascii():
                     modes[root] = mode
         roots = set(modes)
         self.select(config["all_mailbox"])
@@ -255,10 +272,10 @@ class Source:
             client.close()
 
     def mark_read(self, config, items):
-        """Set \\Seen (by Message-ID, in INBOX) on mail shown in a Hermes session or brief."""
+        """Set \\Seen using the INBOX UID and UIDVALIDITY captured during ingestion."""
         client = Proton(config["sources"]["proton"])
         try:
-            client.mark_seen([item["id"] for item in items])
+            return client.mark_seen(items)
         finally:
             client.close()
 

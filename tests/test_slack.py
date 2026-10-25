@@ -280,7 +280,7 @@ def test_slack_runs_get_the_agent_budget(tmp_path, config):
         == config["run_budget_seconds"]
 
 
-SLACK_MCP = "python3 /Users/x/.hermes/skills/tap-in/tapin-slack/scripts/slack_mcp.py"
+SLACK_MCP = "python3 ~/.hermes/skills/tap-in/tapin-slack/scripts/slack_mcp.py"
 
 
 @pytest.mark.parametrize("command,allowed", [
@@ -288,11 +288,11 @@ SLACK_MCP = "python3 /Users/x/.hermes/skills/tap-in/tapin-slack/scripts/slack_mc
     (f"{SLACK_MCP} call slack_send_message '{{\"channel_id\":\"C1\",\"message\":\"hi\"}}'", False),
     (f"{SLACK_MCP} call slack_schedule_message '{{}}'", False),
     ("python3 /Users/x/.hermes/skills/tap-in/tapin-slack/scripts/slack_send.py C1 hej", False),
-    ("git -C ~/Projects/web fetch origin", True),
-    ("git -C ~/Projects/web show origin/main:src/a.ts", True),
-    ("git grep -n useCart origin/main", True),
-    ("git log --oneline -5 origin/main", True),
-    ("git branch -r", True),
+    ("git -C ~/Projects/web fetch origin", False),
+    ("git -C ~/Projects/web show origin/main:src/a.ts", False),
+    ("git grep -n useCart origin/main", False),
+    ("git log --oneline -5 origin/main", False),
+    ("git branch -r", False),
     ("git branch evil", False),
     ("git -c core.pager=sh log", False),
     ("git log --output=/tmp/x", False),
@@ -309,7 +309,7 @@ SLACK_MCP = "python3 /Users/x/.hermes/skills/tap-in/tapin-slack/scripts/slack_mc
     ("gh pr comment 12 --body hi", False),
     ("gh pr merge 12", False),
     ("gh pr view 12 --web", False),
-    ("linear issue view WEB-12", True),
+    ("linear issue view WEB-12 --no-download", True),
     ("linear api 'query { viewer { id } }'", True),
     ("linear api 'mutation { issueDelete(id: \"x\") }'", False),
     ("linear issue create --title x", False),

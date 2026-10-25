@@ -199,13 +199,51 @@ def retry_followup(store, hermes, followup_id):
     mark("retry_pending", "")
 
 
+RETRY_FIRST_SECONDS, RETRY_MAX_SECONDS = 60, 1800
+
+
+def source_failed(error):
+    """The source an error line belongs to ("gmail: ...", "triage gmail: ...", "waiting todoist: ..."), if any."""
+    head = error.split(":", 1)[0].split()
+    if len(head) == 1:
+        return head[0]
+    if len(head) == 2 and head[0] in ("triage", "proposals", "waiting"):
+        return head[1]
+    return None
+
+
+def settle_checked(store, checked, read_errors, started):
+    """After a check: sources read without error move their cursor to the check's *start*, so an event
+    that arrived while it ran stays newer than the cursor. A failed source keeps its cursor (the nudge,
+    backlog or wake still stands) and waits a growing delay before the next attempt."""
+    failed = {source_failed(error) for error in read_errors} - {None}
+    for name in checked:
+        if name in failed:
+            retry = store.get_meta(f"source_retry:{name}", None) or {}
+            attempts = int(retry.get("attempts", 0)) + 1
+            delay = min(RETRY_FIRST_SECONDS * 2 ** (attempts - 1), RETRY_MAX_SECONDS)
+            store.set_meta(f"source_retry:{name}", {"attempts": attempts, "next_at": time.time() + delay})
+            continue
+        store.set_meta(f"last_poll:{name}", started)
+        store.db.execute("DELETE FROM meta WHERE key=?", (f"source_retry:{name}",))
+        store.db.commit()
+
+
 def fast_sources(config, store, now=None):
-    """Sources with their own shorter `poll_seconds` (Slack) that are due between the regular checks."""
+    """Sources due between the regular checks: the adapter's `due` (listener nudge, own interval, wake),
+    or a backlog the source left last time (`source_backlog:<name>`). A source that failed waits out
+    its retry delay (`source_retry:<name>`)."""
     now = time.time() if now is None else now
     installed = sources()
     due = []
     for name, settings in config["sources"].items():
         if not settings.get("enabled"):
+            continue
+        retry = store.get_meta(f"source_retry:{name}", None)
+        if retry and now < float(retry.get("next_at", 0)):
+            continue
+        if store.get_meta(f"source_backlog:{name}", False):
+            due.append(name)
             continue
         last = store.get_meta(f"last_poll:{name}", 0)
         source = installed.get(name)
@@ -438,11 +476,13 @@ def dispatch(args, home, config, store):
                 if not only:
                     return 0
                 local = False
+        started = time.time()
         if command != "scan":
             # Under the run lock anything still "running" was interrupted: jobs and replies alike go to
             # needs_attention before any work starts, so nothing is replayed without an explicit retry.
             store.recover()
         errors = poll(config, store, only)
+        source_errors = list(errors)  # reading a source: poll and the sorter's inbox step
         failures = 0
         blocked = [error.split(":", 1)[0] for error in errors]
         hermes = None
@@ -455,6 +495,7 @@ def dispatch(args, home, config, store):
         if command != "scan":
             triage_errors, triage_failures = run_triage(config, store, bridge, sources(), blocked, only)
             errors = errors + triage_errors
+            source_errors += triage_errors
             failures += triage_failures
         if command != "scan" and any(j["status"] in ("pending", "created", "retry_pending", "running", "creating")
                                      for j in store.rows()):
@@ -468,11 +509,11 @@ def dispatch(args, home, config, store):
             finish_errors = sync_finished(store, config, bridge, sources(), blocked)
             failures += len(finish_errors)
             errors = errors + finish_errors
-        stamp = time.time()
         if local:
-            store.set_meta("last_poll", stamp)
-        for name in (only if only is not None else config["sources"]):
-            store.set_meta(f"last_poll:{name}", stamp)
+            store.set_meta("last_poll", started)
+        checked = [name for name in (only if only is not None else config["sources"])
+                   if config["sources"].get(name, {}).get("enabled")]
+        settle_checked(store, checked, source_errors, started)
         store.backup()
         counts = {}
         for job in store.rows():

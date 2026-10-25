@@ -385,7 +385,7 @@ def test_all_agents_start_at_once(store, config):
     ("/opt/homebrew/bin/td task view id:6hq2 --full --json", True),
     ("python ~/.hermes/skills/productivity/google-workspace/scripts/google_api.py calendar list "
      "--start 2026-10-26T00:00:00Z --end 2026-10-27T00:00:00Z", True),
-    ("~/.hermes/hermes-agent/venv/bin/python /Users/x/.hermes/skills/productivity/google-workspace/scripts/"
+    ("~/.hermes/hermes-agent/venv/bin/python ~/.hermes/skills/productivity/google-workspace/scripts/"
      "google_api.py gmail search 'from:ania newer_than:7d'", True),
     ("python ~/.hermes/skills/productivity/google-workspace/scripts/google_api.py gmail send --to a@b.test", False),
     ("python ~/.hermes/skills/productivity/google-workspace/scripts/google_api.py calendar create --summary x", False),

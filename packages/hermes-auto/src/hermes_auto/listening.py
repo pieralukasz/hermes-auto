@@ -99,6 +99,9 @@ class LocalSink:
         if wake_after:
             self.ticks.schedule(now + float(wake_after))
 
+    def beat(self, sources, connected):
+        """Liveness is the listener's own state file here; nothing to forward."""
+
     def pump(self):
         self.ticks.pump()
 
@@ -125,6 +128,23 @@ class RelaySink:
                 log(f"relay publish failed ({type(exc).__name__}), retrying")
             time.sleep(2 * (attempt + 1))
         raise RuntimeError("Relay did not accept the event")
+
+    def beat(self, sources, connected):
+        """Tell the relay the listener for `sources` is alive; the Mac checks a source itself when its
+        heartbeats stop. Best effort: a relay from before heartbeats answers 404, which is fine."""
+        import urllib.error
+        import urllib.request
+        body = json.dumps({"sources": list(sources), "connected": bool(connected)}).encode()
+        request = urllib.request.Request(self.url + "/heartbeat", data=body, method="POST", headers={
+            "Authorization": f"Bearer {self.token}", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(request, timeout=10):
+                pass
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                log(f"relay heartbeat refused ({exc.code})")
+        except OSError as exc:
+            log(f"relay heartbeat failed ({type(exc).__name__})")
 
     def pump(self):
         pass
@@ -160,7 +180,10 @@ def run_tick(home):
 
 
 class TickPump:
-    """Runs a tick once the latest event's quiet period ends; a busy run lock retries in 30 seconds."""
+    """Runs a tick once the latest event's quiet period ends; a busy run lock retries in 30 seconds,
+    a tick that crashed or timed out in `RETRY_SECONDS`."""
+
+    RETRY_SECONDS = 60
 
     def __init__(self, runner, clock=time.time, logger=None):
         self.runner, self.clock, self.logger = runner, clock, logger or log
@@ -177,7 +200,12 @@ class TickPump:
             if due is None or self.clock() < due:
                 return
             self.due_at = None
-        code, error = self.runner()
+        try:
+            code, error = self.runner()
+        except Exception as exc:  # noqa: BLE001 - the pumping thread must outlive a hung or failed tick
+            self.schedule(self.clock() + self.RETRY_SECONDS)
+            self.logger(f"tick failed: {type(exc).__name__}: {str(exc)[:160]}")
+            return
         if code and "Another hermes-auto operation" in (error or ""):
             self.schedule(self.clock() + 30)
         self.logger(f"tick exit={code}")
@@ -185,6 +213,17 @@ class TickPump:
 
 def log(message):
     print(time.strftime("%Y-%m-%d %H:%M:%S"), message, flush=True)
+
+
+def keep_pumping(stop, step, seconds=1, logger=None):
+    """Call `step` every `seconds` until `stop` is set. A failing step is logged, never fatal: this
+    thread runs the ticks and heartbeats of a listener whose main loop would not notice it died."""
+    while not stop.is_set():
+        try:
+            step()
+        except Exception as exc:  # noqa: BLE001
+            (logger or log)(f"pump error: {type(exc).__name__}: {str(exc)[:160]}")
+        stop.wait(seconds)
 
 
 def install_launchd(home, name, entry_point):

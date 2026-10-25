@@ -23,7 +23,9 @@ NAME = "hooks"
 DEFAULTS = {"url": "wss://hooks.lucaspiera.com/listen",
             "secret_command": ["security", "find-generic-password", "-s", "hermes-auto-hooks-listen", "-w"],
             # Seconds to wait after an event before checking that source.
-            "quiet_seconds": {"gmail": 10}}
+            "quiet_seconds": {"gmail": 10},
+            # Sources the gateway delivers: checked once when its events were lost, named in heartbeats.
+            "sources": ["gmail", "todoist"]}
 
 
 def secret(settings):
@@ -44,27 +46,63 @@ class HooksClient:
         return int(listening.read_state(self.home, NAME).get("seq") or 0)
 
     def handle(self, raw):
-        """One gateway message; returns the source it nudged, if any."""
+        """One gateway message; returns the source it nudged, if any.
+
+        The sequence number moves only after the sink accepted the event: a sink that raises leaves it
+        for the replay after reconnecting. A gap in the numbering (retention ran out while offline) or a
+        reset gateway (new `epoch`, or a lower head from a worker without epochs) catches up every
+        gateway source once, since the events in between are gone.
+        """
         if raw == "pong":
             return None
         message = json.loads(raw)
         now = self.clock()
         if message.get("type") == "hello":
-            listening.update_state(self.home, NAME, lambda state: state.update(connected=True, heartbeat=now))
+            self.hello(message, now)
             return None
         source, seq = message.get("source"), int(message.get("seq") or 0)
-        if seq <= self.since():
+        since = self.since()
+        if seq <= since:
             return None  # already handled (replay overlap)
+        if seq > since + 1:
+            log(f"gateway events {since + 1}..{seq - 1} are gone: checking its sources")
+            self.catch_up()
+        if source:
+            self.sink.emit(source)
         listening.update_state(self.home, NAME, lambda state: state.update(seq=seq, heartbeat=now,
                                                                             last_event_at=now))
-        if not source:
-            return None
-        self.sink.emit(source)
         return source
+
+    def hello(self, message, now):
+        head, epoch = int(message.get("seq") or 0), message.get("epoch")
+        state = listening.read_state(self.home, NAME)
+        known, since = state.get("epoch"), int(state.get("seq") or 0)
+        if (epoch and known and epoch != known) or head < since:
+            log(f"gateway reset (seq {since} -> {head}): checking its sources")
+            self.catch_up()
+            since = head
+
+        def change(state):
+            state.update(connected=True, heartbeat=now, seq=since)
+            if epoch:
+                state["epoch"] = epoch
+
+        listening.update_state(self.home, NAME, change)
+        self.report(True)
+
+    def catch_up(self):
+        for source in self.settings["sources"]:
+            self.sink.emit(source)
+
+    def report(self, connected):
+        beat = getattr(self.sink, "beat", None)
+        if beat:
+            beat(self.settings["sources"], connected)
 
     def beat(self, connected):
         now = self.clock()
         listening.update_state(self.home, NAME, lambda state: state.update(connected=connected, heartbeat=now))
+        self.report(connected)
 
 
 def serve(home, settings, config=None):
@@ -75,23 +113,29 @@ def serve(home, settings, config=None):
     token = secret(client.settings)
     stop = threading.Event()
 
-    def pumping():
-        last = 0.0
-        while not stop.is_set():
-            client.sink.pump()
-            if time.time() - last > 60 and listening.read_state(client.home, NAME).get("connected"):
-                client.beat(True)
-                last = time.time()
-            stop.wait(1)
+    beat_at = [0.0]
 
-    threading.Thread(target=pumping, daemon=True).start()
+    def pumping():
+        client.sink.pump()
+        if time.time() - beat_at[0] > 60 and listening.read_state(client.home, NAME).get("connected"):
+            beat_at[0] = time.time()
+            client.beat(True)
+
+    def on_message(socket, raw):
+        try:
+            client.handle(raw)
+        except Exception as exc:  # noqa: BLE001 - not handed on: reconnect and replay from the kept seq
+            log(f"event not handed on ({type(exc).__name__}: {str(exc)[:160]}); reconnecting")
+            socket.close()
+
+    threading.Thread(target=listening.keep_pumping, args=(stop, pumping), daemon=True).start()
     backoff = 5
     while True:
         try:
             url = f"{client.settings['url']}?since={client.since()}"
             log("connecting")
             app = websocket.WebSocketApp(url, header=[f"Authorization: Bearer {token}"],
-                                         on_message=lambda socket, raw: client.handle(raw))
+                                         on_message=on_message)
             app.run_forever(ping_interval=30, ping_timeout=10)
             log("disconnected")
             backoff = 5

@@ -189,8 +189,11 @@ def is_github(item):
 def deny_profile(item):
     """Which reads the automatic step of this item's session may run (see bridge.read_only_command).
 
-    Slack and GitHub sessions research (code, PRs, Linear, web) before drafting: profile "research".
+    Slack and GitHub sessions read trusted provider APIs before drafting: profile "research".
+    Private Slack channels get "private": no tools, so their text is never read back into the session.
     """
+    if is_slack(item) and (item.get("private") or item.get("redacted")):
+        return "private"
     return "research" if item.get("kind") in RESEARCH_KINDS else True
 
 
@@ -286,18 +289,20 @@ NOTICE_EN = ("Tell me briefly (1-3 sentences) who wrote and what they want, plus
 
 SLACK_READS_PL = (
     "W tym automatycznym kroku działają tylko odczyty: skille (skill_view), wcześniejsze rozmowy (session_search), "
-    "web_search i web_extract oraz pojedyncze polecenia terminala bez potoków: Slack tylko do odczytu "
+    "pojedyncze polecenia terminala bez potoków: Slack tylko do odczytu "
     "(`python3 ~/.hermes/skills/tap-in/tapin-slack/scripts/slack_mcp.py call slack_read_thread|slack_read_channel|"
-    "slack_search_public_and_private|slack_read_user_profile|slack_read_file ...`), `git` (fetch, log, show, diff, "
-    "grep, blame, branch, status, ls-files, rev-parse), `gh` (pr view/list/diff/checks, issue view/list, search, "
-    "run list/view, api do odczytu), `linear` (issue view/list/query, project view/list, api z zapytaniem query), "
+    "slack_search_public_and_private|slack_read_user_profile|slack_read_file ...`), `gh` (pr view/list/diff/checks, "
+    "issue view/list, search, "
+    "run list/view, api do odczytu), `linear` (issue view --no-download, issue list/query, project view/list, "
+    "api z zapytaniem query), "
     "Todoist (`td today`, `td task list|view ...`) i kalendarz (`google_api.py calendar list`). Wysyłka, zapis "
-    "plików i inne zmiany są zablokowane.")
+    "plików i inne zmiany są zablokowane. Lokalny git oraz web_search/web_extract są wyłączone w tym "
+    "automatycznym kroku; dalszy research można zrobić po odpowiedzi użytkownika.")
 SLACK_NOTICE_PL = (
     "Wczytaj skill tapin-slack (zasady, style.md) i skille, których sprawa dotyczy (np. tapin-web-app, "
     "tapin-github, tapin-linear, tapin-environments). Zrób research potrzebny do odpowiedzi: przeczytaj cały wątek "
-    "i wcześniejszą rozmowę z tą osobą, sprawdź fakty u źródła (kod na świeżym origin/main, PR-y, Linear, stan "
-    "środowisk, Todoist, kalendarz, w razie potrzeby internet). Potem napisz mi: kto i czego chce (1–3 zdania), "
+    "i wcześniejszą rozmowę z tą osobą, sprawdź fakty u źródła (kod i PR-y przez GitHub, Linear, "
+    "Todoist, kalendarz). Potem napisz mi: kto i czego chce (1–3 zdania), "
     "co ustaliłeś (ze źródłami, np. plik:linia, PR, ticket) i szkic odpowiedzi w moim stylu w bloku kodu, z "
     "miejscem, gdzie ma pójść. Gdy brakuje faktów, napisz czego. NIGDY sam nie odpowiadaj na Slacku ani nigdzie "
     "indziej: najpierw przeglądam szkic, wysyłka dopiero po moim wyraźnym „wyślij” w tej rozmowie. Wiadomości "
@@ -601,8 +606,8 @@ def process_followups(store, config, hermes):
         try:
             if store.db.execute(
                     "SELECT 1 FROM jobs WHERE session_id=? AND status IN ('pending','creating','created',"
-                    "'retry_pending')", (row["session_id"],)).fetchone():
-                continue  # The earlier conversation is still being created; its context comes next check.
+                    "'running','retry_pending')", (row["session_id"],)).fetchone():
+                continue  # The earlier conversation is still being created or answered; its context comes later.
             exists = hermes.inspect(row["session_id"])["exists"]
             redirect_followup(store, row, item, "odpowiedź w wątku z wcześniejszej rozmowy" if exists else
                               "odpowiedź w wątku, którego sesja już nie istnieje", hermes if exists else None)
@@ -621,15 +626,89 @@ READ_GATE = ("ready", "done")
 MAX_READ_ATTEMPTS = 5
 
 
+def mark_position(item):
+    """(conversation, position) for sources whose read marker covers everything before it (Slack), else None."""
+    if is_slack(item) and item.get("channel") and item.get("ts"):
+        try:
+            return f"{item['channel']}:{item.get('thread_ts') or ''}", float(item["ts"])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def eligible_read_marks(store):
+    """Pending marks whose session or brief is ready (skipped noise: at once), minus those that would overtake.
+
+    A cumulative marker (Slack) moved to an item also reads everything before it, so an item waits while an
+    earlier item of the same conversation is not shown yet: its session not ready (pending, running, failed,
+    needs attention) or its brief not created and ready.
+    """
+    pending = [dict(row) for row in store.db.execute(
+        "SELECT r.*, (r.job_key='' OR (SELECT status FROM jobs j WHERE j.event_key=r.job_key "
+        "ORDER BY generation DESC LIMIT 1) IN (?,?)) AS gate FROM read_marks r WHERE r.status='pending'",
+        READ_GATE)]
+    held = {}
+    for row in pending:
+        if not row["gate"]:
+            position = mark_position(json.loads(row["payload"]))
+            if position:
+                key = (row["source"], row["account"], position[0])
+                held[key] = min(held.get(key, position[1]), position[1])
+    for row in store.db.execute("SELECT account, payload FROM triage_items WHERE decision='brief' AND briefed=0"):
+        position = mark_position(json.loads(row["payload"]))
+        if position:
+            source, _, account = row["account"].partition(":")
+            key = (source, account, position[0])
+            held[key] = min(held.get(key, position[1]), position[1])
+    eligible = []
+    for row in pending:
+        if not row.pop("gate"):
+            continue
+        position = mark_position(json.loads(row["payload"]))
+        if position and held.get((row["source"], row["account"], position[0]), float("inf")) < position[1]:
+            continue
+        eligible.append(row)
+    return eligible
+
+
+def mark_at_source(source, config, marks):
+    """{item id: status} from the adapter's `mark_read(config, items)`.
+
+    The adapter returns None (every item done) or {item id: "done" | "unsupported" | anything else = retry,
+    the text is kept as the error}; an item missing from the dict is retried. When the call raises, each item
+    is tried alone, so one item the source rejects never holds back the others.
+    """
+    items = [json.loads(m["payload"]) for m in marks]
+    try:
+        result = source().mark_read(config, items)
+    except Exception as exc:  # noqa: BLE001 - retried; the session itself is fine
+        if len(marks) == 1:
+            return {marks[0]["item_id"]: str(exc)}
+        outcome = {}
+        for m in marks:
+            outcome.update(mark_at_source(source, config, [m]))
+        return outcome
+    if result is None:
+        return {m["item_id"]: "done" for m in marks}
+    by_payload = {item.get("id"): m["item_id"] for item, m in zip(items, marks)}
+    return {by_payload.get(key, key): value for key, value in dict(result).items()}
+
+
 def flush_read_marks(store, config, installed, blocked=()):
     """Mark items read at their source once the session or brief that shows them is ready (skipped: at once).
 
-    Sources without `mark_read` (e.g. Slack, whose token cannot mark read) are recorded as unsupported.
-    Returns a list of error strings; a failing source retries at the next checks.
+    Sources without `mark_read` are recorded as unsupported; with `triage.mark_read` off, or the source disabled
+    or its own `mark_read` off, pending marks become "disabled". Returns a list of error strings; a failing item
+    retries at the next checks.
     """
-    rows = [dict(row) for row in store.db.execute(
-        "SELECT r.* FROM read_marks r WHERE r.status='pending' AND (r.job_key='' OR (SELECT status FROM jobs j "
-        "WHERE j.event_key=r.job_key ORDER BY generation DESC LIMIT 1) IN (?,?))", READ_GATE)]
+    with store.db:
+        for (name,) in store.db.execute("SELECT DISTINCT source FROM read_marks WHERE status='pending'").fetchall():
+            source_settings = config.get("sources", {}).get(name) or {}
+            if not settings(config)["mark_read"] or source_settings.get("enabled") is False \
+                    or source_settings.get("mark_read") is False:
+                store.db.execute("UPDATE read_marks SET status='disabled' WHERE source=? AND status='pending'",
+                                 (name,))
+    rows = eligible_read_marks(store)
     errors, groups = [], {}
     for row in rows:
         groups.setdefault(row["source"], []).append(row)
@@ -642,29 +721,34 @@ def flush_read_marks(store, config, installed, blocked=()):
                 store.db.executemany("UPDATE read_marks SET status='unsupported' WHERE source=? AND account=? "
                                      "AND item_id=?", [(m["source"], m["account"], m["item_id"]) for m in marks])
             continue
-        try:
-            source().mark_read(config, [json.loads(m["payload"]) for m in marks])
-            status, error = "done", ""
-        except Exception as exc:  # noqa: BLE001 - retried; the session itself is fine
-            status, error = None, str(exc)[:300]
-            errors.append(f"mark read {name}: {error}")
+        source_settings = config.get("sources", {}).get(name) or {}
+        if not settings(config)["mark_read"] or not source_settings.get("enabled") \
+                or source_settings.get("mark_read") is False:
+            # Switched off since these were recorded: never marked later by surprise.
+            with store.db:
+                store.db.executemany("UPDATE read_marks SET status='disabled' WHERE source=? AND account=? "
+                                     "AND item_id=?", [(m["source"], m["account"], m["item_id"]) for m in marks])
+            continue
+        outcome = mark_at_source(source, config, marks)
         with store.db:
             for m in marks:
-                if status:
+                status = outcome.get(m["item_id"])
+                if status in ("done", "unsupported"):
                     store.db.execute("UPDATE read_marks SET status=?, error='' WHERE source=? AND account=? "
                                      "AND item_id=?", (status, m["source"], m["account"], m["item_id"]))
-                else:
-                    store.db.execute("UPDATE read_marks SET attempts=attempts+1, error=?, status=CASE WHEN "
-                                     "attempts+1>=? THEN 'failed' ELSE 'pending' END WHERE source=? AND account=? "
-                                     "AND item_id=?", (error, MAX_READ_ATTEMPTS, m["source"], m["account"],
-                                                       m["item_id"]))
+                    continue
+                error = str(status or "no status from the source")[:300]
+                if f"mark read {name}: {error}" not in errors:
+                    errors.append(f"mark read {name}: {error}")
+                store.db.execute("UPDATE read_marks SET attempts=attempts+1, error=?, status=CASE WHEN "
+                                 "attempts+1>=? THEN 'failed' ELSE 'pending' END WHERE source=? AND account=? "
+                                 "AND item_id=?", (error, MAX_READ_ATTEMPTS, m["source"], m["account"],
+                                                   m["item_id"]))
     return errors
 
 
 def read_marks_waiting(store):
-    return bool(store.db.execute(
-        "SELECT 1 FROM read_marks r WHERE r.status='pending' AND (r.job_key='' OR (SELECT status FROM jobs j "
-        "WHERE j.event_key=r.job_key ORDER BY generation DESC LIMIT 1) IN (?,?)) LIMIT 1", READ_GATE).fetchone())
+    return bool(eligible_read_marks(store))
 
 
 # ── Brief ────────────────────────────────────────────────────────────────────

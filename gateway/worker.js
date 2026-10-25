@@ -105,10 +105,22 @@ export class Hub {
       const since = Number(url.searchParams.get("since") || 0);
       const missed = await this.state.storage.list({ prefix: "ev:", start: this.key(since + 1) });
       for (const event of missed.values()) pair[1].send(JSON.stringify(event));
-      pair[1].send(JSON.stringify({ type: "hello", seq: (await this.state.storage.get("seq")) || 0 }));
+      // epoch: changes only when storage is wiped, so a client knows its seq belongs to another numbering.
+      // first: oldest event still kept; a client behind it lost events to retention.
+      const seq = (await this.state.storage.get("seq")) || 0;
+      pair[1].send(JSON.stringify({ type: "hello", seq, epoch: await this.epoch(), first: Math.max(1, seq - KEEP + 1) }));
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
     return new Response("not found", { status: 404 });
+  }
+
+  async epoch() {
+    let epoch = await this.state.storage.get("epoch");
+    if (!epoch) {
+      epoch = crypto.randomUUID();
+      await this.state.storage.put("epoch", epoch);
+    }
+    return epoch;
   }
 
   webSocketMessage(socket, message) {

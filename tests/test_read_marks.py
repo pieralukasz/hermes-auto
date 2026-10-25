@@ -1,6 +1,5 @@
 """Items shown in a Hermes session or brief are marked read at their source, and only then."""
 import datetime as dt
-import json
 
 import pytest
 
@@ -112,51 +111,3 @@ def test_mark_read_can_be_turned_off(store, config):
     config["triage"]["mark_read"] = False
     decide(store, config)
     assert marks(store) == {}
-
-
-def test_github_marks_each_thread_once(monkeypatch):
-    from hermes_auto_github import Source
-    import hermes_auto_github as gh
-    patched = []
-
-    class Http:
-        def __init__(self, token):
-            pass
-
-        def mark_thread_read(self, thread):
-            patched.append(thread)
-
-    monkeypatch.setattr(gh, "Http", Http)
-    monkeypatch.setattr(gh, "gh_token", lambda command: "t")
-    Source().mark_read({"sources": {"github": {}}}, [{"id": "1@a", "thread_id": "1"}, {"id": "1@b", "thread_id": "1"},
-                                                    {"id": "2@a", "thread_id": "2"}])
-    assert patched == ["1", "2"]
-    assert json.dumps(patched)
-
-
-class SlackHttp:
-    def __init__(self, channels, newest):
-        self.channels, self.newest, self.marked = channels, newest, []
-
-    def api(self, method, _post=False, **params):
-        if method == "conversations.info":
-            return {"channel": self.channels[params["channel"]]}
-        if method == "conversations.history":
-            return {"messages": [{"ts": self.newest[params["channel"]]}]}
-        assert method == "conversations.mark" and _post
-        self.marked.append((params["channel"], params["ts"]))
-        return {"ok": True}
-
-
-def test_slack_marks_dms_and_latest_mentions_only():
-    from hermes_auto_slack import Source
-    http = SlackHttp({"D1": {"is_im": True, "last_read": "10.0"}, "D2": {"is_im": True, "last_read": "99.0"},
-                      "C1": {"last_read": "1.0"}, "C2": {"last_read": "1.0"}},
-                     {"C1": "20.0", "C2": "50.0"})
-    items = [{"channel": "D1", "ts": "11.0", "thread_ts": ""}, {"channel": "D1", "ts": "12.0", "thread_ts": ""},
-             {"channel": "D2", "ts": "50.0", "thread_ts": ""},  # already read further: never backwards
-             {"channel": "C1", "ts": "20.0", "thread_ts": ""},  # mention is the newest message
-             {"channel": "C2", "ts": "20.0", "thread_ts": ""},  # later messages exist: left alone
-             {"channel": "C1", "ts": "30.0", "thread_ts": "5.0"}]  # thread reply: no public API
-    Source().mark_read({"sources": {"slack": {}}}, items, http=http)
-    assert http.marked == [("D1", "12.0"), ("C1", "20.0")]

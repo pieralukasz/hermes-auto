@@ -6,10 +6,13 @@ belongs to `hermes-auto tick`). It writes `slack-listener.json` in the automatio
 
 - `heartbeat`: last sign of a live connection (the Slack source relaxes its polling while it is fresh),
 - `hints`: conversations with new activity ({channel, thread_ts, why, ts}; ids only),
-- `nudge_at`: when the latest relevant message arrived.
+- `nudge_at`: when the latest relevant message arrived,
+- `pending_hints`, `catchup_owed`, `retry_at`: what the sink has not accepted yet (ids only), retried
+  by the pump with backoff.
 
 When a conversation has been quiet for `quiet_seconds` it runs `hermes-auto tick`, which then performs
-a Slack-only check (the source's `due`). Missed events (sleep, restarts) are covered by that polling.
+a Slack-only check (the source's `due`). Socket Mode replays nothing missed while disconnected (sleep,
+restarts), so every `hello` owes one hintless nudge, delivered at a bounded rate.
 """
 from __future__ import annotations
 
@@ -27,6 +30,11 @@ from hermes_auto.listening import LocalSink, log, sink_from_config
 from . import Http, Source, read_token
 
 NAME = "slack"
+# Socket Mode replays nothing missed while disconnected: every `hello` owes one hintless nudge (a
+# Slack-only check). Delivered at most once per CATCHUP_SECONDS, so a reconnect storm cannot flood the
+# sorter; failed publishes retry with backoff between RETRY_MIN and RETRY_MAX seconds.
+CATCHUP_SECONDS = 60
+RETRY_MIN, RETRY_MAX = 5, 300
 
 
 def read_state(home):
@@ -103,7 +111,7 @@ class Listener:
         """Process one Socket Mode envelope; returns the ack to send (or None)."""
         kind = envelope.get("type")
         if kind == "hello":
-            self.beat(connected=True)
+            self.beat(connected=True, catchup=True)
             return None
         ack = {"envelope_id": envelope["envelope_id"]} if envelope.get("envelope_id") else None
         if kind != "events_api":
@@ -122,19 +130,132 @@ class Listener:
 
     def hint(self, channel, thread_ts, why, ts):
         # Ids only; a followed thread outranks a single mention in it (merged by the sink).
-        self.sink.emit(NAME, hint={"channel": channel, "thread_ts": thread_ts, "why": why, "ts": ts})
+        hint = {"channel": channel, "thread_ts": thread_ts, "why": why, "ts": ts}
+        before = self.clock()
+        state = read_state(self.home)
+        if state.get("pending_hints") or before < float(state.get("retry_at") or 0):
+            # The sink is failing: queue behind the earlier hints instead of blocking this event.
+            self.queue(hint)
+            return
+        try:
+            self.sink.emit(NAME, hint=hint)
+        except Exception as exc:  # noqa: BLE001 - durable before the ack; the pump retries it
+            log(f"publish failed: {type(exc).__name__}: {str(exc)[:160]}")
+            self.queue(hint, failed=True)
+            return
+        self.settled(before)
 
-    def beat(self, connected=None):
+    def queue(self, hint, failed=False):
+        """Keep a hint in the state file until the sink accepts it (one per conversation, newest wins)."""
+        key = f"{hint['channel']}:{hint.get('thread_ts') or ''}"
+
+        def change(state):
+            pending = state.setdefault("pending_hints", {})
+            old = pending.get(key) or {}
+            newest = hint if float(hint.get("ts") or 0) >= float(old.get("ts") or 0) else old
+            why = "thread" if "thread" in (old.get("why"), hint.get("why")) else newest.get("why")
+            pending[key] = {**newest, "why": why}
+            if failed and self.clock() >= float(state.get("retry_at") or 0):
+                self.back_off(state)
+
+        listening.update_state(self.home, NAME, change)
+
+    def back_off(self, state):
+        delay = min(max(float(state.get("retry_delay") or 0) * 2, RETRY_MIN), RETRY_MAX)
+        state["retry_delay"], state["retry_at"] = delay, self.clock() + delay
+
+    def settled(self, before):
+        """A hint accepted after a `hello` was a nudge too: the catch-up owed up to `before` is paid
+        (a later `hello` keeps its own)."""
+        if read_state(self.home).get("catchup_owed") is None:
+            return
+
+        def change(state):
+            if float(state.get("catchup_owed") or before) <= before:
+                state.pop("catchup_owed", None)
+            state["catchup_sent_at"] = before
+
+        listening.update_state(self.home, NAME, change)
+
+    def beat(self, connected=None, catchup=False):
         def change(state):
             state["heartbeat"] = self.clock()
             state["events_since_start"], state["last_event_at"] = self.events, self.last_event
             if connected is not None:
                 state["connected"] = connected
+            if catchup:
+                state["catchup_owed"] = self.clock()
+
+        state = listening.update_state(self.home, NAME, change)
+        beat = getattr(self.sink, "beat", None)
+        if beat:
+            # The relay's liveness view: the Mac checks Slack itself once these stop.
+            beat([NAME], bool(state.get("connected")))
+
+    def pump(self):
+        self.deliver()
+        self.sink.pump()
+
+    def deliver(self):
+        """Publish what is owed (pending hints, else the catch-up nudge) outside the state lock; forget
+        each piece only once the sink accepted it, and only if no newer version replaced it meanwhile."""
+        now = self.clock()
+        state = read_state(self.home)
+        if now < float(state.get("retry_at") or 0):
+            return
+        pending = dict(state.get("pending_hints") or {})
+        owed = state.get("catchup_owed")
+        catchup = owed is not None and now - float(state.get("catchup_sent_at") or 0) >= CATCHUP_SECONDS
+        if not pending and not catchup:
+            return
+        sent, failed = [], False
+        try:
+            for key, hint in pending.items():
+                self.sink.emit(NAME, hint=hint)
+                sent.append((key, hint))
+            if catchup and not sent:
+                self.sink.emit(NAME)
+        except Exception as exc:  # noqa: BLE001 - stays in the state file; retried with backoff
+            log(f"publish failed: {type(exc).__name__}: {str(exc)[:160]}")
+            failed = True
+
+        def change(state):
+            hints = state.get("pending_hints") or {}
+            for key, hint in sent:
+                if hints.get(key) == hint:
+                    del hints[key]
+            if hints:
+                state["pending_hints"] = hints
+            else:
+                state.pop("pending_hints", None)
+            if failed:
+                self.back_off(state)
+            else:
+                state.pop("retry_at", None)
+                state.pop("retry_delay", None)
+            if sent or (catchup and not failed):
+                owed_now = state.get("catchup_owed")
+                if owed_now is not None and (owed_now == owed or float(owed_now) <= now):
+                    state.pop("catchup_owed", None)
+                state["catchup_sent_at"] = now
 
         listening.update_state(self.home, NAME, change)
 
-    def pump(self):
-        self.sink.pump()
+
+def on_message(listener, socket, raw):
+    """Handle one frame. websocket-client swallows callback errors, so an event that could not be kept
+    closes the connection unacked: Slack redelivers it, and the reconnect's `hello` owes a catch-up."""
+    try:
+        envelope = json.loads(raw)
+        ack = listener.handle(envelope)
+    except Exception as exc:  # noqa: BLE001
+        log(f"event not kept, reconnecting: {type(exc).__name__}: {str(exc)[:160]}")
+        socket.close()
+        return
+    if ack:
+        socket.send(json.dumps(ack))
+    if envelope.get("type") == "disconnect":
+        socket.close()
 
 
 def serve(home, settings, config=None):
@@ -146,17 +267,15 @@ def serve(home, settings, config=None):
     token = app_token(listener.settings)
     stop = threading.Event()
 
-    def pumping():
-        last_beat = 0.0
-        while not stop.is_set():
-            listener.pump()
-            if time.time() - last_beat > 60:
-                if read_state(home).get("connected"):
-                    listener.beat()
-                last_beat = time.time()
-            stop.wait(1)
+    beat_at = [0.0]
 
-    threading.Thread(target=pumping, daemon=True).start()
+    def pumping():
+        listener.pump()
+        if time.time() - beat_at[0] > 60:
+            beat_at[0] = time.time()
+            listener.beat()  # also while disconnected, so the relay sees the listener is down, not dead
+
+    threading.Thread(target=listening.keep_pumping, args=(stop, pumping), daemon=True).start()
     backoff = 5
     while True:
         try:
@@ -164,15 +283,7 @@ def serve(home, settings, config=None):
             url = opened["url"]
             log("connecting")
 
-            def on_message(socket, raw):
-                envelope = json.loads(raw)
-                ack = listener.handle(envelope)
-                if ack:
-                    socket.send(json.dumps(ack))
-                if envelope.get("type") == "disconnect":
-                    socket.close()
-
-            app = websocket.WebSocketApp(url, on_message=on_message)
+            app = websocket.WebSocketApp(url, on_message=lambda socket, raw: on_message(listener, socket, raw))
             app.run_forever(ping_interval=30, ping_timeout=10)
             log("disconnected")
             backoff = 5

@@ -6,8 +6,9 @@ in). Bots, Slackbot, the user's own messages, edits, joins and @here/@channel al
 
 Messages of one conversation (a DM, or a thread) are handed over as one burst once nobody has
 written for `quiet_seconds`; if the user read or answered it in Slack before that, the candidate is
-marked read and the sorter opens nothing. The adapter only reads Slack (Web API with the user's
-token, plus Slack's MCP search for discovery); it never posts.
+marked read and the sorter opens nothing. The adapter reads Slack (Web API with the user's token, plus
+Slack's MCP search for discovery) and never posts; its only write moves a DM's read marker over messages a
+Hermes session or brief has shown (`Source.mark_read`; channels and threads are never marked).
 """
 from __future__ import annotations
 
@@ -22,6 +23,8 @@ API_URL = "https://slack.com/api/"
 OVERLAP_SECONDS = 600
 HUMAN_SUBTYPES = (None, "thread_broadcast", "file_share", "me_message")
 MENTION = "<@{}>"
+# True while handed-over bursts remain (cut off by `limit` or still being written): poll again soon.
+BACKLOG = "source_backlog:slack"
 
 
 class SlackError(RuntimeError):
@@ -275,6 +278,7 @@ class Slack:
         cursor = store.get_meta(key) if since_ms is None else {"since": since_ms / 1000, "convs": {}}
         now = self.now()
         if cursor is None:
+            store.set_meta(BACKLOG, False)
             return [], key, {"since": now, "start": now, "convs": {}}
         handed = {k: float(v) for k, v in cursor.get("convs", {}).items()}
         since = float(cursor["since"])
@@ -292,9 +296,11 @@ class Slack:
                 waiting.append(min(float(m["ts"]) for m in fresh))
                 continue
             candidates.append((last, conv, self.candidate(identity, info, channel_id, thread_ts, messages,
-                                                          fresh, why)))
+                                                          fresh, why), min(float(m["ts"]) for m in fresh)))
         candidates.sort(key=lambda item: item[0])
-        candidates = candidates[:limit]
+        # Bursts cut off by `limit` hold the cursor like bursts still being written: they come next time.
+        waiting += [first for _, _, _, first in candidates[limit:]]
+        candidates = [(last, conv, item) for last, conv, item, _ in candidates[:limit]]
         for last, conv, _ in candidates:
             handed[conv] = last
         horizon = now - 86400 * int(self.settings["thread_days"])
@@ -302,6 +308,9 @@ class Slack:
         # Never move past a burst that is still being written (or one cut off by `limit`).
         mark = min(waiting) - 1 if waiting else now - quiet
         new_cursor = {"since": max(since, min(mark, now)), "start": float(cursor.get("start", 0)), "convs": handed}
+        if since_ms is None:
+            # Push mode polls again soon while bursts wait for quiet or were cut off (see cli.fast_sources).
+            store.set_meta(BACKLOG, bool(waiting))
         return [item for _, _, item in candidates], key, new_cursor
 
     def candidate(self, identity, info, channel_id, thread_ts, messages, fresh, why):
@@ -350,6 +359,8 @@ class Slack:
             "private": private, "redacted": redacted, "dm": dm,
             "snippet": "" if redacted else " ".join((last.get("text") or "").split())[:300],
             "body": body[:20000], "url": url, "sent": [],
+            # Messages this item shows: marking read may pass these and no others (Source.mark_read).
+            "fresh_ts": [m["ts"] for m in fresh],
         }
 
     def transcript(self, messages, fresh, thread_ts, me):
@@ -394,35 +405,67 @@ def listener_hints(store, since):
 
 class Source:
     def mark_read(self, config, items, http=None):
-        """Move Slack's read marker to an item's last message once it appears in a Hermes session or brief.
+        """Move a DM's read marker over messages a Hermes session or brief has shown; {item id: status}.
 
-        DMs and group DMs: always (never backwards). Channel mentions: only when that message is still the
-        channel's latest, so no unrelated unread messages are hidden. Thread replies: Slack has no public API
-        for thread read state, so they are left as they are.
+        "done": the marker is at or past the item. "unsupported": left unread, because it cannot be marked
+        safely: channel messages (the channel's marker would also read every unrelated message before the
+        mention), thread replies (no public API for thread read state), and DM items with a message between the
+        marker and the item that no item in this call shows (unread before the baseline, missed by discovery,
+        not a human message, or more than one page to check). "retry: <error>": this conversation failed this
+        time; other conversations are unaffected.
+
+        The marker moves only over a contiguous run of shown messages and never past the newest shown one, so
+        messages arriving meanwhile stay unread. Slack's API has no compare-and-set: if the user moves the
+        marker further in Slack between `conversations.info` and `conversations.mark`, this call can move it
+        back to the shown message (later messages then look unread again; nothing is hidden). The caller passes
+        only items whose earlier items in the same conversation are shown (triage.flush_read_marks).
         """
         import subprocess
+        result = {}
+        by_channel = {}
+        for item in items:
+            if not item.get("channel") or not item.get("ts") or item.get("thread_ts"):
+                result[item.get("id")] = "unsupported"
+            else:
+                by_channel.setdefault(item["channel"], []).append(item)
+        if not by_channel:
+            return result
         settings = {**self.defaults(), **config["sources"].get("slack", {})}
         if http is None:
-            result = subprocess.run(list(settings["mark_token_command"]), capture_output=True, text=True, timeout=30)
-            if result.returncode or not result.stdout.strip():
+            token = subprocess.run(list(settings["mark_token_command"]), capture_output=True, text=True, timeout=30)
+            if token.returncode or not token.stdout.strip():
                 raise SlackError("No Slack mark-read token (mark_token_command)")
-            http = Http(result.stdout.strip())
-        latest = {}
-        for item in items:
-            channel, ts = item.get("channel"), item.get("ts")
-            if not channel or not ts or item.get("thread_ts"):
-                continue
-            if float(ts) > float(latest.get(channel, {}).get("ts", 0)):
-                latest[channel] = item
-        for channel, item in latest.items():
-            info = http.api("conversations.info", channel=channel)["channel"]
-            if float(info.get("last_read") or 0) >= float(item["ts"]):
-                continue
-            if not (info.get("is_im") or info.get("is_mpim")):
-                newest = http.api("conversations.history", channel=channel, limit=1).get("messages") or [{}]
-                if float(newest[0].get("ts") or 0) > float(item["ts"]):
-                    continue
-            http.api("conversations.mark", _post=True, channel=channel, ts=item["ts"])
+            http = Http(token.stdout.strip())
+        for channel, group in by_channel.items():
+            group.sort(key=lambda item: float(item["ts"]))
+            try:
+                result.update(self._mark_channel(http, channel, group))
+            except Exception as exc:  # noqa: BLE001 - one conversation failing must not hold the others
+                result.update({item.get("id"): f"retry: {str(exc)[:200]}" for item in group})
+        return result
+
+    @staticmethod
+    def _mark_channel(http, channel, group):
+        info = http.api("conversations.info", channel=channel)["channel"]
+        if not (info.get("is_im") or info.get("is_mpim")):
+            return {item.get("id"): "unsupported" for item in group}
+        last_read = float(info.get("last_read") or 0)
+        shown = {float(ts) for item in group for ts in (item.get("fresh_ts") or [item["ts"]])}
+        target = None
+        if float(group[-1]["ts"]) > last_read:
+            page = http.api("conversations.history", channel=channel, oldest=f"{last_read:.6f}",
+                            latest=group[-1]["ts"], limit=200)
+            if page.get("has_more"):
+                unshown = [0.0]  # too much unread to check: mark nothing
+            else:
+                unshown = [float(m["ts"]) for m in page.get("messages", []) if float(m["ts"]) not in shown]
+            limit = min(unshown, default=float("inf"))
+            # Furthest item with no unshown message between the marker and it.
+            target = next((item for item in reversed(group) if last_read < float(item["ts"]) <= limit), None)
+        if target is not None:
+            http.api("conversations.mark", _post=True, channel=channel, ts=target["ts"])
+            last_read = float(target["ts"])
+        return {item.get("id"): "done" if float(item["ts"]) <= last_read else "unsupported" for item in group}
 
     @staticmethod
     def defaults():
@@ -432,8 +475,8 @@ class Source:
                 # ... and while the Socket Mode listener is connected (it nudges on new messages).
                 "listener_poll_seconds": 900,
                 "app_token_command": ["security", "find-generic-password", "-s", "hermes-auto-slack-app", "-w"],
-                # User token of the "Lucas Hermes Agent" app with im/mpim/channels/groups:write, used only for
-                # conversations.mark (the MCP token cannot mark read).
+                # User token of the "Lucas Hermes Agent" app with im:write/mpim:write (and im/mpim:history), used
+                # only for conversations.mark on DMs (the MCP token cannot mark read).
                 "mark_token_command": ["security", "find-generic-password", "-s", "hermes-auto-slack-user", "-w"],
                 # A conversation is handed over after nobody wrote for this long.
                 "quiet_seconds": 90,
