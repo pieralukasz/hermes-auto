@@ -69,9 +69,9 @@ DEFAULTS = {
         "własne repo (pieralukasz).\n"
         "session: ktoś prosi go o review (review_requested), oznacza go (mention, team_mention), komentuje lub "
         "recenzuje jego PR albo zadaje pytanie w wątku, w którym uczestniczy, z prośbą o zmiany lub odpowiedź; "
-        "przypisano mu issue lub PR; CI nie przechodzi na jego PR lub na main po jego zmianie.\n"
+        "przypisano mu issue lub PR.\n"
         "brief: jego PR zmergowany lub zamknięty, akceptacja review bez uwag, informacja bez pytania do niego.\n"
-        "skip: udany przebieg CI, komentarze botów bez błędu (deploy preview, coverage, changesety), Dependabot, "
+        "skip: komentarze botów bez błędu (deploy preview, coverage, changesety), Dependabot, "
         "zmiany w wątkach, w których nikt na niego nie czeka."),
     "todoist": {
         "enabled": True,
