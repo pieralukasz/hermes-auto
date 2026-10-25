@@ -205,7 +205,7 @@ On macOS:
 hermes-auto install-launchd
 ```
 
-By default, the service checks for the `Hermes` desktop process every 60 seconds. Opening the app triggers a scan within that interval; while open it polls every 5 minutes. Closing it stops new scheduled scans (it does not interrupt an already running preparation). Change `desktop_process` if your app uses another process name. Set `desktop_only: false` for background polling independent of the app. `run` is always an explicit immediate run. `max_jobs_per_run` bounds each run; `agent_run_budget_seconds`/`agent_max_turns` bound full-agent jobs and `run_budget_seconds`/`max_turns` restricted ones.
+By default, the service checks for the `Hermes` desktop process every 60 seconds. Opening the app triggers a scan within that interval; in polling mode it then reads sources every `poll_seconds` (300) while open. With `"poll_sources": false` (see Relay queue and push mode) there is no periodic source check: webhooks and listeners trigger reads within seconds, and the timer only handles local upkeep and fallbacks. Closing it stops new scheduled scans (it does not interrupt an already running preparation). Change `desktop_process` if your app uses another process name. Set `desktop_only: false` for background polling independent of the app. `run` is always an explicit immediate run. `max_jobs_per_run` bounds each run; `agent_run_budget_seconds`/`agent_max_turns` bound full-agent jobs and `run_budget_seconds`/`max_turns` restricted ones.
 
 Linux users can schedule `hermes-auto tick` through a user timer; set `desktop_only: false` on headless machines. Machines asleep/offline cannot process events until they resume.
 

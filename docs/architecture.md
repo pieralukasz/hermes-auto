@@ -25,7 +25,7 @@ Push acknowledgements follow durable delivery. Ticks acknowledge successful sour
 
 Push listeners (`hermes_auto.listening`, opt-in services per adapter: Slack Socket Mode, Proton IMAP IDLE) never touch the database; they write `<name>-listener.json` (times and ids, no text) and run `tick`; an adapter's optional `due(settings, store, last_poll, now)` turns that tick into a check of that source only (`fast_sources`).
 
-Limits in 0.1: synchronous preparation with a configurable per-run cap; no inbound webhook server; no attachment extraction; no cross-mail-provider deduplication. Adapter polling is intentionally opt-in. Versions are aligned for this first release, but distributions and dependencies are separate.
+Limits in 0.1: no attachment extraction; no cross-mail-provider deduplication. Adapter polling is intentionally opt-in. Agent runs start in the background (`Hermes.start`/`collect`), so a tick does not wait for them. Inbound webhooks (Todoist, Gmail Pub/Sub) go to the Cloudflare Worker in `gateway/`, which forwards ids only through the relay queue; the Mac never opens an inbound port. Versions are aligned for this first release, but distributions and dependencies are separate.
 
 ## Sorter (`triage`, opt-in)
 
