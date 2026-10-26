@@ -121,12 +121,19 @@ class GitHub:
         # Notifications cut off by `limit` hold the cursor (the next read starts OVERLAP_SECONDS before it).
         new_since = min(now, fresh[limit][0]) if len(fresh) > limit else now
         fresh = fresh[:limit]
-        candidates = [self.candidate(me, item) for _, item in fresh]
+        candidates = [found for found in (self.candidate(me, item) for _, item in fresh) if found]
         for updated, item in fresh:
             handed[item["id"]] = updated
         horizon = now - 86400 * 30
         handed = {k: v for k, v in handed.items() if v >= horizon}
         return candidates, key, {"since": new_since, "start": float(cursor.get("start", 0)), "handed": handed}
+
+    def muted(self, comment):
+        """A latest comment matching a `skip_comments` rule (author login and body text) opens nothing."""
+        author = (comment.get("user") or {}).get("login", "")
+        body = str(comment.get("body") or "")
+        return any(rule.get("author") == author and str(rule.get("contains") or "") in body
+                   for rule in self.settings.get("skip_comments", []))
 
     def candidate(self, me, item):
         subject = item.get("subject", {})
@@ -134,6 +141,8 @@ class GitHub:
         details = self.http.get(subject["url"]) if subject.get("url") else None
         comment = self.http.get(subject["latest_comment_url"]) if subject.get("latest_comment_url") and \
             subject.get("latest_comment_url") != subject.get("url") else None
+        if comment and self.muted(comment):
+            return None
         url = (comment or {}).get("html_url") or (details or {}).get("html_url") or html_url(subject.get("url")) \
             or f"https://github.com/{repo}"
         actor = ((comment or details or {}).get("user") or {})
@@ -169,6 +178,8 @@ class Source:
         return {"enabled": True, "token_command": ["gh", "auth", "token"],
                 # Repositories the user only watches are noise unless he asks for them.
                 "skip_reasons": ["subscribed"], "skip_repos": [],
+                # Bot reports to mute: [{"author": "<login>", "contains": "<text in the comment body>"}].
+                "skip_comments": [],
                 # Without a live listener, check this often between the regular checks (seconds).
                 "poll_seconds": 300, "listen_quiet_seconds": 20}
 

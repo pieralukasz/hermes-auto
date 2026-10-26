@@ -91,6 +91,39 @@ def test_own_latest_comment_counts_as_read(store):
     assert item["read"]
 
 
+class CommentApi(FakeApi):
+    def __init__(self, items, comment):
+        super().__init__(items)
+        self.comment = comment
+
+    def get(self, url, **params):
+        if url.endswith("/comments/9"):
+            return {"html_url": "https://github.com/acme/web/pull/7#issuecomment-9", **self.comment}
+        return super().get(url, **params)
+
+
+REPORT = "## Test step failed\n<!-- pytest-obligation:357d5419 -->"
+BOT = {"login": "github-actions[bot]", "type": "Bot"}
+
+
+@pytest.mark.parametrize("comment, kept", [
+    ({"body": REPORT, "user": BOT}, False),
+    ({"body": "Deploy failed", "user": BOT}, True),
+    ({"body": REPORT, "user": {"login": "oz", "type": "User"}}, True),
+])
+def test_skip_comments_mutes_one_bot_report(store, comment, kept):
+    api = CommentApi([notification("1", NOW - 600)], comment)
+    settings = {**Source.defaults(), "skip_comments": [
+        {"author": "github-actions[bot]", "contains": "<!-- pytest-obligation"}]}
+    _, key, cursor = GitHub(settings, http=api, now=lambda: NOW).inbox({}, store)
+    store.set_meta(key, cursor)
+    api.items.append(notification("2", NOW + 10, reason="author"))
+    candidates, _, cursor = GitHub(settings, http=api, now=lambda: NOW + 60).inbox({}, store)
+    assert [c["thread_id"] for c in candidates] == (["2"] if kept else [])
+    store.set_meta(key, cursor)
+    assert GitHub(settings, http=api, now=lambda: NOW + 120).inbox({}, store)[0] == []  # muted stays handled
+
+
 def test_github_session_researches_and_never_publishes(store, config):
     api = FakeApi([notification("2", NOW + 10)])
     item = github_with(api, NOW + 60).candidate("me", api.items[0])
