@@ -960,11 +960,29 @@ def read_marks_waiting(store):
 
 # ── Brief ────────────────────────────────────────────────────────────────────
 
+DAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def times_on(times, day):
+    """Brief times on `day`. A list applies every day; a dict maps a day or a day range to its own list,
+    e.g. {"mon-fri": ["06:00", "10:00"], "sat-sun": ["08:00"]} (a day matching no key has no brief)."""
+    if not isinstance(times, dict):
+        return list(times)
+    for spec, values in times.items():
+        first, _, last = str(spec).strip().lower().partition("-")
+        if DAYS.index(first) <= day.weekday() <= DAYS.index(last or first):
+            return list(values)
+    return []
+
+
 def current_slot(times, now):
-    """Latest configured brief time at or before `now` ("YYYY-MM-DD HH:MM"), else None."""
+    """Latest configured brief time at or before `now` ("YYYY-MM-DD HH:MM"), else None.
+
+    Looks back a week, so a weekend with one morning brief still finds Friday's last slot."""
     slots = []
-    for day in (now.date() - dt.timedelta(days=1), now.date()):
-        for value in times:
+    for back in range(7, -1, -1):
+        day = now.date() - dt.timedelta(days=back)
+        for value in times_on(times, day):
             hour, minute = (int(part) for part in value.split(":"))
             moment = dt.datetime.combine(day, dt.time(hour, minute))
             if moment <= now:
@@ -1128,7 +1146,8 @@ def maybe_brief(store, config, now=None, hermes=None, adapter=None):
     if new_slot:
         hour = slot[-5:]
         for source in triage["brief_sources"]:
-            if hour in (source.get("times") or triage["brief_times"]):
+            day = dt.datetime.strptime(slot, "%Y-%m-%d %H:%M").date()
+            if hour in (source.get("times") or times_on(triage["brief_times"], day)):
                 store.set_meta(f"brief_source_due:{source['name']}", True)
     errors = []
     try:

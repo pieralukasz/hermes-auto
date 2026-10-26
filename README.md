@@ -177,6 +177,8 @@ Instead of labelling threads and tasks yourself, let the sorter look at everythi
 }
 ```
 
+`brief_times` is a list for every day, or per day / day range: `{"mon-fri": ["06:00", "10:00", "14:00", "18:00"], "sat-sun": ["08:00"]}` (a day matching no key has no brief). A section source's own `times` must name slots that exist.
+
 - **Mail (Gmail, Proton):** every new inbox message gets one decision. *Session*: a person expects your answer or action, so a conversation opens with a one- or two-sentence notice of who wrote and what they want. *Brief*: worth knowing, listed in the next brief at `brief_times`. *Skip*: marketing and noise. Adjust `mail_criteria` in plain language. Message notifications from LinkedIn and similar services count as mail from that person.
 - **Replies go back to their conversation.** When someone answers mail you sent from a Hermes session, the reply opens a new session ("↩ <title>") carrying that conversation's context; the earlier conversation is never written to or unarchived.
 - **Third-party mail runs read-only.** Both cases say what arrived, with context from reads: calendar list, Gmail search/get, Todoist list/view, past sessions, skills. Every other tool call and every terminal command that is not one plain read (no pipes, redirects or substitutions) is refused. No draft; drafting happens when you reply in the session, with full tools. Nothing is sent or changed.

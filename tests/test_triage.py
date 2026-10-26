@@ -162,6 +162,17 @@ def test_unanswered_mail_is_kept_for_a_retry_not_recorded(store, config):
     assert [tuple(row) for row in rows] == [("M1", "skip")]
 
 
+def test_brief_times_per_weekday():
+    times = {"mon-fri": ["06:00", "10:00", "14:00", "18:00"], "sat-sun": ["08:00"]}
+    # Saturday 07:00: the last slot is Friday 18:00; Saturday 09:00: the weekend morning one.
+    assert triage.current_slot(times, dt.datetime(2026, 10, 31, 7, 0)) == "2026-10-30 18:00"
+    assert triage.current_slot(times, dt.datetime(2026, 10, 31, 9, 0)) == "2026-10-31 08:00"
+    # Monday 05:00 still points at Sunday 08:00; Monday 11:00 at 10:00.
+    assert triage.current_slot(times, dt.datetime(2026, 11, 2, 5, 0)) == "2026-11-01 08:00"
+    assert triage.current_slot(times, dt.datetime(2026, 11, 2, 11, 0)) == "2026-11-02 10:00"
+    assert triage.times_on({"sat": ["08:00"]}, dt.date(2026, 11, 2)) == []
+
+
 def test_brief_slots(store, config):
     hermes = Fake(replies=[[{"i": 0, "decision": "brief", "reason": "", "summary": "Faktura OVH"}]])
     triage.triage_mail(store, config, hermes, "gmail", "me@example.test", [mail("M2", "T2")])
