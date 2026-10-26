@@ -145,3 +145,20 @@ def test_polled_on_its_own_interval():
 
 def test_sorter_reads_linear_with_the_other_message_sources():
     assert "linear" in cli.MAIL_LIKE and triage.deny_profile({"kind": "linear"}) == "research"
+
+
+def test_closed_tickets_and_others_comments_without_mention_stay_out(store):
+    api = FakeApi([])
+    store.set_meta(*linear_with(api, NOW).inbox({}, store)[1:])
+    done = note("done", NOW + 10, kind="issueStatusChanged", comment=None)
+    done["issue"]["state"] = {"name": "Done", "type": "completed"}
+    unblocked = note("unblocked", NOW + 11, kind="issueUnblocked", comment=None)
+    unblocked["issue"]["state"] = {"name": "Todo", "type": "unstarted"}
+    others = note("others", NOW + 12, comment="@niklas can you look?")
+    others["issue"]["assignee"] = {"displayName": "niklas"}
+    pinged = note("pinged", NOW + 13, comment="cc: @Lucas")
+    pinged["issue"]["assignee"] = {"displayName": "niklas"}
+    api.items += [done, unblocked, others, pinged, note("qa", NOW + 14, comment="QA FAIL: Req2")]
+    candidates, _, _ = linear_with(api, NOW + 60).inbox({}, store)
+    assert [c["id"] for c in candidates] == ["unblocked", "pinged", "qa"]
+    assert candidates[1]["mentions_me"] and not candidates[1]["mine"] and candidates[2]["mine"]

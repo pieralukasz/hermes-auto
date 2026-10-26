@@ -90,15 +90,17 @@ DEFAULTS = {
         "zmiany w wątkach, w których nikt na niego nie czeka."),
     "linear_criteria": (
         "Powiadomienia z Lineara Łukasza: Tap In (workspace tapinlive, praca). Pracuje w zespole WEB; QA robi "
-        "Szymon (To QA -> Done albo To Fix z tabelą QA PASS/FAIL), Jakub ustawia priorytety i przypisuje.\n"
-        "session: ktoś przypisał mu ticket (issueAssignedToYou), oznaczył go (issueMention, issueCommentMention), "
-        "zadał mu pytanie lub prosi o coś w komentarzu do jego ticketu albo w wątku, w którym uczestniczy; QA "
-        "zwróciło jego ticket (To Fix, QA FAIL lub PARTIAL); jego ticket dostał termin albo blokuje innych.\n"
-        "brief: zmiana stanu bez prośby do niego (Done, To QA, In Progress z automatu GitHuba), QA PASS, "
-        "odblokowanie ticketu (issueUnblocked), komentarz do innej osoby albo informacja bez pytania do niego, "
-        "zmiany w dokumentach i opisach projektów.\n"
-        "skip: przypomnienia i podsumowania od Lineara bez treści od ludzi, reakcje emoji, zmiany wywołane "
-        "przez niego samego, subskrypcje bez treści."),
+        "Szymon (werdykt w komentarzu: QA PASS, FAIL albo PARTIAL), Jakub ustawia priorytety i przypisuje. "
+        "mine = ticket przypisany do niego, mentions_me = komentarz go oznacza. Zamknięte tickety i cudze "
+        "komentarze bez oznaczenia są odfiltrowane wcześniej.\n"
+        "session: przypisanie do niego (issueAssignedToYou), ustawienie pilnego priorytetu (issuePriorityUrgent), "
+        "oznaczenie go (issueMention, issueCommentMention, mentions_me); na jego tickecie werdykt QA FAIL lub "
+        "PARTIAL albo pytanie lub prośba do niego.\n"
+        "brief: odblokowany ticket (issueUnblocked), zmiany dokumentów i opisów projektów, komentarz do projektu, "
+        "subskrypcja ticketu lub dokumentu (np. „MCP subscribed you”), odpięcie od ticketu "
+        "(issueUnassignedFromYou), komentarz na jego tickecie z informacją bez pytania do niego.\n"
+        "skip: werdykt QA PASS bez uwag do poprawy (zamknięcie ticketu wystarczy), podziękowania, „ok”, "
+        "komentarze bez treści dla niego."),
     "todoist": {
         "enabled": True,
         # False: decide and report only (no moves, labels or runs).
@@ -285,7 +287,8 @@ def classify_batch(hermes, config, items, route):
             'tablicą JSON: [{"i": 0, "decision": "session|brief|skip", "reason": "krótko po polsku", '
             '"summary": "jedno zdanie po polsku: kto, co, czego chce"}].')
         user = json.dumps([{"i": index, "from": item.get("from"), "bot": bool(item.get("bot")),
-                            "where": item.get("place"), "type": item.get("type"),
+                            "where": item.get("place"), "type": item.get("type"), "mine": bool(item.get("mine")),
+                            "mentions_me": bool(item.get("mentions_me")),
                             "text": str(item.get("body") or "")[:3000]} for index, item in enumerate(items)],
                           ensure_ascii=False)
         return parse_decisions(hermes.classify(system, user, max_tokens=300 + 200 * len(items), **route), items)

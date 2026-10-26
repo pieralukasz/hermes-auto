@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import subprocess
 import time
 
@@ -19,7 +20,7 @@ PAGE = 100
 BACKLOG = "source_backlog:linear"
 
 FIELDS = """id type createdAt readAt title subtitle url isLinearActor botActor { name } actor { displayName }
-      ... on IssueNotification { issue { id identifier title url priorityLabel state { name } team { key }
+      ... on IssueNotification { issue { id identifier title url priorityLabel state { name type } team { key }
         assignee { displayName } project { name } description } comment { body user { displayName } }
         parentComment { body user { displayName } } }
       ... on ProjectNotification { project { id name } }
@@ -64,6 +65,32 @@ def text(value, limit):
     return str(value or "").strip()[:limit]
 
 
+CLOSED = ("completed", "canceled")
+
+
+def mine(me, node):
+    return ((node.get("issue") or {}).get("assignee") or {}).get("displayName") == me
+
+
+def mentions(me, node):
+    body = str((node.get("comment") or {}).get("body") or "")
+    return bool(me) and re.search(rf"@{re.escape(me)}\b", body, re.IGNORECASE) is not None
+
+
+def noise(settings, me, node):
+    """Left out before the sorter: Linear's own reminders, tickets already closed (the "Done" notice, an
+    unblock of a done ticket) and, with `only_my_comments`, comments on other people's tickets that do not
+    mention the user (a mention also arrives as its own notification)."""
+    kind = node.get("type")
+    if kind in settings.get("skip_types", []):
+        return True
+    state = ((node.get("issue") or {}).get("state") or {}).get("type")
+    if settings.get("skip_closed") and kind in ("issueStatusChanged", "issueUnblocked") and state in CLOSED:
+        return True
+    return bool(settings.get("only_my_comments") and kind == "issueNewComment" and not mine(me, node)
+                and not mentions(me, node))
+
+
 class Linear:
     def __init__(self, settings, api=None, now=None):
         self.settings = settings
@@ -92,7 +119,6 @@ class Linear:
                 return [], "triage_cursor:linear", {"since": now, "start": now, "handed": {}}
         since = float(cursor["since"])
         handed = dict(cursor.get("handed", {}))
-        skip = set(self.settings.get("skip_types", []))
         viewer, nodes = self.notifications(since - OVERLAP_SECONDS)
         me = viewer.get("displayName", "")
         fresh = []
@@ -100,7 +126,7 @@ class Linear:
             created = stamp(node["createdAt"])
             if created <= float(cursor.get("start", 0)) or node["id"] in handed:
                 continue
-            if node.get("type") in skip:
+            if noise(self.settings, me, node):
                 handed[node["id"]] = created
                 continue
             fresh.append((created, node))
@@ -150,7 +176,7 @@ class Linear:
             "read": bool(self.settings.get("skip_read") and node.get("readAt")),
             "from": actor or "Linear", "bot": bool(node.get("isLinearActor") or node.get("botActor")), "to": me,
             "subject": f"Linear: {place} {title}".strip()[:180], "place": place, "why": node.get("type", ""),
-            "type": node.get("type", ""), "org": org, "team": (issue.get("team") or {}).get("key", ""),
+            "type": node.get("type", ""), "org": org, "mine": mine(me, node), "mentions_me": mentions(me, node), "team": (issue.get("team") or {}).get("key", ""),
             "date": time.strftime("%Y-%m-%d %H:%M", time.localtime(created)),
             "body": "\n".join(lines)[:20000], "url": issue.get("url") or node.get("url") or "",
             "snippet": text(node.get("subtitle") or title, 300), "sent": [],
@@ -164,6 +190,10 @@ class Source:
                 # Reminders and digests Linear sends to everyone: never a conversation.
                 "skip_types": ["projectUpdatePrompt", "feedSummaryGenerated", "issueCommentReaction",
                                "issueReaction", "issueEmojiReaction"],
+                # A ticket marked done or canceled (and an unblock of one) is not worth a word.
+                "skip_closed": True,
+                # Comments on other people's tickets only when they mention the user.
+                "only_my_comments": True,
                 # true: a notification already read in Linear opens nothing.
                 "skip_read": False,
                 # Linear has no push for a member's inbox: check this often (seconds; 0 = only full checks).
