@@ -248,18 +248,29 @@ def test_slack_brief_section(store, config):
     assert "## Slack (1)" in text and "Chris dał znać" in text and "## Poczta" not in text
 
 
-def test_slack_items_skip_the_waiting_check(store, config, monkeypatch):
+def test_slack_messages_reach_the_waiting_check_but_private_channels_do_not(store, config, monkeypatch):
     seen = {}
+    dm = slack_item()
+    private = slack_item("G1:@2.0", "G1", channel="G1", place="#tajny", private=True, redacted=True, dm=False,
+                         why="mention", snippet="", body="Wiadomość w prywatnym kanale.")
 
     class Adapter:
         def inbox(self, config, store, limit=40, since_ms=None):
-            return [slack_item()], "k", {"since": 1}
+            return [dm, private], "k", {"since": 1}
 
+    class Todoist:
+        def inbox_tasks(self, settings):
+            return []
+
+    monkeypatch.setattr(triage, "triage_todoist", lambda *a, **k: None)
+    monkeypatch.setattr(triage, "propose_agent_tasks", lambda *a, **k: None)
     monkeypatch.setattr(triage, "check_waiting", lambda s, c, h, a, mails: seen.setdefault("mails", mails))
-    fake = Fake(replies=[[{"i": 0, "decision": "skip", "reason": "", "summary": ""}]])
-    config["sources"]["todoist"] = {"enabled": False}
-    errors, _ = run_triage(config, store, lambda: fake, {"slack": Adapter}, only=["slack"])
-    assert errors == [] and seen == {}
+    fake = Fake(replies=[[{"i": 0, "decision": "skip", "reason": "", "summary": ""},
+                          {"i": 1, "decision": "skip", "reason": "", "summary": ""}]])
+    config["sources"]["todoist"] = {"enabled": True}
+    errors, _ = run_triage(config, store, lambda: fake, {"slack": Adapter, "todoist": Todoist}, only=["slack"])
+    assert errors == []
+    assert [item["id"] for item in seen["mails"]] == [dm["id"]]
 
 
 def test_fast_sources_follow_their_own_interval(store, config):
@@ -498,3 +509,20 @@ def test_watched_channel_session_prompt_says_where(store, config):
     assert "why=channel" in system and user[0]["why"] == "channel"
     prompt = prompt_for(store.rows()[0], config)
     assert "obserwowanym kanale #bugs-and-suggestions" in prompt and "NIGDY sam nie odpowiadaj" in prompt
+
+
+def test_session_prompts_look_up_the_related_todoist_task_and_the_command_is_allowed(config):
+    github = {"kind": "github", "id": "1@x", "from": "jakub", "place": "acme/web#4238", "date": "2026-10-26",
+              "url": "https://github.com/acme/web/pull/4238", "body": "Approved", "why": "author"}
+    mail = {"from": "anna@example.test", "to": "me@example.test", "subject": "Faktura", "date": "2026-10-26",
+            "body": "W załączniku."}
+    for prompt in (triage.mail_session_prompt(slack_item(), "", config),
+                   triage.mail_session_prompt(github, "", config),
+                   triage.mail_session_prompt(mail, "", config)):
+        assert "td task list --filter 'search: <fraza>' --json" in prompt
+    private = slack_item(redacted=True, private=True, dm=False, why="mention")
+    assert "search:" not in triage.mail_session_prompt(private, "", config)
+    command = "td task list --filter 'search: 4238' --json"
+    assert read_only_command(command) is True
+    assert read_only_command(command, "slack") is True
+    assert read_only_command(command, "private") is False

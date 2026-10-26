@@ -67,8 +67,8 @@ def run_triage(config, store, bridge, installed, blocked=(), only=None):
             if candidates:
                 account = candidates[0].get("account", "")
                 report = triage.triage_mail(store, config, bridge(), name, account, candidates, key, cursor)
-                # Slack text never goes to Todoist comments (waiting check): DM content stays in sessions.
-                new_mail += [item for _, item, _ in report or [] if item.get("kind") != "slack"]
+                # Private-channel Slack items carry no content (redacted) and stay out of the waiting check.
+                new_mail += [item for _, item, _ in report or [] if not item.get("redacted")]
             else:
                 store.set_meta(key, cursor)
         except Exception as exc:
