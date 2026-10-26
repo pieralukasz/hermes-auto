@@ -102,3 +102,35 @@ def test_classify_route_reads_provider_key_from_hermes_env(tmp_path):
         server.shutdown()
     assert result == {"ok": True}
     assert seen and all("synthetic-work-key" in header for header in seen)
+
+
+@pytest.mark.skipif(not os.environ.get("HERMES_AUTO_TEST_PYTHON"), reason="local Hermes runtime not configured")
+def test_routed_session_row_records_its_provider(tmp_path):
+    """Desktop resumes a session on `model_config.provider`: a routed job's row must carry the route's provider,
+    or a reply in a work-account session runs on the profile's default account."""
+    import sqlite3
+
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    config = {**defaults(), "hermes_home": str(hermes_home),
+              "hermes_python": os.environ["HERMES_AUTO_TEST_PYTHON"],
+              "hermes_source": os.environ["HERMES_AUTO_TEST_SOURCE"],
+              "routes": [{"match": {"source": "example", "owner": "acme"}, "provider": "work-test"}]}
+    store = Store(tmp_path, initialize=True)
+    try:
+        store.enqueue("routed", "example", "r", "Routed", "open", {"owner": "acme"})
+        store.enqueue("plain", "example", "p", "Plain", "open", {"owner": "other"})
+        store.db.commit()
+        routed, plain = store.rows()
+        hermes = Hermes(config, tmp_path)
+        hermes.create(routed, "Synthetic test context")
+        hermes.create(plain, "Synthetic test context")
+    finally:
+        store.close()
+    db = sqlite3.connect(hermes_home / "state.db")
+    try:
+        stored = dict(db.execute("SELECT id, json_extract(model_config, '$.provider') FROM sessions").fetchall())
+    finally:
+        db.close()
+    assert stored[routed["session_id"]] == "work-test"
+    assert stored[plain["session_id"]] is None

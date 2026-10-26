@@ -408,6 +408,20 @@ def route_kwargs(request):
     return {key: route[key] for key in ("provider", "model") if route.get(key)}
 
 
+def pin_route(db, sid, session, request):
+    """Record a routed job's provider on its session row: Desktop resumes a session on `model_config.provider`,
+    else on the profile default, so a reply in a work-account session would run on the personal account.
+    The row is created here, before the agent, so the agent never writes its own route."""
+    provider = route_kwargs(request).get("provider")
+    stored = (session or {}).get("model_config") or "{}"
+    try:
+        stored = json.loads(stored) if isinstance(stored, str) else dict(stored)
+    except (TypeError, ValueError):
+        stored = {}
+    if provider and not stored.get("provider"):
+        db.patch_session_model_config(sid, {"provider": provider})
+
+
 def classify(config, request):
     from agent.auxiliary_client import call_llm
     triage = config.get("triage", {})
@@ -739,6 +753,7 @@ def main():
         if request.get("hidden"):
             # Listed in the Desktop "Auto" page instead of the main Sessions list.
             db.set_session_hidden(sid, True)
+        pin_route(db, sid, session, request)
         if job["mode"] == "open" and not db.get_messages(sid):
             db.append_message(sid, "user", content=request["prompt"])
             db.append_message(sid, "assistant", content=request["open_message"])
@@ -747,6 +762,7 @@ def main():
         return
     if action != "run" or session is None:
         raise RuntimeError("Target session is missing; it will not be recreated")
+    pin_route(db, sid, session, request)
     db.close()
     from run_agent import AIAgent
     import cli

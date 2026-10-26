@@ -238,7 +238,8 @@ class Hermes:
             if self.config["language"].lower() in ("polish", "polski", "pl") else
             "This session is ready. Automatic preparation is disabled; continue when you are ready.")
         hidden = bool(self.config.get("triage", {}).get("hide_sessions", False))
-        return self.invoke("create", job, title=title, prompt=prompt, open_message=message, hidden=hidden)
+        return self.invoke("create", job, title=title, prompt=prompt, open_message=message, hidden=hidden,
+                           route=job_route(job, self.config))
 
     def run(self, job, prompt):
         deny = deny_mode(job)
