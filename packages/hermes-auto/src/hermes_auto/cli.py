@@ -64,9 +64,16 @@ def run_triage(config, store, bridge, installed, blocked=(), only=None):
             continue
         try:
             candidates, key, cursor = source().inbox(config, store, limit=options["max_mail_per_run"])
-            if candidates:
-                account = candidates[0].get("account", "")
-                report = triage.triage_mail(store, config, bridge(), name, account, candidates, key, cursor)
+            # Items kept after a route's classifier failed are retried even when the source has nothing new.
+            accounts = [candidates[0].get("account", "")] if candidates else triage.pending_accounts(store, name)
+            if accounts:
+                try:
+                    report = triage.triage_mail(store, config, bridge(), name, accounts[0], candidates, key, cursor)
+                except triage.RoutesPending as pending:
+                    # The rest of the batch is recorded; "sorter <name>" is not a read failure, so the source
+                    # is not throttled and the other routes' next items are not held back.
+                    report = pending.report
+                    errors.append(f"sorter {name}: {pending}")
                 # Private-channel Slack items carry no content (redacted) and stay out of the waiting check.
                 new_mail += [item for _, item, _ in report or [] if not item.get("redacted")]
             else:
@@ -203,7 +210,10 @@ RETRY_FIRST_SECONDS, RETRY_MAX_SECONDS = 60, 1800
 
 
 def source_failed(error):
-    """The source an error line belongs to ("gmail: ...", "triage gmail: ...", "waiting todoist: ..."), if any."""
+    """The source an error line belongs to ("gmail: ...", "triage gmail: ...", "waiting todoist: ..."), if any.
+
+    "sorter <name>: ..." (a model route failed to classify) is deliberately not a source failure: its items
+    wait with their own retry delay (`triage.pending_due`) while the source keeps being read."""
     head = error.split(":", 1)[0].split()
     if len(head) == 1:
         return head[0]
@@ -232,7 +242,9 @@ def settle_checked(store, checked, read_errors, started):
 def fast_sources(config, store, now=None):
     """Sources due between the regular checks: the adapter's `due` (listener nudge, own interval, wake),
     or a backlog the source left last time (`source_backlog:<name>`). A source that failed waits out
-    its retry delay (`source_retry:<name>`)."""
+    its retry delay (`source_retry:<name>`). Items a model route failed to classify make it due once their
+    retry delay passed (`triage_pending:<name>:*`)."""
+    from .triage import pending_due
     now = time.time() if now is None else now
     installed = sources()
     due = []
@@ -242,7 +254,7 @@ def fast_sources(config, store, now=None):
         retry = store.get_meta(f"source_retry:{name}", None)
         if retry and now < float(retry.get("next_at", 0)):
             continue
-        if store.get_meta(f"source_backlog:{name}", False):
+        if store.get_meta(f"source_backlog:{name}", False) or pending_due(store, name, now):
             due.append(name)
             continue
         last = store.get_meta(f"last_poll:{name}", 0)
@@ -404,9 +416,16 @@ def dispatch(args, home, config, store):
             task = state.get("task") or json.loads(row["payload"] or "{}")
             issues.append({"item_id": row["item_id"], "decision": row["decision"], "content": task.get("content", ""),
                            "attempts": state.get("attempts", 0), "error": state.get("error", "")})
+        # Items whose model route failed to classify, waiting for a retry (not lost, not marked read).
+        waiting = [{"source": key.split(":", 2)[1], "account": key.split(":", 2)[2], "items": len(state["items"]),
+                    "attempts": state.get("attempts", 0), "error": state.get("error", ""),
+                    "next_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(state.get("next_at", 0)))}
+                   for key, state in ((row[0], json.loads(row[1])) for row in store.db.execute(
+                       "SELECT key, value FROM meta WHERE key GLOB 'triage_pending:*'"))]
         print(json.dumps({"paused": store.get_meta("paused", False),
                           "source_errors": store.get_meta("source_errors", []), "jobs": jobs,
-                          "followups": followups, "triage_issues": issues}, indent=2, ensure_ascii=False))
+                          "followups": followups, "triage_issues": issues, "triage_pending": waiting},
+                         indent=2, ensure_ascii=False))
     elif command in ("pause", "resume"):
         store.set_meta("paused", command == "pause")
         print(command + "d")

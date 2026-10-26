@@ -14,6 +14,7 @@ import datetime as dt
 import json
 import re
 import secrets
+import time
 import uuid
 from email.utils import parseaddr
 
@@ -25,6 +26,9 @@ INTERNAL_SOURCES = ("brief", "questions", "proposals", "unblocked")
 PRIORITIES = ("p1", "p2", "p3", "p4")
 # The sorter never assigns p4: an undated p4 task lands back in "Do organizacji", so it would loop.
 ASSIGNABLE_PRIORITIES = ("p1", "p2", "p3")
+# Items whose model route failed to classify wait in `triage_pending:<source>:<account>` and are retried
+# after this growing delay (sooner when a new item on the same route is classified anyway).
+PENDING_RETRY_FIRST_SECONDS, PENDING_RETRY_MAX_SECONDS = 60, 1800
 
 DEFAULTS = {
     "enabled": False,
@@ -205,22 +209,44 @@ def deny_profile(item):
     return "research" if item.get("kind") in RESEARCH_KINDS else True
 
 
+def route_key(config, item):
+    return json.dumps(model_route(config, item.get("kind", ""), item), sort_keys=True)
+
+
+def classify_routes(hermes, config, items):
+    """Classify each model route's items in its own call: ({index: verdict}, [(route, indexes, error)]).
+
+    A work organisation's items run on its own account, the rest on the default one. One account failing
+    (e.g. rate limited) leaves the other groups' decisions intact; the caller keeps the failed items.
+    """
+    groups = {}
+    for index, item in enumerate(items):
+        groups.setdefault(route_key(config, item), []).append(index)
+    decisions, failed = {}, []
+    for key, indexes in groups.items():
+        route = json.loads(key)
+        try:
+            part = classify_batch(hermes, config, [items[index] for index in indexes], route)
+        except Exception as exc:  # noqa: BLE001 - reported by the caller, the items stay pending
+            failed.append((route, indexes, exc))
+            continue
+        decisions.update({indexes[local]: verdict for local, verdict in part.items()})
+    return decisions, failed
+
+
 def classify_mail(hermes, config, items):
-    """{index: {decision, reason, summary}} for each item; unknown decisions fall back to `brief`."""
-    if not items:
-        return {}
-    routes = [model_route(config, item.get("kind", ""), item) for item in items]
-    if any(route != routes[0] for route in routes):
-        # A work organisation's items are classified on its own account, the rest on the default one.
-        groups = {}
-        for index, route in enumerate(routes):
-            groups.setdefault(json.dumps(route, sort_keys=True), []).append(index)
-        decisions = {}
-        for indexes in groups.values():
-            part = classify_mail(hermes, config, [items[index] for index in indexes])
-            decisions.update({indexes[local]: verdict for local, verdict in part.items()})
-        return decisions
-    route = {"route": routes[0]} if routes[0] else {}
+    """{index: {decision, reason, summary}} for each item; unknown decisions fall back to `brief`.
+
+    Raises the first route group's error; `triage_mail` uses `classify_routes` to keep the rest."""
+    decisions, failed = classify_routes(hermes, config, items)
+    if failed:
+        raise failed[0][2]
+    return decisions
+
+
+def classify_batch(hermes, config, items, route):
+    """One classifier call for items that share a model route."""
+    route = {"route": route} if route else {}
     triage = settings(config)
     if all(is_github(item) for item in items):
         system = (
@@ -479,19 +505,85 @@ def conversation_id(item):
     return item.get("thread_id", "")
 
 
+class RoutesPending(RuntimeError):
+    """A route's classifier failed. Everything else in the batch was recorded with the source cursor; the
+    failed items wait in `triage_pending:<source>:<account>`. `report` is what this batch did decide."""
+
+    def __init__(self, message, report):
+        super().__init__(message)
+        self.report = report
+
+
+def pending_key(source, account):
+    return f"triage_pending:{source}:{account}"
+
+
+def pending_accounts(store, source):
+    """Accounts of `source` with items waiting for a classifier retry."""
+    rows = store.db.execute("SELECT key FROM meta WHERE key GLOB ?", (pending_key(source, "*"),))
+    return [key.split(":", 2)[2] for (key,) in rows]
+
+
+def pending_due(store, source, now):
+    """True when a waiting item of `source` is due for its classifier retry."""
+    rows = store.db.execute("SELECT value FROM meta WHERE key GLOB ?", (pending_key(source, "*"),))
+    return any(now >= float(json.loads(value).get("next_at", 0)) for (value,) in rows)
+
+
+def take_pending(store, config, source, account, candidates, now):
+    """(items to retry with this batch, items still waiting). Due items retry; earlier, an item retries only
+    alongside a new item on its route (that call runs anyway). The source may hand an item again: its copy wins."""
+    pending = store.get_meta(pending_key(source, account), None) or {}
+    offered = {item["id"] for item in candidates}
+    waiting = [item for item in pending.get("items", []) if item["id"] not in offered]
+    if now < float(pending.get("next_at", 0)):
+        live = {route_key(config, item) for item in candidates}
+        retry = [item for item in waiting if route_key(config, item) in live]
+    else:
+        retry = waiting
+    retry = retry[:settings(config)["max_mail_per_run"]]
+    chosen = {item["id"] for item in retry}
+    return retry, [item for item in waiting if item["id"] not in chosen]
+
+
+def save_pending(store, source, account, held, failed, failed_items, now):
+    """Rewrite the waiting list inside the batch's transaction (the cursor moves past these items)."""
+    key = pending_key(source, account)
+    pending = store.get_meta(key, None) or {}
+    items = held + failed_items
+    if not items:
+        store.db.execute("DELETE FROM meta WHERE key=?", (key,))
+        return
+    state = {**pending, "items": items}
+    if failed:
+        attempts = int(pending.get("attempts", 0)) + 1
+        state.update(attempts=attempts, error=failed_message(failed),
+                     next_at=now + min(PENDING_RETRY_FIRST_SECONDS * 2 ** (attempts - 1), PENDING_RETRY_MAX_SECONDS))
+    store.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, json.dumps(state, ensure_ascii=False)))
+
+
+def failed_message(failed):
+    return "; ".join(f"{len(indexes)} item(s) on {json.dumps(route) if route else 'the default route'}: "
+                     f"{one_line(str(error), 300)}" for route, indexes, error in failed)
+
+
 def watched(store, source, account, thread_id):
     row = store.db.execute("SELECT active FROM watched_streams WHERE account=? AND stream_id=?",
                            (f"{source}:{account}", thread_id)).fetchone()
     return bool(row and row["active"])
 
 
-def triage_mail(store, config, hermes, source, account, candidates, cursor_key=None, cursor=None):
+def triage_mail(store, config, hermes, source, account, candidates, cursor_key=None, cursor=None, now=None):
     """Record a decision for every new candidate; advance the cursor in the same commit.
 
-    Returns a list of (decision, item, detail) for reporting.
+    Returns a list of (decision, item, detail) for reporting. Items of a model route whose classifier
+    failed are kept for a retry (`take_pending`) and the call raises `RoutesPending` after the commit.
     """
     identity = f"{source}:{account}"
     triage_options = settings(config)
+    now = time.time() if now is None else now
+    retry, held = take_pending(store, config, source, account, candidates, now)
+    candidates = retry + list(candidates)
     new = [item for item in candidates
            if not store.db.execute("SELECT 1 FROM triage_items WHERE account=? AND item_id=?",
                                    (identity, item["id"])).fetchone()
@@ -511,7 +603,8 @@ def triage_mail(store, config, hermes, source, account, candidates, cursor_key=N
             routed.append((item, session))
         else:
             unknown.append(item)
-    decisions = classify_mail(hermes, config, unknown)
+    decisions, failed = classify_routes(hermes, config, unknown)
+    failed_items = [unknown[index] for _, indexes, _ in failed for index in indexes]
     report = []
 
     def follow(item, session):
@@ -553,7 +646,9 @@ def triage_mail(store, config, hermes, source, account, candidates, cursor_key=N
         for item, session in routed:
             follow(item, session)
         for index, item in enumerate(unknown):
-            verdict = decisions[index]
+            verdict = decisions.get(index)
+            if verdict is None:
+                continue  # its route failed: kept in the waiting list below, not recorded or marked read
             if verdict["decision"] == "session":
                 row = store.db.execute("SELECT value FROM meta WHERE key=?",
                                        (thread_key(source, account, conversation_id(item)),)).fetchone()
@@ -577,8 +672,11 @@ def triage_mail(store, config, hermes, source, account, candidates, cursor_key=N
                               verdict["summary"], json.dumps(item, ensure_ascii=False),
                               int(verdict["decision"] != "brief")))
             report.append((verdict["decision"], item, verdict))
+        save_pending(store, source, account, held, failed, failed_items, now)
         if cursor_key:
             store.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (cursor_key, json.dumps(cursor)))
+    if failed:
+        raise RoutesPending(f"kept {len(failed_items)} item(s) for a retry: {failed_message(failed)}", report)
     return report
 
 

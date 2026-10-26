@@ -150,12 +150,16 @@ def test_followup_for_deleted_session_becomes_new_mail_session(store, config):
     assert [job["external_id"] for job in store.rows()] == ["M1"]
 
 
-def test_unanswered_mail_aborts_without_advancing_cursor(store, config):
-    hermes = Fake(replies=[[]])
+def test_unanswered_mail_is_kept_for_a_retry_not_recorded(store, config):
+    # The cursor moves on; the mail waits in the sorter's own list instead, so it is never lost or marked read.
+    hermes = Fake(replies=[[], [{"i": 0, "decision": "skip", "reason": "", "summary": ""}]])
     with pytest.raises(RuntimeError):
         triage.triage_mail(store, config, hermes, "gmail", "me@example.test", [mail("M1")], "cursor", 5)
-    assert store.get_meta("cursor") is None
     assert store.db.execute("SELECT COUNT(*) FROM triage_items").fetchone()[0] == 0
+    assert store.db.execute("SELECT COUNT(*) FROM read_marks").fetchone()[0] == 0
+    triage.triage_mail(store, config, hermes, "gmail", "me@example.test", [], "cursor", 6, now=4e9)
+    rows = store.db.execute("SELECT item_id, decision FROM triage_items")
+    assert [tuple(row) for row in rows] == [("M1", "skip")]
 
 
 def test_brief_slots(store, config):
