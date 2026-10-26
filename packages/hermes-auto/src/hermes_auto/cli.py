@@ -17,7 +17,7 @@ from .runner import process_jobs
 from .store import Store, locked
 
 
-MAIL_LIKE = ("gmail", "proton", "slack", "github")
+MAIL_LIKE = ("gmail", "proton", "slack", "github", "linear")
 
 
 def poll(config, store, only=None):

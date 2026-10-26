@@ -1,5 +1,5 @@
 [tool.pytest.ini_options]
-pythonpath = ["packages/hermes-auto/src", "packages/hermes-auto-todoist/src", "packages/hermes-auto-gmail/src", "packages/hermes-auto-proton/src", "packages/hermes-auto-slack/src", "packages/hermes-auto-github/src"]
+pythonpath = ["packages/hermes-auto/src", "packages/hermes-auto-todoist/src", "packages/hermes-auto-gmail/src", "packages/hermes-auto-proton/src", "packages/hermes-auto-slack/src", "packages/hermes-auto-github/src", "packages/hermes-auto-linear/src"]
 testpaths = ["tests"]
 [tool.ruff]
 line-length = 110
