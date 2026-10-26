@@ -297,6 +297,7 @@ def test_bridge_inspect_reports_owner_and_delivery(tmp_path, monkeypatch, capsys
     (source / "hermes_cli" / "__init__.py").write_text("")
     (source / "hermes_cli" / "active_sessions.py").write_text(
         "def active_session_registry_snapshot():\n    return [{'session_id': 'S1', 'surface': 'desktop'}]\n")
+    (source / "hermes_cli" / "env_loader.py").write_text("def load_hermes_dotenv(**kwargs):\n    return []\n")
     (source / "hermes_state_registry.py").write_text(
         "class DB:\n"
         "    def get_session(self, sid):\n        return {'message_count': 3, 'archived': 0, 'last_activity_at': 1.0}\n"
@@ -310,13 +311,15 @@ def test_bridge_inspect_reports_owner_and_delivery(tmp_path, monkeypatch, capsys
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(sys, "argv", ["bridge", str(request)])
     monkeypatch.setattr(sys, "path", list(sys.path))
-    for name in ("hermes_bootstrap", "hermes_state_registry", "hermes_cli", "hermes_cli.active_sessions"):
+    for name in ("hermes_bootstrap", "hermes_state_registry", "hermes_cli", "hermes_cli.active_sessions",
+                 "hermes_cli.env_loader"):
         monkeypatch.delitem(sys.modules, name, raising=False)
     monkeypatch.setattr(bridge, "reply_delivered", lambda path, ids, needles: False)
     try:
         bridge.main()
     finally:
-        for name in ("hermes_bootstrap", "hermes_state_registry", "hermes_cli", "hermes_cli.active_sessions"):
+        for name in ("hermes_bootstrap", "hermes_state_registry", "hermes_cli", "hermes_cli.active_sessions",
+                 "hermes_cli.env_loader"):
             sys.modules.pop(name, None)
     info = json.loads(capsys.readouterr().out)
     assert info["owned_by"] == "desktop" and info["delivered"] is False and info["messages"] == 3

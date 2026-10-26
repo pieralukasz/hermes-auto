@@ -1,5 +1,8 @@
 """Opt-in contract check with installed Hermes, no network and no model calls."""
+import http.server
+import json
 import os
+import threading
 
 import pytest
 
@@ -40,3 +43,62 @@ def test_real_session_api_two_profiles(tmp_path):
         finally:
             store.close()
     assert ids[0] == ids[2] and ids[0] != ids[1]
+
+
+@pytest.mark.skipif(not os.environ.get("HERMES_AUTO_TEST_PYTHON"), reason="local Hermes runtime not configured")
+def test_classify_route_reads_provider_key_from_hermes_env(tmp_path):
+    """A routed provider's `key_env` lives in the profile's .env; classify must send it, not a placeholder."""
+    seen = []
+
+    class FakeAnthropic(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers.get("content-length") or 0)) or b"{}")
+            seen.append(self.headers.get("x-api-key") or self.headers.get("authorization") or "")
+            message = {"id": "msg_test", "type": "message", "role": "assistant", "model": "test-model",
+                       "content": [], "stop_reason": None, "stop_sequence": None,
+                       "usage": {"input_tokens": 1, "output_tokens": 1}}
+            text = "{\"ok\": true}"
+            if request.get("stream"):
+                events = [("message_start", {"type": "message_start", "message": message}),
+                          ("content_block_start", {"type": "content_block_start", "index": 0,
+                                                   "content_block": {"type": "text", "text": ""}}),
+                          ("content_block_delta", {"type": "content_block_delta", "index": 0,
+                                                   "delta": {"type": "text_delta", "text": text}}),
+                          ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+                          ("message_delta", {"type": "message_delta", "usage": {"output_tokens": 1},
+                                             "delta": {"stop_reason": "end_turn", "stop_sequence": None}}),
+                          ("message_stop", {"type": "message_stop"})]
+                body = "".join(f"event: {name}\ndata: {json.dumps(data)}\n\n" for name, data in events).encode()
+                kind = "text/event-stream"
+            else:
+                body = json.dumps({**message, "content": [{"type": "text", "text": text}],
+                                   "stop_reason": "end_turn"}).encode()
+                kind = "application/json"
+            self.send_response(200)
+            self.send_header("content-type", kind)
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), FakeAnthropic)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "providers:\n  work-test:\n    name: Work (test)\n"
+        f"    api: http://127.0.0.1:{server.server_port}\n    transport: anthropic_messages\n"
+        "    key_env: HERMES_AUTO_TEST_WORK_KEY\n    default_model: test-model\n    models: [test-model]\n")
+    (hermes_home / ".env").write_text("HERMES_AUTO_TEST_WORK_KEY=synthetic-work-key\n")
+    config = {**defaults(), "hermes_home": str(hermes_home),
+              "hermes_python": os.environ["HERMES_AUTO_TEST_PYTHON"],
+              "hermes_source": os.environ["HERMES_AUTO_TEST_SOURCE"]}
+    try:
+        result = Hermes(config, tmp_path).classify("Reply with JSON.", "Synthetic item",
+                                                   route={"provider": "work-test", "model": "test-model"})
+    finally:
+        server.shutdown()
+    assert result == {"ok": True}
+    assert seen and all("synthetic-work-key" in header for header in seen)

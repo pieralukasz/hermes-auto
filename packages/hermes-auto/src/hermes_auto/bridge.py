@@ -663,6 +663,10 @@ def main():
     sys.path.insert(0, config["hermes_source"])
     import hermes_bootstrap  # noqa: F401
     os.environ["HERMES_HOME"] = config["hermes_home"]
+    # Only run/create import run_agent, which loads the profile's .env; classify calls call_llm directly,
+    # so a routed provider's key_env (e.g. a work account) resolved to the no-key placeholder → 401.
+    from hermes_cli.env_loader import load_hermes_dotenv
+    load_hermes_dotenv(hermes_home=config["hermes_home"])
     from hermes_state_registry import acquire
 
     db = acquire(Path(config["hermes_home"]) / "state.db")
