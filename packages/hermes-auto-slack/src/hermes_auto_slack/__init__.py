@@ -349,6 +349,9 @@ class Slack:
         else:
             last_read = float(info.get("last_read") or 0)
         answered = any(m.get("user") == me and float(m["ts"]) > last_ts for m in messages)
+        # Reading in Slack (e.g. a phone notification) does not settle it: the session still opens
+        # unless `skip_read` is on. Answering there does.
+        seen = bool(self.settings.get("skip_read")) and last_read >= last_ts
         stamp = last["ts"].replace(".", "")
         url = f"{team_url}/archives/{channel_id}/p{stamp}"
         if thread_ts and thread_ts != last["ts"]:
@@ -361,7 +364,7 @@ class Slack:
         return {
             "kind": "slack", "id": f"{channel_id}:{thread_ts or ''}@{last['ts']}",
             "thread_id": f"{channel_id}:{thread_ts or ''}" if not info.get("is_im") or thread_ts else channel_id,
-            "account": identity.get("team_id", ""), "read": bool(last_read >= last_ts or answered),
+            "account": identity.get("team_id", ""), "read": bool(seen or answered),
             "from": ", ".join(senders), "to": "Łukasz", "subject": f"Slack: {', '.join(senders)} · {where}",
             "date": time.strftime("%Y-%m-%d %H:%M", time.localtime(last_ts)), "why": why,
             "channel": channel_id, "thread_ts": thread_ts or "", "ts": last["ts"], "place": where,
@@ -489,6 +492,8 @@ class Source:
                 "mark_token_command": ["security", "find-generic-password", "-s", "hermes-auto-slack-user", "-w"],
                 # A conversation is handed over after nobody wrote for this long.
                 "quiet_seconds": 90,
+                # true: a conversation already read in Slack opens no session (answered ones never do).
+                "skip_read": False,
                 # Threads the user wrote in within this many days are followed.
                 "thread_days": 14,
                 # link_only: private channels give author, place and link only; "full" passes the text.

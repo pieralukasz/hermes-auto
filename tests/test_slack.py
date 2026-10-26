@@ -158,7 +158,7 @@ def test_baseline_ignores_old_messages_and_bots_and_own(store):
     assert candidates == []
 
 
-def test_read_or_answered_in_slack_marks_read(store):
+def test_answered_in_slack_marks_read_but_reading_alone_does_not(store):
     fake = FakeSlack()
     fake.channel("D1", is_im=True, user="UCHRIS", last_read="0")
     fake.channel("D2", is_im=True, user="UOZ", last_read="0")
@@ -168,8 +168,19 @@ def test_read_or_answered_in_slack_marks_read(store):
     fake.post("D2", "UOZ", f"{NOW + 10:.6f}", "pytanie")
     fake.post("D2", ME, f"{NOW + 30:.6f}", "juz odpisalem")
     candidates, _, _ = slack_with(fake, NOW + 300).inbox({}, store)
-    assert {c["thread_id"]: c["read"] for c in candidates} == {"D1": True, "D2": True}
+    assert {c["thread_id"]: c["read"] for c in candidates} == {"D1": False, "D2": True}
     assert key
+
+
+def test_skip_read_treats_read_in_slack_as_seen(store):
+    fake = FakeSlack()
+    fake.channel("D1", is_im=True, user="UCHRIS", last_read="0")
+    baseline(store, fake)
+    fake.post("D1", "UCHRIS", f"{NOW + 10:.6f}", "pytanie")
+    fake.channels["D1"]["last_read"] = f"{NOW + 10:.6f}"
+    slack = Slack({**Source.defaults(), "token_file": "unused", "skip_read": True}, http=fake, now=lambda: NOW + 300)
+    candidates, _, _ = slack.inbox({}, store)
+    assert [c["read"] for c in candidates] == [True]
 
 
 def test_channel_mention_and_followed_thread(store):
@@ -470,11 +481,11 @@ def test_watched_channel_posts_become_separate_candidates(store):
     assert by_text[f"<@{ME}> to chyba twoje"]["why"] == "mention"  # never twice
     store.set_meta(key, cursor)
     assert inbox(NOW + 600)[0] == []  # handed over once
-    # Read in Slack before the sorter got to it: marked read, no session.
+    # Read in Slack before the sorter got to it: still a candidate for a session (`skip_read` is off).
     fake.post("C9", "UOZ", f"{NOW + 700:.6f}", "kolejny bug")
     fake.channels["C9"]["last_read"] = f"{NOW + 700:.6f}"
     candidates, _, _ = inbox(NOW + 1000)
-    assert [c["read"] for c in candidates] == [True]
+    assert [c["read"] for c in candidates] == [False]
 
 
 def test_unwatched_channel_posts_stay_out(store):
