@@ -77,26 +77,42 @@ def test_github_notifications_cut_by_limit_come_next_time(store):
 
 # ── Marking read at the source ───────────────────────────────────────────────
 
-def test_github_never_marks_a_thread_and_says_so(monkeypatch):
-    """PATCH /notifications/threads/{id} reads the whole thread, including updates nobody has shown yet,
-    and no check before it closes that race: the adapter reports every item unsupported instead."""
+class GitHubThreads:
+    """`/notifications/threads/{id}` with GitHub's semantics: PATCH reads the whole thread as of now."""
+
+    def __init__(self, threads):
+        self.threads = threads
+        self.patched = []
+
+    def get(self, url, **params):
+        return self.threads.get(url.rsplit("/", 1)[1])
+
+    def patch(self, url):
+        thread_id = url.rsplit("/", 1)[1]
+        self.patched.append(thread_id)
+        self.threads[thread_id] = {**self.threads[thread_id], "unread": False}
+
+
+def test_github_marks_the_shown_thread_read_but_not_one_updated_since():
     import hermes_auto_github as gh
-    calls, real = [], gh.Http
+    shown = "2026-10-26T10:00:00Z"
+    http = GitHubThreads({"1": {"unread": True, "updated_at": shown},
+                          "2": {"unread": True, "updated_at": "2026-10-26T10:05:00Z"},
+                          "3": {"unread": False, "updated_at": shown}})
+    result = gh.Source().mark_read({"sources": {"github": {}}}, [
+        {"id": f"1@{shown}"}, {"id": f"2@{shown}"}, {"id": f"3@{shown}"}, {"id": f"4@{shown}"}], http=http)
+    assert result == {f"1@{shown}": "done", f"2@{shown}": "unsupported", f"3@{shown}": "done", f"4@{shown}": "done"}
+    assert http.patched == ["1"]  # thread 2 has an update nobody has shown yet; 3 is read; 4 is gone
 
-    class Http:
-        def __init__(self, token):
-            calls.append("token")
 
-        def __getattr__(self, name):
-            calls.append(name)
-            raise AssertionError(name)
-
-    monkeypatch.setattr(gh, "Http", Http)
-    monkeypatch.setattr(gh, "gh_token", lambda command: calls.append("gh") or "t")
-    result = gh.Source().mark_read({"sources": {"github": {}}}, [{"id": "1@a", "thread_id": "1"},
-                                                               {"id": "2@a", "thread_id": "2"}])
-    assert result == {"1@a": "unsupported", "2@a": "unsupported"} and calls == []
-    assert not hasattr(real, "mark_thread_read")  # no thread-wide write left to call by mistake
+def test_github_update_read_by_our_own_mark_still_reaches_the_sorter():
+    """An update landing just before our PATCH is read with the thread; it must not count as read by the user."""
+    import hermes_auto_github as gh
+    race = {"unread": False, "updated_at": "2026-10-26T10:00:00Z", "last_read_at": "2026-10-26T10:00:01Z"}
+    by_user = {**race, "last_read_at": "2026-10-26T10:30:00Z"}
+    assert gh.read_on_github(race) is False
+    assert gh.read_on_github(by_user) is True
+    assert gh.read_on_github({**race, "unread": True}) is False
 
 
 class SlackMarkHttp:

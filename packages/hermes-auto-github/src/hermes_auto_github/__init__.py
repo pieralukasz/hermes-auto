@@ -1,7 +1,7 @@
 """GitHub source for the sorter: the user's notifications (review requests, mentions, comments, CI ...).
 
-Reads `GET /notifications` with the user's `gh` token and never writes: no comments, no reviews, and no
-marking read (GitHub can only mark a whole thread read, which could hide an update nobody has shown yet).
+Reads `GET /notifications` with the user's `gh` token. Its only write marks a notification thread read once
+the session or brief showing it is ready, or at once for skipped noise (`mark_read`); no comments, no reviews.
 Each notification thread is one conversation; a new update in it is a new candidate.
 Notifications the user already read on GitHub are recorded as read, so the sorter opens nothing. Watched
 repositories (`reason: subscribed`) are left out unless configured otherwise.
@@ -15,6 +15,9 @@ import time
 
 API = "https://api.github.com"
 OVERLAP_SECONDS = 300
+# GitHub marks a whole thread read: an update landing between our check and the PATCH is read with it. Such an
+# update is at most seconds older than the thread's `last_read_at`, so it still counts as unread here.
+READ_RACE_SECONDS = 60
 # True while notifications cut off by `limit` remain: push mode polls again soon (see cli.fast_sources).
 BACKLOG = "source_backlog:github"
 
@@ -59,6 +62,19 @@ class Http:
         if not response.ok:
             raise RuntimeError(f"GitHub read failed ({response.status_code}) for {url.split('?')[0]}")
         return response.json()
+
+    def patch(self, url):
+        response = self.session.patch(API + url, timeout=45)
+        if response.status_code not in (200, 205, 304, 404):
+            raise RuntimeError(f"GitHub mark read failed ({response.status_code}) for {url}")
+
+
+def read_on_github(item):
+    """Read by the user on GitHub: not unread, and read clearly after the update (not by our own thread mark)."""
+    if item.get("unread", True):
+        return False
+    last_read = item.get("last_read_at")
+    return not last_read or stamp(last_read) - stamp(item["updated_at"]) >= READ_RACE_SECONDS
 
 
 class GitHub:
@@ -138,7 +154,7 @@ class GitHub:
         return {
             "kind": "github", "id": f"{item['id']}@{item['updated_at']}", "thread_id": item["id"],
             # Read on GitHub, or the latest comment is his own: nothing waits for him.
-            "account": me, "read": not item.get("unread", True) or bool(comment and actor.get("login") == me),
+            "account": me, "read": read_on_github(item) or bool(comment and actor.get("login") == me),
             "from": actor.get("login") or repo, "bot": actor.get("type") == "Bot", "to": me,
             "subject": f"GitHub: {subject.get('title') or repo} · {repo}"[:180],
             "place": repo, "why": item.get("reason", ""), "date": when, "type": subject.get("type", ""),
@@ -178,13 +194,28 @@ class Source:
         settings = {**self.defaults(), **config["sources"]["github"]}
         return GitHub(settings).inbox(config, store, limit=limit, since_ms=since_ms)
 
-    def mark_read(self, config, items):
-        """GitHub notifications stay unread: every item is reported "unsupported".
+    def mark_read(self, config, items, http=None):
+        """Mark each shown notification's thread read; {item id: "done" | "unsupported"}.
 
-        GitHub only marks a whole notification thread read (PATCH /notifications/threads/{id}); an update that
-        lands after the shown one would be read with it, and checking `updated_at` first cannot close that race.
+        GitHub only marks a whole thread (PATCH /notifications/threads/{id}). A thread updated after the shown
+        update is left unread ("unsupported" for this item; the newer update is its own candidate and mark). An
+        update landing between this check and the PATCH is read with it, but `read_on_github` still treats it
+        as unread, so the sorter shows it.
         """
-        return {item["id"]: "unsupported" for item in items}
+        settings = {**self.defaults(), **config["sources"]["github"]}
+        http = http or Http(gh_token(settings["token_command"]))
+        result = {}
+        for item in items:
+            thread_id, _, shown = str(item.get("id", "")).partition("@")
+            thread = http.get(f"/notifications/threads/{thread_id}")
+            if thread is None or not thread.get("unread", True):
+                result[item["id"]] = "done"
+            elif shown and stamp(thread["updated_at"]) > stamp(shown):
+                result[item["id"]] = "unsupported"
+            else:
+                http.patch(f"/notifications/threads/{thread_id}")
+                result[item["id"]] = "done"
+        return result
 
     def setup(self, config):
         GitHub({**self.defaults(), **config["sources"]["github"]}).http.get("/user")
