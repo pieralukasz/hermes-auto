@@ -25,7 +25,7 @@ def config():
 class BackgroundShim:
     """Background run API over a synchronous `run`: start does the work, collect hands the result back."""
 
-    def start(self, job, prompt):
+    def start(self, job, prompt, display=None):
         try:
             return {"result": self.run(job, prompt)}
         except Exception as exc:  # noqa: BLE001
@@ -313,9 +313,22 @@ def test_session_title_fits_hermes_limit():
     long_job = {"title": "Odpisz bartkowi na maila " * 10, "source": "todoist", "id": 17}
     title = session_title(long_job)
     assert len(title) <= TITLE_LIMIT
-    assert title.startswith("Odpisz") and title.endswith(" · todoist · #17")
-    assert session_title({"title": "Krótkie", "source": "gmail", "id": 3}) == "Krótkie · gmail · #3"
-    assert session_title({"title": "K", "source": "gmail", "id": 3}, prefix="☀ ") == "☀ K · gmail · #3"
+    assert title.startswith("Todoist · Odpisz") and title.endswith("…")
+    assert session_title({"title": "Krótkie", "source": "gmail", "id": 3}) == "Gmail · Krótkie"
+    assert session_title({"title": "K", "source": "gmail", "id": 3}, prefix="☀ ") == "☀ Gmail · K"
+
+
+@pytest.mark.parametrize("title,source,expected", [
+    ("Aviad: review sports stat cards", "github", "GitHub · Aviad: review sports stat cards"),
+    ("GitHub: feat: offline mode · example/app", "github", "GitHub · feat: offline mode · example/app"),
+    ("↩ ↩ GitHub: feat(widgets): x · github · #269", "github", "↩ GitHub · feat(widgets): x"),
+    ("↩ GitHub · Aviad: poprawki", "github", "↩ GitHub · Aviad: poprawki"),
+    ("Brief 27.10 06:00", "brief", "Brief 27.10 06:00"),
+    ("Todoist: plan do zatwierdzenia (2)", "questions", "Todoist: plan do zatwierdzenia (2)"),
+])
+def test_session_title_names_the_source_once(title, source, expected):
+    from hermes_auto.hermes import session_title
+    assert session_title({"title": title, "source": source, "id": 1}) == expected
 
 
 class ArchiveFake:

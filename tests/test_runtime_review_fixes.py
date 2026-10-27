@@ -254,7 +254,7 @@ class CrashOnceHermes:
         return {"session_id": job["session_id"]}
 
     # Agent runs start in the background (main 9a7b1c3); this run finishes at once.
-    def start(self, job, prompt):
+    def start(self, job, prompt, display=None):
         return {"result": self.run(job, prompt)}
 
     def collect(self, handle):

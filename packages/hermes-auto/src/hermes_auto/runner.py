@@ -83,6 +83,25 @@ def prompt_for(job, config, retry=False):
     )
 
 
+def display_for(job, config, retry=False):
+    """What the session shows as its first message instead of the full prompt (the model still gets that).
+
+    A Todoist task looks as if the user typed it; a sorted message is a short card. None keeps the prompt
+    visible (briefs and plans are written to be read; a retry is a short continuation anyway)."""
+    if retry:
+        return None
+    from .triage import INTERNAL_SOURCES, session_card
+    if job["source"] in INTERNAL_SOURCES:
+        return None
+    payload = json.loads(job["payload"])
+    if job["source"] == "todoist":
+        parts = [payload.get("content") or job.get("title", ""), payload.get("description") or ""]
+        return "\n\n".join(part.strip() for part in parts if part and part.strip()) or None
+    if payload.get("triage"):
+        return session_card(payload, payload["triage"].get("reason", ""), config)
+    return None
+
+
 def source_enabled(job, config):
     from .triage import INTERNAL_SOURCES
     if job["source"] in INTERNAL_SOURCES:
@@ -131,6 +150,7 @@ def process_jobs(store, config, hermes, blocked_sources=()):
             continue
         retry = job["status"] == "retry_pending"
         prompt = prompt_for(job, config, retry)
+        continuation = retry  # a retry prompt continues an existing turn; it shows as typed
         try:
             if job["status"] == "pending":
                 # ID was persisted at enqueue time, before any Hermes process starts.
@@ -150,13 +170,14 @@ def process_jobs(store, config, hermes, blocked_sources=()):
                 # the first message, so it carries the original task, and create finishes the same
                 # session's title and visibility instead of a continuation prompt with no context.
                 prompt = prompt_for(job, config)
+                continuation = False
                 store.update(job["id"], status="creating")  # interrupted again -> needs_attention, no loop
                 hermes.create(job, prompt)
             if job["mode"] == "open":
                 store.update(job["id"], status="ready", error="")
                 continue
             store.update(job["id"], status="running", attempts=job["attempts"] + 1, error="")
-            store.set_meta(f"run:{job['id']}", hermes.start(job, prompt))
+            store.set_meta(f"run:{job['id']}", hermes.start(job, prompt, display_for(job, config, continuation)))
         except Exception as exc:
             failures += 1
             store.update(job["id"], status="needs_attention", error=str(exc))

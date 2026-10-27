@@ -140,7 +140,10 @@ def agent_class(monkeypatch):
 
     def append(messages, calls, payload):
         for call in calls:
-            errors.append((call.function.name, json.loads(payload(call))["error"]))
+            result = json.loads(payload(call))
+            # A refused call is a neutral "not run" result: no `error` key (Desktop would paint it red).
+            assert result["skipped"] is True and "error" not in result
+            errors.append((call.function.name, result["note"]))
 
     module = types.ModuleType("agent.turn_tool_validation")
     module._append_tool_error_results = append
@@ -186,7 +189,7 @@ def test_restricted_profiles_refuse_tool_wrappers(agent_class, profile, wrapper)
 def test_private_profile_executes_no_tool(agent_class, name, arguments):
     deny_tool_execution(agent_class, profile="private")
     assert agent_class()._execute_tool_calls(batch((name, arguments)), []) is None
-    assert agent_class.errors and "No tools" in agent_class.errors[0][1]
+    assert agent_class.errors and "no tools" in agent_class.errors[0][1]
 
 
 @pytest.mark.parametrize("command", ["git log -p HEAD", "git show HEAD", "git grep phrase", "git branch"])

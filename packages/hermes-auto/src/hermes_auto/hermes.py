@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -29,17 +30,32 @@ def job_route(job, config):
     return model_route(config, (job or {}).get("source", ""), payload if isinstance(payload, dict) else {})
 
 
-def session_title(job, limit=TITLE_LIMIT, prefix=""):
-    """`<prefix><title> · <source> · #<id>`, shortening only the task title so the suffix survives.
+# Sources named at the start of a title ("GitHub · Aviad: review sports stat cards"). Briefs, plans and
+# proposals already say what they are ("Brief 27.10 06:00").
+SOURCE_LABELS = {"gmail": "Gmail", "proton": "Proton", "slack": "Slack", "github": "GitHub", "linear": "Linear",
+                 "todoist": "Todoist"}
+ARROWS = re.compile(r"^(?:↩\s*)+")
+OLD_SUFFIX = re.compile(r"(?: · [a-z]+ · #\d+)+$")
 
-    No prefix by default; the optional Desktop "Auto" page plugin needs `title_prefix: "☀ "`.
+
+def session_title(job, limit=TITLE_LIMIT, prefix=""):
+    """`<prefix>[↩ ]<Source> · <title>`, shortened to Hermes' limit. A reply keeps one leading "↩".
+
+    Hermes keeps titles unique; the bridge adds " (2)" on a clash. No prefix by default; the optional Desktop
+    "Auto" page plugin needs `title_prefix: "☀ "`.
     """
-    suffix = f" · {job['source']} · #{job['id']}"
     text = " ".join(str(job["title"] or "").split())
-    room = limit - len(suffix) - len(prefix)
+    arrow = "↩ " if ARROWS.match(text) else ""
+    text = ARROWS.sub("", text)
+    text = OLD_SUFFIX.sub("", text)  # a title copied from a session named before this format
+    label = SOURCE_LABELS.get(job.get("source", ""))
+    if label and not text.startswith(label + " · "):
+        # Older names carried the source as "GitHub: ..." or "Slack: ..."; keep only one.
+        text = f"{label} · " + re.sub(rf"^{re.escape(label)}:\s*", "", text)
+    room = limit - len(prefix) - len(arrow)
     if len(text) > room:
         text = text[:room - 1].rstrip() + "…"
-    return f"{prefix}{text}{suffix}"
+    return f"{prefix}{arrow}{text}"
 
 
 def run_alive(pid, directory):
@@ -136,7 +152,7 @@ class Hermes:
             raise RuntimeError(f"Hermes {action} returned no receipt")
         return records[-1]
 
-    def start(self, job, prompt):
+    def start(self, job, prompt, display=None):
         """Start a run in the background and return a handle; `collect` reads it later.
 
         The process gets its own session (survives the tick and launchd) and writes its exit code to a
@@ -149,7 +165,7 @@ class Hermes:
         request = directory / "request.json"
         deny = deny_mode(job)
         private_json(request, {"action": "run", "config": self.config, "job": job, "prompt": prompt,
-                               "full_tools": full_tools(job), "deny_tools": deny,
+                               "display": display, "full_tools": full_tools(job), "deny_tools": deny,
                                "route": job_route(job, self.config)})
         command = [self.python, "-I", str(Path(__file__).with_name("bridge.py")), str(request)]
         script = 'umask 077; "$@" >"$OUT" 2>"$ERR"; echo $? >"$CODE.tmp" && mv "$CODE.tmp" "$CODE"'
@@ -241,7 +257,7 @@ class Hermes:
         return self.invoke("create", job, title=title, prompt=prompt, open_message=message, hidden=hidden,
                            route=job_route(job, self.config))
 
-    def run(self, job, prompt):
+    def run(self, job, prompt, display=None):
         deny = deny_mode(job)
-        return self.invoke("run", job, prompt=prompt, full_tools=full_tools(job), deny_tools=deny,
+        return self.invoke("run", job, prompt=prompt, display=display, full_tools=full_tools(job), deny_tools=deny,
                            route=job_route(job, self.config))

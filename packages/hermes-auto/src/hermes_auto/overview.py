@@ -14,7 +14,9 @@ OPENABLE = ("skip", "brief", "read")
 
 
 def _title(payload):
-    return str(payload.get("subject") or payload.get("content") or payload.get("snippet") or "")[:200]
+    # `name`: the short name the sorter gave it (Haiku); older items have only their subject.
+    return str(payload.get("name") or payload.get("subject") or payload.get("content") or payload.get("snippet")
+               or "")[:200]
 
 
 def events(store, limit=200):

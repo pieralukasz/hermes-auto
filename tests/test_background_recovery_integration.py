@@ -65,7 +65,7 @@ class BackgroundHermes:
         self.runs.append(job["id"])
         return {"session_id": job["session_id"]}
 
-    def start(self, job, prompt):
+    def start(self, job, prompt, display=None):
         self.started.append(prompt)
         return {"pid": 1, "dir": "fake", "deadline": time.time() + 900}
 

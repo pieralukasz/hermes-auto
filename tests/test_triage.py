@@ -30,7 +30,7 @@ def config():
 class BackgroundShim:
     """Background run API over a synchronous `run`: start does the work, collect hands the result back."""
 
-    def start(self, job, prompt):
+    def start(self, job, prompt, display=None):
         try:
             return {"result": self.run(job, prompt)}
         except Exception as exc:  # noqa: BLE001

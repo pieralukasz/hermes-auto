@@ -57,6 +57,40 @@ def desktop_parity(agent_class):
     agent_class.__init__ = desktop_init
 
 
+def show_clean_prompt(agent_class, prompt, display):
+    """The session shows `display` (a short card) as the first message; the model gets `prompt`.
+
+    Hermes' own mechanism: `persist_user_message` is the transcript text, and the sent bytes are kept as the
+    row's `api_content`, so later turns (the user continuing in Desktop) still see the full prompt and source.
+    Only the turn carrying exactly `prompt` is affected."""
+    if not display or display == prompt:
+        return
+    original = agent_class.run_conversation
+
+    def run_conversation(self, user_message, *args, **kwargs):
+        if user_message == prompt and kwargs.get("persist_user_message") is None:
+            kwargs["persist_user_message"] = display
+            kwargs.setdefault("title_user_message", display)
+        return original(self, user_message, *args, **kwargs)
+
+    agent_class.run_conversation = run_conversation
+
+
+def unique_title(db, sid, title):
+    """Hermes keeps titles unique; a second "GitHub · Aviad: review" becomes "GitHub · Aviad: review (2)"."""
+    limit = db.MAX_TITLE_LENGTH
+    for attempt in range(1, 50):
+        suffix = "" if attempt == 1 else f" ({attempt})"
+        candidate = title[:limit - len(suffix)].rstrip() + suffix
+        try:
+            db.set_session_title(sid, candidate)
+            return candidate
+        except ValueError as exc:
+            if "already in use" not in str(exc):
+                raise
+    raise RuntimeError("No free session title")
+
+
 SHELL_META = set(";|&<>`$\n\r\\(){}")
 GOOGLE_API = "skills/productivity/google-workspace/scripts/google_api.py"
 GOOGLE_READS = {("calendar", "list"), ("gmail", "search"), ("gmail", "get"), ("gmail", "labels")}
@@ -230,8 +264,9 @@ GH_READS = {
     ("release", "view"): grammar((), REPO + ("--json",)),
     ("workflow", "list"): grammar(("--all", "-a"), REPO + ("--json", "--limit", "-L")),
 }
-# `gh api` stays a GET: no fields, input, method, headers, host or jq/template options.
-GH_API = grammar(("--paginate", "--include", "-i", "--slurp"))
+# `gh api` stays a GET: no fields, input, method, headers, host or template options. `--jq` filters the
+# response inside gh (no file, network or process access), so it is a read like the plain call.
+GH_API = grammar(("--paginate", "--include", "-i", "--slurp"), ("--jq", "-q"))
 
 
 def gh_value(option, value):
@@ -330,6 +365,48 @@ def read_only_command(command, profile=True):
     return False
 
 
+def terminal_output_dirs():
+    """Where Hermes spills a long command output; the agent reads it back with read_file/search_files."""
+    return [os.path.join(home, "cache", "terminal-output") for home in hermes_homes()]
+
+
+def cached_output_read(name, arguments):
+    """read_file/search_files inside Hermes' terminal-output cache only: text the step already fetched.
+
+    The path is resolved (symlinks, `..`) before the check, so nothing outside the cache is reachable."""
+    if name not in ("read_file", "search_files"):
+        return False
+    path = arguments.get("path")
+    if not isinstance(path, str) or not path.strip():
+        return False
+    real = os.path.realpath(os.path.expanduser(path))
+    for directory in terminal_output_dirs():
+        root = os.path.realpath(directory)
+        if real == root or real.startswith(root + os.sep):
+            return True
+    return False
+
+
+def refusal(call, note):
+    """A neutral result for a call the automatic step does not run: no `error` key, so Desktop shows a
+    skipped step instead of a red failure; the note still tells the model what to do instead."""
+    payload = {"skipped": True, "note": note}
+    if call.function.name == "terminal":
+        payload.update(output="", exit_code=1)  # Desktop renders an empty exit 1 as a grey notice
+    return json.dumps(payload, ensure_ascii=False)
+
+
+class CallSubset:
+    """The assistant message with only some of its tool calls; Hermes' executors read nothing else."""
+
+    def __init__(self, message, calls):
+        self._message = message
+        self.tool_calls = calls
+
+    def __getattr__(self, name):
+        return getattr(self._message, name)
+
+
 def deny_tool_execution(agent_class, allowed=None, profile=True):
     """Keep the session's normal tool list (and so its stored prompt) but execute only reads.
 
@@ -349,32 +426,46 @@ def deny_tool_execution(agent_class, allowed=None, profile=True):
         name = call.function.name
         if name in allowed:
             return True
-        if name != "terminal":
+        if name not in ("terminal", "read_file", "search_files") or profile not in PROFILE_TOOLS:
             return False
         try:
             arguments = json.loads(call.function.arguments or "{}")
         except (TypeError, ValueError):
             return False
+        if not isinstance(arguments, dict):
+            return False
+        if name != "terminal":
+            return cached_output_read(name, arguments)
         return not arguments.get("background") and read_only_command(arguments.get("command"), profile)
 
     if profile in RESEARCH_PROFILES:
-        refused = ("Only reads are allowed in this automatic step (third-party messages): Slack MCP reads, "
-                   "gh/linear reads, calendar list, td list/view, session_search and skills. Local git and "
-                   "arbitrary web access are disabled. Sending and writing wait for the user's explicit OK. "
-                   "Nothing ran in this batch.")
+        refused = ("Not run: this automatic step only reads (third-party messages). Allowed: Slack MCP reads, "
+                   "gh/linear reads (code via `gh api repos/OWNER/REPO/contents/PATH?ref=SHA --jq '.content | @base64d'`), calendar list, "
+                   "td list/view (search: `td task list --filter 'search: phrase'`), session_search, skills, and "
+                   "read_file/search_files on saved command output. Local git and the web are off. One plain "
+                   "command per call, no pipes. Sending and writing wait for the user's explicit OK.")
     elif profile is True:
-        refused = ("Only reads are allowed in this automatic step (third-party mail): calendar list, "
-                   "gmail search/get, td list/view/today, session_search, skills. Nothing ran in this batch.")
+        refused = ("Not run: this automatic step only reads (third-party mail). Allowed: calendar list, gmail "
+                   "search/get, td list/view/today (search: `td task list --filter 'search: phrase'`), "
+                   "session_search, skills, and read_file/search_files on saved command output. One plain command "
+                   "per call, no pipes.")
     else:
-        refused = ("No tools run in this automatic step (private third-party content): answer from the "
-                   "conversation only. Nothing ran in this batch.")
+        refused = ("Not run: no tools in this automatic step (private third-party content). Answer from the "
+                   "conversation only.")
 
     def guarded(self, assistant_message, messages, *args, **kwargs):
         calls = list(getattr(assistant_message, "tool_calls", None) or [])
-        if all(permitted(call) for call in calls):
+        allowed_calls = [call for call in calls if permitted(call)]
+        if len(allowed_calls) == len(calls):
             return original(self, assistant_message, messages, *args, **kwargs)
-        _append_tool_error_results(messages, calls, lambda call: json.dumps({"error": refused}))
-        return None
+        # Per call, not per batch: the reads in a parallel batch still run; only the refused calls get a
+        # neutral "not run" result. Every tool call keeps exactly one result.
+        result = None
+        if allowed_calls:
+            result = original(self, CallSubset(assistant_message, allowed_calls), messages, *args, **kwargs)
+        _append_tool_error_results(messages, [call for call in calls if call not in allowed_calls],
+                                   lambda call: refusal(call, refused))
+        return result
 
     agent_class._execute_tool_calls = guarded
     init = agent_class.__init__
@@ -661,7 +752,11 @@ def reply_delivered(db_path, session_ids, needles):
     conn = sqlite3.connect(Path(db_path).as_uri() + "?mode=ro", uri=True, timeout=10)
     try:
         marks = ",".join("?" for _ in ids)
-        found = " AND ".join("instr(coalesce(content,''), ?) > 0" for _ in needles)
+        # The transcript may show a short card; the sent text (with the reply's date and sender) is api_content.
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+        text = ("(coalesce(content,'') || char(10) || coalesce(api_content,''))" if "api_content" in columns
+                else "coalesce(content,'')")
+        found = " AND ".join(f"instr({text}, ?) > 0" for _ in needles)
         return conn.execute(f"SELECT 1 FROM messages WHERE session_id IN ({marks}) AND role='user' AND {found} "
                             "LIMIT 1", (*ids, *needles)).fetchone() is not None
     finally:
@@ -698,6 +793,8 @@ def main():
         from agent.auxiliary_client import call_llm
         assert callable(_append_tool_error_results) and callable(call_llm)
         assert callable(db.set_session_hidden) and callable(db.set_session_archived)
+        # Clean first message: the transcript text differs from what the model is sent.
+        assert "persist_user_message" in inspect.signature(AIAgent.run_conversation).parameters
         # Delivery guard of retry-followup reads the whole compression lineage.
         assert callable(db.get_compression_lineage) and callable(db.resolve_resume_session_id)
         print(json.dumps({"ok": True, "python": sys.executable, "source": config["hermes_source"]}))
@@ -749,7 +846,7 @@ def main():
             db.create_session(sid, source="cli")
         if session is None or not session.get("title"):
             # A failed earlier create can leave an untitled session; finish it instead of skipping.
-            db.set_session_title(sid, request["title"][:db.MAX_TITLE_LENGTH])
+            unique_title(db, sid, request["title"])
         if request.get("hidden"):
             # Listed in the Desktop "Auto" page instead of the main Sessions list.
             db.set_session_hidden(sid, True)
@@ -770,6 +867,7 @@ def main():
     # Only this worker's in-memory configuration changes. Interactive Hermes keeps its settings.
     # Unattended runs never get interactive approval: dangerous commands are denied.
     cli.CLI_CONFIG["approvals"] = {"mode": "manual", "single_query_mode": "deny"}
+    show_clean_prompt(AIAgent, request["prompt"], request.get("display"))
     profile = request.get("deny_tools")
     if profile:
         # Third-party content inside a normal session: the session keeps its full toolset and prompt.
