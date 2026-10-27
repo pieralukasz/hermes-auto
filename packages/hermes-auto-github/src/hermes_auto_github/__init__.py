@@ -135,17 +135,31 @@ class GitHub:
         return any(rule.get("author") == author and str(rule.get("contains") or "") in body
                    for rule in self.settings.get("skip_comments", []))
 
+    def latest_review(self, subject):
+        """The newest submitted review of a pull request, or None (reviews have no `latest_comment_url`)."""
+        if subject.get("type") != "PullRequest" or not subject.get("url"):
+            return None
+        reviews = [review for review in (self.http.get(subject["url"] + "/reviews", per_page=100) or [])
+                   if review.get("submitted_at") and review.get("state") != "PENDING"]
+        return max(reviews, key=lambda review: review["submitted_at"], default=None)
+
     def candidate(self, me, item):
         subject = item.get("subject", {})
         repo = item["repository"]["full_name"]
         details = self.http.get(subject["url"]) if subject.get("url") else None
         comment = self.http.get(subject["latest_comment_url"]) if subject.get("latest_comment_url") and \
             subject.get("latest_comment_url") != subject.get("url") else None
-        if comment and self.muted(comment):
+        review = self.latest_review(subject)
+        # The newest comment or review is what changed in the thread; a push or an edit leaves both as they were.
+        latest = comment
+        if review and (not comment or review["submitted_at"] > (comment.get("updated_at")
+                                                                 or comment.get("created_at") or "")):
+            latest = review
+        if latest is comment and comment and self.muted(comment):
             return None
-        url = (comment or {}).get("html_url") or (details or {}).get("html_url") or html_url(subject.get("url")) \
+        url = (latest or {}).get("html_url") or (details or {}).get("html_url") or html_url(subject.get("url")) \
             or f"https://github.com/{repo}"
-        actor = ((comment or details or {}).get("user") or {})
+        actor = ((latest or details or {}).get("user") or {})
         lines = [f"Repo: {repo}", f"Typ: {subject.get('type')}", f"Powód: {item.get('reason')}",
                  f"Tytuł: {subject.get('title')}"]
         if details:
@@ -154,21 +168,28 @@ class GitHub:
                 state = "merged"
             lines.append(f"Stan: {state}; autor: {(details.get('user') or {}).get('login')}"
                          + ("; draft" if details.get("draft") else ""))
-            if details.get("body") and not comment:
+            if details.get("body") and not latest:
                 lines.append("Opis: " + " ".join(str(details["body"]).split())[:1500])
         if comment:
             lines.append(f"Ostatni komentarz ({(comment.get('user') or {}).get('login')}): "
                          + str(comment.get("body") or "").strip()[:4000])
+        if review:
+            lines.append(f"Ostatnia recenzja ({(review.get('user') or {}).get('login')}, {review.get('state')}): "
+                         + str(review.get("body") or "").strip()[:4000])
+        if not latest:
+            lines.append("Bez nowego komentarza ani recenzji (push, edycja albo zmiana reviewerów).")
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(stamp(item["updated_at"])))
+        activity = {"id": f"{'review' if latest is review else 'comment'}:{latest.get('id')}" if latest else "",
+                    "author": actor.get("login", "") if latest else "", "bot": actor.get("type") == "Bot"}
         return {
             "kind": "github", "id": f"{item['id']}@{item['updated_at']}", "thread_id": item["id"],
-            # Read on GitHub, or the latest comment is his own: nothing waits for him.
-            "account": me, "read": read_on_github(item) or bool(comment and actor.get("login") == me),
+            # Read on GitHub, or the latest comment or review is his own: nothing waits for him.
+            "account": me, "read": read_on_github(item) or bool(latest and actor.get("login") == me),
             "from": actor.get("login") or repo, "bot": actor.get("type") == "Bot", "to": me,
             "subject": f"GitHub: {subject.get('title') or repo} · {repo}"[:180],
             "place": repo, "why": item.get("reason", ""), "date": when, "type": subject.get("type", ""),
             "owner": item["repository"]["owner"]["login"], "body": "\n".join(lines)[:20000], "url": url,
-            "snippet": str(subject.get("title") or "")[:300], "sent": [],
+            "snippet": str(subject.get("title") or "")[:300], "sent": [], "activity": activity,
         }
 
 

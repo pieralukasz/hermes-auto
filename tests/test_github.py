@@ -52,6 +52,8 @@ class FakeApi:
         if url.endswith("/pulls/7"):
             return {"html_url": "https://github.com/acme/web/pull/7", "state": "open", "user": {"login": "oz"},
                     "body": "opis"}
+        if url.endswith("/pulls/7/reviews"):
+            return getattr(self, "reviews", [])
         if url.endswith("/comments/9"):
             return {"html_url": "https://github.com/acme/web/pull/7#issuecomment-9", "body": "can you look?",
                     "user": {"login": "oz", "type": "User"}}
@@ -199,3 +201,116 @@ def test_due_polls_without_listener_and_waits_for_nudge_with_it(store, tmp_path)
 
 def test_zero_interval_disables_own_polling(store):
     assert not Source().due({"poll_seconds": 0}, store, NOW - 4000, NOW)
+
+
+# ── Updates in a thread that already has a session ────────────────────────────
+
+HUMAN = {"login": "oz", "type": "User"}
+
+
+def update(api, at, me="me"):
+    """The next update of thread 2 as the adapter hands it to the sorter."""
+    api.items = [notification("2", at, comment=api.comment is not None)]
+    return github_with(api, at + 30).candidate(me, api.items[0])
+
+
+class ThreadApi(FakeApi):
+    def __init__(self):
+        super().__init__([])
+        self.comment, self.reviews = {"id": 9, "body": "can you look?", "user": HUMAN,
+                                      "created_at": "2026-10-27T00:00:00Z"}, []
+
+    def get(self, url, **params):
+        if url.endswith("/comments/9"):
+            return {"html_url": "https://github.com/acme/web/pull/7#issuecomment-9", **self.comment}
+        return super().get(url, **params)
+
+
+def opened(store, config, api):
+    """Thread 2 gets its first session through the classifier."""
+    fake = Fake(replies=[[{"i": 0, "decision": "session", "reason": "review", "summary": "oz prosi"}]])
+    triage.triage_mail(store, config, fake, "github", "me", [update(api, NOW)], "k", {"since": 1})
+    assert len(store.rows()) == 1
+    return fake
+
+
+def decisions(store):
+    return [row["decision"] for row in store.db.execute("SELECT decision FROM triage_items ORDER BY rowid")]
+
+
+def test_adapter_reports_the_newest_comment_or_review(store):
+    api = ThreadApi()
+    item = update(api, NOW)
+    assert item["activity"] == {"id": "comment:9", "author": "oz", "bot": False}
+    api.reviews = [{"id": 5, "state": "CHANGES_REQUESTED", "body": "fix the cart", "user": {"login": "ann"},
+                    "submitted_at": "2026-10-27T01:00:00Z", "html_url": "https://github.com/acme/web/pull/7#r5"},
+                   {"id": 6, "state": "PENDING", "user": {"login": "ann"}}]
+    item = update(api, NOW + 100)
+    assert item["activity"]["id"] == "review:5" and item["from"] == "ann" and item["url"].endswith("#r5")
+    assert "Ostatnia recenzja (ann, CHANGES_REQUESTED): fix the cart" in item["body"]
+    api.comment, api.reviews = None, []
+    item = update(api, NOW + 200)
+    assert item["activity"]["id"] == "" and "Bez nowego komentarza ani recenzji" in item["body"]
+
+
+@pytest.mark.parametrize("change", ["push", "same comment", "bot comment"])
+def test_thread_update_without_news_opens_nothing(store, config, change):
+    api = ThreadApi()
+    opened(store, config, api)
+    if change == "push":
+        api.comment = None
+    elif change == "bot comment":
+        api.comment = {"id": 10, "body": "Preview ready", "user": BOT, "created_at": "2026-10-27T02:00:00Z"}
+    fake = Fake()
+    report = triage.triage_mail(store, config, fake, "github", "me", [update(api, NOW + 100)], "k", {"since": 2})
+    assert [decision for decision, _, _ in report] == ["skip"] and fake.prompts == []
+    assert len(store.rows()) == 1 and store.db.execute("SELECT COUNT(*) FROM followups").fetchone()[0] == 0
+    assert decisions(store) == ["session", "skip"]
+
+
+@pytest.mark.parametrize("verdict, followups, recorded", [("session", 1, "followup"), ("brief", 0, "brief"),
+                                                          ("skip", 0, "skip")])
+def test_new_human_comment_in_a_thread_goes_through_the_classifier(store, config, verdict, followups, recorded):
+    api = ThreadApi()
+    opened(store, config, api)
+    api.comment = {"id": 11, "body": "why this way?", "user": HUMAN, "created_at": "2026-10-27T03:00:00Z"}
+    fake = Fake(replies=[[{"i": 0, "decision": verdict, "reason": "", "summary": "oz pyta"}]])
+    triage.triage_mail(store, config, fake, "github", "me", [update(api, NOW + 100)], "k", {"since": 2})
+    system, user = fake.prompts[0]
+    assert user[0]["followup"] is True and "followup=true" in system
+    assert store.db.execute("SELECT COUNT(*) FROM followups").fetchone()[0] == followups
+    assert decisions(store) == ["session", recorded]  # a session verdict continues as a "↩" session
+
+
+def test_two_updates_in_one_batch_compare_with_each_other(store, config):
+    api = ThreadApi()
+    opened(store, config, api)
+    api.comment = {"id": 11, "body": "why?", "user": HUMAN, "created_at": "2026-10-27T03:00:00Z"}
+    first = update(api, NOW + 100)
+    second = {**update(api, NOW + 200)}
+    fake = Fake(replies=[[{"i": 0, "decision": "brief", "reason": "", "summary": "oz pyta"}]])
+    triage.triage_mail(store, config, fake, "github", "me", [first, second], "k", {"since": 2})
+    assert len(fake.prompts[0][1]) == 1 and decisions(store) == ["session", "skip", "brief"]
+
+
+def test_legacy_payload_compares_the_shown_comment(store, config):
+    api = ThreadApi()
+    opened(store, config, api)
+    row = store.db.execute("SELECT rowid, payload FROM triage_items").fetchone()
+    legacy = {key: value for key, value in json.loads(row[1]).items() if key != "activity"}
+    store.db.execute("UPDATE triage_items SET payload=? WHERE rowid=?", (json.dumps(legacy), row[0]))
+    store.db.commit()
+    report = triage.triage_mail(store, config, Fake(), "github", "me", [update(api, NOW + 100)], "k", {"since": 2})
+    assert [decision for decision, _, _ in report] == ["skip"]
+
+
+def test_followup_title_keeps_one_arrow(store):
+    store.db.execute("INSERT INTO followups(event_key,source,session_id,title,payload) VALUES (?,?,?,?,?)",
+                     ("github:me:2@x", "github", "s1", "t", json.dumps({"id": "2@x", "thread_id": "2",
+                                                                        "account": "me", "kind": "github"})))
+    store.db.commit()
+    fake = Fake(sessions={"s1": {}})
+    fake.session_excerpts = lambda ids: {"s1": {"title": "↩ ↩ ↩ GitHub: feat: cart"}}
+    row = dict(store.db.execute("SELECT * FROM followups").fetchone())
+    triage.redirect_followup(store, row, json.loads(row["payload"]), "r", fake)
+    assert store.rows()[0]["title"] == "↩ GitHub: feat: cart"
