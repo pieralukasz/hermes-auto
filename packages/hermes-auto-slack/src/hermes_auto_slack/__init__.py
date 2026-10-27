@@ -29,7 +29,9 @@ BACKLOG = "source_backlog:slack"
 
 
 class SlackError(RuntimeError):
-    pass
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
 
 
 def read_token(path):
@@ -59,7 +61,7 @@ class Http:
                 continue
             data = response.json() if response.ok else {"ok": False, "error": f"http {response.status_code}"}
             if not data.get("ok"):
-                raise SlackError(f"Slack {method} failed: {data.get('error')}")
+                raise SlackError(f"Slack {method} failed: {data.get('error')}", code=data.get("error"))
             return data
         raise SlackError(f"Slack {method} rate limited")
 
@@ -260,7 +262,13 @@ class Slack:
         result = {}
         for key, (channel_id, thread_ts, why) in found.items():
             if thread_ts:
-                messages = self.replies(channel_id, thread_ts)
+                try:
+                    messages = self.replies(channel_id, thread_ts)
+                except SlackError as error:
+                    # Deleted before we read it (the listener hint outlives the post): nothing left to sort.
+                    if error.code == "thread_not_found":
+                        continue
+                    raise
             else:
                 messages = list(reversed(self.history(channel_id, since - 86400 * 2, pages=1)))
             result[key] = (channel_id, thread_ts, messages, why)

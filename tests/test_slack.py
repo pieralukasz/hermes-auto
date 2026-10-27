@@ -10,7 +10,7 @@ from hermes_auto.config import defaults
 from hermes_auto.hermes import Hermes, deny_mode
 from hermes_auto.runner import prompt_for
 from hermes_auto.store import Store
-from hermes_auto_slack import Slack, Source, parse_hits
+from hermes_auto_slack import Slack, SlackError, Source, parse_hits
 
 from test_triage import Fake
 
@@ -81,7 +81,9 @@ class FakeSlack:
             messages = [m for m in self.channels[params["channel"]]["messages"] if float(m["ts"]) > oldest]
             return {"ok": True, "messages": sorted(messages, key=lambda m: -float(m["ts"]))}
         if method == "conversations.replies":
-            parent = next(m for m in self.channels[params["channel"]]["messages"] if m["ts"] == params["ts"])
+            parent = next((m for m in self.channels[params["channel"]]["messages"] if m["ts"] == params["ts"]), None)
+            if parent is None:  # deleted post: what Slack answers for it
+                raise SlackError("Slack conversations.replies failed: thread_not_found", code="thread_not_found")
             return {"ok": True, "messages": [parent, *self.threads.get((params["channel"], params["ts"]), [])]}
         raise AssertionError(method)
 
@@ -486,6 +488,49 @@ def test_watched_channel_posts_become_separate_candidates(store):
     fake.channels["C9"]["last_read"] = f"{NOW + 700:.6f}"
     candidates, _, _ = inbox(NOW + 1000)
     assert [c["read"] for c in candidates] == [False]
+
+
+def test_deleted_post_the_listener_saw_does_not_fail_the_source(tmp_path):
+    """A watched-channel post deleted before the sorter read it: skip it, keep reading the rest."""
+    from hermes_auto_slack.listener import write_state
+    store = Store(tmp_path, initialize=True)
+    try:
+        fake = FakeSlack()
+        fake.channel("C9", name="bugs-and-suggestions", last_read="0")
+        settings = {**Source.defaults(), "token_file": "unused", "watch_channels": ["C9"]}
+
+        def inbox(now):
+            return Slack(settings, http=fake, now=lambda: now).inbox({}, store)
+
+        _, key, cursor = inbox(NOW)
+        store.set_meta(key, cursor)
+        gone = f"{NOW + 5:.6f}"
+        write_state(tmp_path, {"hints": {f"C9:{gone}": {"channel": "C9", "thread_ts": gone, "why": "channel",
+                                                         "ts": gone, "seen": NOW + 5}}})
+        fake.post("C9", "UOZ", f"{NOW + 6:.6f}", "checkout nie dziala")
+        candidates, _, _ = inbox(NOW + 300)
+        assert [c["snippet"] for c in candidates] == ["checkout nie dziala"]
+    finally:
+        store.close()
+
+
+def test_other_reply_errors_still_fail_the_source(store):
+    fake = FakeSlack()
+    fake.channel("C9", name="bugs-and-suggestions", last_read="0")
+    settings = {**Source.defaults(), "token_file": "unused", "watch_channels": ["C9"]}
+    _, key, cursor = Slack(settings, http=fake, now=lambda: NOW).inbox({}, store)
+    store.set_meta(key, cursor)
+    fake.post("C9", "UOZ", f"{NOW + 6:.6f}", "bug")
+    real = fake.api
+
+    def api(method, **params):
+        if method == "conversations.replies":
+            raise SlackError("Slack conversations.replies failed: invalid_auth", code="invalid_auth")
+        return real(method, **params)
+
+    fake.api = api
+    with pytest.raises(SlackError, match="invalid_auth"):
+        Slack(settings, http=fake, now=lambda: NOW + 300).inbox({}, store)
 
 
 def test_unwatched_channel_posts_stay_out(store):
