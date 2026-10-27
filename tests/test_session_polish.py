@@ -288,3 +288,22 @@ def test_sorted_session_is_titled_with_its_name(tmp_path):
     payload = json.loads(store.db.execute("SELECT payload FROM triage_items").fetchone()[0])
     assert payload["name"] == "Ewa: faktura do piątku"
     store.close()
+
+
+
+@pytest.mark.parametrize("command,allowed", [
+    ('linear issue query --all-teams --search "navigation" --updated-after 2026-09-01 --limit 15', True),
+    ("linear issue query --search shop --search-comments --state started -j", True),
+    ("linear issue query --search shop --workspace other", False),
+])
+def test_linear_issue_query_filters_are_reads(command, allowed):
+    assert read_only_command(command, "research") is allowed
+
+
+def test_slack_card_does_not_repeat_the_sender_and_cleans_old_titles():
+    item = {"kind": "slack", "from": "Bart", "why": "dm", "place": "DM", "subject": "Slack: Bart · DM",
+            "url": "https://example.slack.com/archives/D1/p1",
+            "followup_of": {"id": "S1", "title": "↩ Slack: Bart · DM · slack · #184 · slack · #191"}}
+    assert triage.session_card(item, "", {"language": "Polish"}).splitlines() == [
+        "Slack · Bart napisał do Ciebie", "DM · https://example.slack.com/archives/D1/p1",
+        "Ciąg dalszy rozmowy: Slack: Bart · DM"]

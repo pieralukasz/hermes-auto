@@ -616,14 +616,16 @@ def session_card(item, reason, config):
         subject = re.sub(r" · [\w./-]+$", "", subject) if item.get("place") and subject.endswith(
             str(item.get("place"))) else subject
     lines = [head]
-    if subject:
+    if subject and subject.casefold() not in (sender.casefold(), one_line(item.get("place"), 120).casefold()):
         lines.append(subject)
     where = " · ".join(filter(None, [one_line(item.get("place"), 120) if kind != "mail" else "",
                                      safe_url(item.get("url")) or ""]))
     if where:
         lines.append(where)
     if item.get("followup_of"):
-        origin = one_line((item["followup_of"] or {}).get("title"), 120)
+        # Titles from before the "<Source> · <name>" format repeat arrows and " · slack · #N" suffixes.
+        origin = re.sub(r"^(?:↩\s*)+|(?: · [a-z]+ · #\d+)+$", "", one_line((item["followup_of"] or {}).get("title"), 200))
+        origin = one_line(origin, 120)
         lines.append(f"Ciąg dalszy rozmowy: {origin}" if origin else "Ciąg dalszy wcześniejszej rozmowy")
     reason = one_line(reason, 300)
     if reason:

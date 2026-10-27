@@ -302,7 +302,13 @@ LINEAR_READS = {
     ("issue", "list"): grammar(("--json", "-j", "--no-pager", "--all-states", "--all-assignees", "-A",
                                 "--unassigned", "-U"),
                                ("--state", "-s", "--assignee", "--sort", "--team", "--project", "--limit")),
-    ("issue", "query"): LINEAR_LIST, ("project", "view"): LINEAR_LIST, ("project", "list"): LINEAR_LIST,
+    # Search and filters only; no --workspace (another account's credential).
+    ("issue", "query"): grammar(("--json", "-j", "--no-pager", "--search-comments", "--all-teams", "--unassigned", "-U",
+                                 "--include-archived"),
+                                ("--search", "--team", "--state", "-s", "--sort", "--assignee", "--project",
+                                 "--project-label", "--cycle", "--milestone", "--label", "-l", "--created-after",
+                                 "--updated-after", "--limit")),
+    ("project", "view"): LINEAR_LIST, ("project", "list"): LINEAR_LIST,
     ("team", "list"): LINEAR_LIST, ("cycle", "list"): LINEAR_LIST, ("cycle", "view"): LINEAR_LIST,
 }
 
