@@ -117,4 +117,12 @@ final class HermesAutoCoreTests: XCTestCase {
         let slow = await CLIRunner(executable: URL(fileURLWithPath: "/bin/sleep"), timeout: 0.5).run(["5"])
         XCTAssertEqual(slow.exitCode, 124)
     }
+
+    func testCLIRunnerKillsAProcessThatIgnoresSIGTERMWithinTheDeadline() async {
+        let started = Date()
+        let stubborn = await CLIRunner(executable: URL(fileURLWithPath: "/bin/sh"), timeout: 0.5)
+            .run(["-c", "trap '' TERM; sleep 30"])
+        XCTAssertEqual(stubborn.exitCode, 124)
+        XCTAssertLessThan(Date().timeIntervalSince(started), 6)
+    }
 }

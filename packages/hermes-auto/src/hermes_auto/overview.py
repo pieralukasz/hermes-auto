@@ -13,10 +13,12 @@ from pathlib import Path
 OPENABLE = ("skip", "brief", "read")
 
 
-def _title(payload):
-    # `name`: the short name the sorter gave it (Haiku); older items have only their subject.
-    return str(payload.get("name") or payload.get("subject") or payload.get("content") or payload.get("snippet")
-               or "")[:200]
+def _title(payload, kind=""):
+    # `name`: the short name the sorter gave it (Haiku); older items have only their subject. A Todoist task's
+    # title is its content; a message never falls back to its text (snippet, body).
+    if kind == "task":
+        return str(payload.get("content") or payload.get("subject") or "")[:200]
+    return str(payload.get("name") or payload.get("subject") or "(bez tematu)")[:200]
 
 
 def events(store, limit=200):
@@ -40,7 +42,7 @@ def events(store, limit=200):
         result.append({
             "account": row["account"], "item_id": row["item_id"], "source": source, "kind": row["kind"],
             "decision": row["decision"], "reason": row["reason"], "summary": row["summary"],
-            "created": row["created"], "title": _title(payload),
+            "created": row["created"], "title": _title(payload, row["kind"]),
             "from": str(payload.get("from") or "")[:200], "place": str(payload.get("place") or "")[:200],
             "url": str(payload.get("url") or ""), "job_id": row["job_id"], "job_status": row["job_status"],
             "session_id": session or None,

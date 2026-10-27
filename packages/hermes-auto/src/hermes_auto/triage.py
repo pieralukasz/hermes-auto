@@ -363,10 +363,9 @@ def name_items(hermes, config, items):
         except Exception:  # noqa: BLE001 - names are cosmetic; the sorter goes on with subjects
             continue
         for entry in result if isinstance(result, list) else []:
-            try:
-                index = int(entry["i"])
-            except (KeyError, TypeError, ValueError):
-                continue
+            index = entry.get("i") if isinstance(entry, dict) else None
+            if not isinstance(index, int) or isinstance(index, bool):
+                continue  # only a plain integer index; 1e400, "0" or true are model noise
             name = clean_name(entry.get("name"))
             if 0 <= index < len(group) and name:
                 group[index]["name"] = name

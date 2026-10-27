@@ -101,11 +101,22 @@ public struct CLIRunner: CommandRunner {
         group.enter()
         DispatchQueue.global().async { stderr.data = err.fileHandleForReading.readDataToEndOfFile(); group.leave() }
         if group.wait(timeout: .now() + timeout) == .timedOut {
+            // One deadline for the whole run: SIGTERM, a short grace, then SIGKILL; a child that inherited
+            // the pipe can keep it open, so the readers are not waited for without a limit either.
             process.terminate()
-            group.wait()
+            if group.wait(timeout: .now() + 2) == .timedOut, process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+                _ = group.wait(timeout: .now() + 2)
+            }
             return CommandResult(exitCode: 124, stdout: Data(), stderr: "hermes-auto nie odpowiedział w \(Int(timeout)) s")
         }
-        process.waitUntilExit()
+        // Both pipes closed; the process may still linger (closed its output but did not exit).
+        let exited = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async { process.waitUntilExit(); exited.signal() }
+        if exited.wait(timeout: .now() + 5) == .timedOut {
+            process.terminate()
+            return CommandResult(exitCode: 124, stdout: Data(), stderr: "hermes-auto nie zakończył się po wyjściu")
+        }
         return CommandResult(exitCode: process.terminationStatus, stdout: stdout.data,
                              stderr: String(decoding: stderr.data, as: UTF8.self))
     }

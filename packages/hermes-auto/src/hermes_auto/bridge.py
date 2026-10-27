@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 
@@ -264,14 +265,18 @@ GH_READS = {
     ("release", "view"): grammar((), REPO + ("--json",)),
     ("workflow", "list"): grammar(("--all", "-a"), REPO + ("--json", "--limit", "-L")),
 }
-# `gh api` stays a GET: no fields, input, method, headers, host or template options. `--jq` filters the
-# response inside gh (no file, network or process access), so it is a read like the plain call.
+# `gh api` stays a GET: no fields, input, method, headers, host or template options. gh's jq can read the
+# process environment (`env`, `$ENV`: the worker holds API keys), so `--jq` takes only filters on this list.
 GH_API = grammar(("--paginate", "--include", "-i", "--slurp"), ("--jq", "-q"))
+GH_JQ_FILTERS = frozenset({".content | @base64d", ".content|@base64d", ".[].filename", ".[] | .filename",
+                           ".[].body", ".[] | .body"})
 
 
 def gh_value(option, value):
     if option in ("--repo", "-R"):
         return bool(GH_REPO.fullmatch(value))
+    if option in ("--jq", "-q"):
+        return " ".join(value.split()) in GH_JQ_FILTERS
     return "://" not in value
 
 
@@ -283,7 +288,7 @@ def gh_read(tokens):
     """`gh <group> <read command>` or `gh api <GET endpoint>` with only the options in its grammar."""
     args = tokens[1:]
     if args[:1] == ["api"]:
-        positionals = split_options(args[1:], GH_API)
+        positionals = split_options(args[1:], GH_API, gh_value)
         return (positionals is not None and len(positionals) == 1 and bool(GH_ENDPOINT.fullmatch(positionals[0]))
                 and not positionals[0].lstrip("/").startswith("graphql"))
     spec = GH_READS.get(tuple(args[:2]))
@@ -376,19 +381,31 @@ def terminal_output_dirs():
     return [os.path.join(home, "cache", "terminal-output") for home in hermes_homes()]
 
 
-def cached_output_read(name, arguments):
-    """read_file/search_files inside Hermes' terminal-output cache only: text the step already fetched.
+RUN_STARTED = time.time()
 
-    The path is resolved (symlinks, `..`) before the check, so nothing outside the cache is reachable."""
+
+def cached_output_read(name, arguments, since=None):
+    """read_file/search_files on one output file this run saved in Hermes' terminal-output cache.
+
+    One existing regular file, no directory: Hermes treats a missing path with commas or spaces as several
+    roots, and the shared cache also holds other sessions' output. The path is resolved (symlinks, `..`) and
+    the file must be written after this run started."""
     if name not in ("read_file", "search_files"):
         return False
     path = arguments.get("path")
-    if not isinstance(path, str) or not path.strip():
+    if not isinstance(path, str) or not path.strip() or "," in path or any(c.isspace() for c in path):
+        return False
+    if name == "search_files" and (arguments.get("file_glob") or arguments.get("target") == "files"):
         return False
     real = os.path.realpath(os.path.expanduser(path))
+    try:
+        if not os.path.isfile(real) or os.path.getmtime(real) < (RUN_STARTED if since is None else since) - 1:
+            return False
+    except OSError:
+        return False
     for directory in terminal_output_dirs():
         root = os.path.realpath(directory)
-        if real == root or real.startswith(root + os.sep):
+        if real.startswith(root + os.sep):
             return True
     return False
 

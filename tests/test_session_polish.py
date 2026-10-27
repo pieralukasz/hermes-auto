@@ -84,12 +84,13 @@ def test_saved_command_output_can_be_read_back(agent_class, cache, profile):
     deny_tool_execution(agent_class, profile=profile)
     agent = agent_class()
     message = batch(("read_file", {"path": str(cache / "out-1.log")}),
-                    ("search_files", {"pattern": "author", "path": str(cache)}))
+                    ("search_files", {"pattern": "author", "path": str(cache / "out-1.log")}))
     assert agent._execute_tool_calls(message, []) == "executed"
     assert agent_class.results == []
 
 
-@pytest.mark.parametrize("path", ["{tmp}/secret.txt", "{cache}/../../../secret.txt", "{cache}/link", "", None])
+@pytest.mark.parametrize("path", ["{tmp}/secret.txt", "{cache}/../../../secret.txt", "{cache}/link", "", None,
+                                  "{cache}", "{cache}/missing,{tmp}", "{cache}/missing {tmp}", "{cache}/out-1.log,{tmp}"])
 def test_reads_outside_the_output_cache_are_refused(agent_class, cache, tmp_path, path):
     os.symlink(tmp_path / "secret.txt", cache / "link")
     value = path.format(tmp=tmp_path, cache=cache) if path is not None else None
@@ -107,6 +108,10 @@ def test_private_profile_cannot_read_the_cache_either(agent_class, cache):
     ("gh api repos/acme/app/pulls/4/files --paginate --jq '.[].filename'", True),
     ("gh api repos/acme/app/contents/src/a.ts?ref=abc123 --jq '.content | @base64d'", True),
     ("gh api repos/acme/app/issues/4/comments -q .[].body", True),
+    ("gh api user --jq env", False),
+    ("gh api user -q '$ENV'", False),
+    ("gh api user --jq '.login, env.ANTHROPIC_API_KEY'", False),
+    ("gh api user --jq '$__loc__'", False),
     ("gh api repos/acme/app/issues -f title=x --jq .", False),
     ("gh api repos/acme/app --jq . -X POST", False),
     ("gh api graphql --jq .", False),
@@ -307,3 +312,28 @@ def test_slack_card_does_not_repeat_the_sender_and_cleans_old_titles():
     assert triage.session_card(item, "", {"language": "Polish"}).splitlines() == [
         "Slack · Bart napisał do Ciebie", "DM · https://example.slack.com/archives/D1/p1",
         "Ciąg dalszy rozmowy: Slack: Bart · DM"]
+
+
+
+def test_cache_files_from_before_this_run_are_refused(cache):
+    old = cache / "out-old.log"
+    old.write_text("another session's output")
+    os.utime(old, (1, 1))
+    assert bridge.cached_output_read("read_file", {"path": str(old)}) is False
+    assert bridge.cached_output_read("read_file", {"path": str(cache / "out-1.log")}, since=0) is True
+    # A file search over the cache would list other sessions' files.
+    assert bridge.cached_output_read("search_files", {"path": str(cache / "out-1.log"), "target": "files"}) is False
+
+
+@pytest.mark.parametrize("index", [1e400, "0", True, None, -1, 5])
+def test_bad_name_indexes_are_ignored(index):
+    item = {**GITHUB}
+    triage.name_items(Namer([[{"i": index, "name": "x"}, "junk"]]), naming_config(), [item])
+    assert "name" not in item
+
+
+def test_events_title_never_shows_message_text():
+    from hermes_auto.overview import _title
+    assert _title({"snippet": "Poufny tekst", "body": "Poufny"}) == "(bez tematu)"
+    assert _title({"content": "Zrób VAT"}, "task") == "Zrób VAT"
+    assert _title({"name": "Ewa: faktura", "subject": "RE: x"}) == "Ewa: faktura"
