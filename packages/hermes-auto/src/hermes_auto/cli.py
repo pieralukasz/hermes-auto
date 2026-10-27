@@ -326,6 +326,11 @@ def parser():
     commands.add_parser("init", help="Create configuration and durable state once")
     commands.add_parser("doctor", help="Check the Hermes API bridge without an LLM call")
     commands.add_parser("status", help="Show jobs, source errors and pause state")
+    events = commands.add_parser("events", help="Read-only: the sorter's latest decisions, newest first (JSON)")
+    events.add_argument("--limit", type=int, default=200)
+    opened = commands.add_parser("open-item", help="Explicitly give a skipped, briefed or read message its session")
+    opened.add_argument("account", help="Sorter account, e.g. gmail:me@example.test (see 'events')")
+    opened.add_argument("item_id")
     commands.add_parser("pause", help="Pause discovery and preparation")
     commands.add_parser("resume", help="Resume discovery and preparation")
     commands.add_parser("tick", help="Scheduled run, respecting desktop presence and polling interval")
@@ -352,7 +357,7 @@ def main(argv=None):
     args = parser().parse_args(argv)
     home = args.home.expanduser().resolve()
     try:
-        if args.command == "status":
+        if args.command in ("status", "events"):
             store = Store(home, read_only=True)
             try:
                 return dispatch(args, home, read_config(home), store)
@@ -401,7 +406,8 @@ def dispatch(args, home, config, store):
         print(json.dumps(Hermes(config, home).invoke("doctor"), indent=2))
         print("Installed adapters:", ", ".join(sorted(sources())) or "none")
     elif command == "status":
-        jobs = [{key: job[key] for key in ("id", "source", "title", "mode", "status", "session_id", "error")}
+        jobs = [{key: job[key] for key in ("id", "source", "title", "mode", "status", "session_id", "error",
+                                           "created", "updated")}
                 for job in store.rows()]
         # Replies routed into existing sessions; payloads (mail bodies) stay out of CLI output.
         followups = [dict(row) for row in store.db.execute(
@@ -422,10 +428,19 @@ def dispatch(args, home, config, store):
                     "next_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(state.get("next_at", 0)))}
                    for key, state in ((row[0], json.loads(row[1])) for row in store.db.execute(
                        "SELECT key, value FROM meta WHERE key GLOB 'triage_pending:*'"))]
+        from .overview import sources as health
         print(json.dumps({"paused": store.get_meta("paused", False),
                           "source_errors": store.get_meta("source_errors", []), "jobs": jobs,
-                          "followups": followups, "triage_issues": issues, "triage_pending": waiting},
+                          "followups": followups, "triage_issues": issues, "triage_pending": waiting,
+                          "health": health(config, store, home)},
                          indent=2, ensure_ascii=False))
+    elif command == "events":
+        from .overview import events
+        print(json.dumps(events(store, args.limit), indent=2, ensure_ascii=False))
+    elif command == "open-item":
+        from .triage import open_item
+        job_id = open_item(store, args.account, args.item_id)
+        print(json.dumps({"job_id": job_id, "queued": True}))
     elif command in ("pause", "resume"):
         store.set_meta("paused", command == "pause")
         print(command + "d")

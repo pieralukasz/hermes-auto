@@ -204,15 +204,21 @@ Instead of labelling threads and tasks yourself, let the sorter look at everythi
 hermes-auto scan --dry-run  # temporary copy of state; no sessions, no baseline changes
 hermes-auto scan            # record opt-ins/baselines and enqueue; no model calls
 hermes-auto run             # scan and prepare eligible pending jobs now
-hermes-auto status          # works while the service is running; includes source errors
+hermes-auto status          # works while the service is running; includes source errors and source health
+hermes-auto events          # read-only: the sorter's latest decisions with reasons, newest first (no bodies)
 hermes-auto pause
 hermes-auto resume
 hermes-auto retry 12        # explicitly continue needs_attention job in its existing session
 hermes-auto new-session 12  # explicitly allocate a DIFFERENT conversation
+hermes-auto open-item gmail:me@example.test MSG_ID  # override the sorter: give a skipped/briefed message its session
 hermes-auto backup
 ```
 
 `retry` and `new-session` queue work; run it explicitly or wait for the scheduler. Automatic retries are deliberately disabled after an uncertain outcome: first inspect the existing conversation. Deleting a conversation does not erase the event record and does not automatically recreate it. `new-session` is the explicit escape hatch.
+
+`open-item` takes the account and item id shown by `events` and queues the same notice-only session a `session` verdict would; later messages of that conversation follow into it. Todoist tasks are refused (they go through their plan session), and so is an item that already has a job.
+
+**Menu bar app (macOS):** `macos/HermesAutoBar` shows these decisions, source health and problems, and runs the commands above from buttons. See its README.
 
 On macOS:
 

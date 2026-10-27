@@ -13,3 +13,7 @@ config.json
 *.pem
 *token*.json
 *secret*.json
+
+# Swift (macos/)
+.build/
+.swiftpm/

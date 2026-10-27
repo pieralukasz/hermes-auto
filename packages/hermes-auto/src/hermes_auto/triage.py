@@ -805,6 +805,46 @@ def triage_mail(store, config, hermes, source, account, candidates, cursor_key=N
     return report
 
 
+MANUAL_OPEN = "otwarte ręcznie"
+
+
+def open_item(store, identity, item_id):
+    """The user overrides the sorter: a message it skipped, briefed or saw as read gets its session.
+
+    Same job as a `session` verdict (notice-only draft, same tool profile and route), queued for the next check.
+    Later messages of the conversation follow into it. Todoist tasks have their own plan flow and are refused.
+    Returns the job id."""
+    row = store.db.execute("SELECT * FROM triage_items WHERE account=? AND item_id=?", (identity, item_id)).fetchone()
+    if row is None:
+        raise ValueError(f"No sorter item {identity} {item_id}")
+    if row["kind"] == "task":
+        raise ValueError("Todoist tasks are changed through their plan session, not opened here")
+    if row["decision"] not in ("skip", "brief", "read"):
+        raise ValueError(f"The sorter already handled this item ({row['decision']}); nothing to open")
+    event_key = f"{identity}:{item_id}"
+    existing = store.db.execute("SELECT id FROM jobs WHERE event_key=? ORDER BY generation DESC",
+                                (event_key,)).fetchone()
+    if existing:
+        raise ValueError(f"Job {existing[0]} already exists for this item; use new-session {existing[0]}")
+    source, account = identity.split(":", 1)
+    item = json.loads(row["payload"] or "{}")
+    was = row["decision"] + (f": {row['reason']}" if row["reason"] else "")
+    verdict = {"decision": "session", "reason": f"{MANUAL_OPEN} (sortownik: {was})"[:500],
+               "summary": row["summary"]}
+    with store.db:
+        store.enqueue(event_key, source, item_id, item.get("subject") or "Mail", "draft",
+                      {**item, "triage": verdict, "deny_tools": deny_profile(item)})
+        job = store.db.execute("SELECT id, session_id FROM jobs WHERE event_key=? ORDER BY generation DESC",
+                               (event_key,)).fetchone()
+        if conversation_id(item):
+            store.db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)",
+                             (thread_key(source, account, conversation_id(item)), json.dumps(job["session_id"])))
+        # briefed=1: it has its own session now, so the next brief does not list it again.
+        store.db.execute("UPDATE triage_items SET decision='session', reason=?, briefed=1 WHERE account=? AND "
+                         "item_id=?", (verdict["reason"], identity, item_id))
+    return job["id"]
+
+
 def redirect_followup(store, row, item, reason, hermes=None):
     """Turn a reply that cannot join its conversation into a new session ("↩ <title>"), in one commit.
 
