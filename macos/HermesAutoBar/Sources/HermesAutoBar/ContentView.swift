@@ -15,6 +15,7 @@ enum Preview {
         Tab.allCases.first { "\($0)" == name }
     } : nil
     static let expand: String? = enabled ? environment["HERMES_AUTO_BAR_EXPAND"] : nil
+    static let source: String? = enabled ? environment["HERMES_AUTO_BAR_SOURCE"] : nil
 }
 
 struct ContentView: View {
@@ -29,7 +30,7 @@ struct ContentView: View {
             header
             Divider()
             if let status = model.status {
-                SourcesStrip(status: status, now: model.now)
+                SourcesStrip(status: status, now: model.now, model: model)
                 Divider()
                 Picker("", selection: $tab) {
                     ForEach(Tab.allCases) { tab in
@@ -60,6 +61,10 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 440, idealWidth: 460, minHeight: 520, idealHeight: 620)
+        .onChange(of: model.sourceFilter) { _, source in
+            // Problems are not per source; a chip click means "show me what came from there".
+            if source != nil && tab == .problems { tab = .events }
+        }
         .task { await model.refresh() }
     }
 
@@ -154,44 +159,111 @@ func symbol(_ overall: Overall) -> String {
     }
 }
 
+/// Source chips: last successful read per source. A click shows only that source's events and sessions;
+/// a second click (or the chip in the list header) shows everything again. ZimaBlade opens relay details.
 struct SourcesStrip: View {
     var status: Status
     var now: Date
+    @Bindable var model: Model
+    @State private var relayDetails = false
 
     var body: some View {
         let sources = (status.health?.sources ?? [:]).sorted { $0.key < $1.key }
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
                 if let relay = status.health?.relay {
-                    chip(symbol: "antenna.radiowaves.left.and.right", label: "ZimaBlade",
-                         detail: relay.connected == true ? "połączony" : "rozłączony",
-                         bad: relay.connected != true,
-                         help: "Relay zdarzeń z ZimaBlade (Slack, GitHub, webhooki)")
+                    Button { relayDetails.toggle() } label: {
+                        chip(symbol: "antenna.radiowaves.left.and.right", label: "ZimaBlade",
+                             detail: relay.connected == true ? "połączony" : "rozłączony",
+                             bad: relay.connected != true, selected: false)
+                    }
+                    .help("Relay zdarzeń z ZimaBlade (Slack, GitHub, webhooki). Kliknij po szczegóły.")
+                    .popover(isPresented: $relayDetails, arrowEdge: .bottom) { RelayDetails(relay: relay, now: now) }
                 }
                 ForEach(sources, id: \.key) { name, health in
                     let failing = health.retryAt.map { $0 > now.timeIntervalSince1970 } ?? false
-                    chip(symbol: sourceSymbol(name), label: sourceLabel(name),
-                         detail: failing ? "błąd odczytu" : Times.ago(health.lastPoll.map { Date(timeIntervalSince1970: $0) }, now: now),
-                         bad: failing,
-                         help: failing ? "Odczyt się nie udał; ponowienie samo, z rosnącym odstępem"
-                             : "Ostatni udany odczyt źródła")
+                    let selected = model.sourceFilter == name
+                    Button {
+                        withAnimation(.snappy(duration: 0.15)) {
+                            model.sourceFilter = SourceScope.toggle(model.sourceFilter, name)
+                        }
+                    } label: {
+                        chip(symbol: sourceSymbol(name), label: sourceLabel(name),
+                             detail: failing ? "błąd odczytu"
+                                 : Times.ago(health.lastPoll.map { Date(timeIntervalSince1970: $0) }, now: now),
+                             bad: failing, selected: selected)
+                    }
+                    .help(selected ? "Pokaż wszystkie źródła"
+                          : "Pokaż tylko \(sourceLabel(name))" + (failing
+                              ? ". Odczyt się nie udał; ponowienie samo, z rosnącym odstępem" : ""))
+                    .accessibilityAddTraits(selected ? .isSelected : [])
                 }
             }
+            .buttonStyle(.plain)
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
         }
     }
 
-    private func chip(symbol: String, label: String, detail: String, bad: Bool, help: String) -> some View {
+    private func chip(symbol: String, label: String, detail: String, bad: Bool, selected: Bool) -> some View {
         HStack(spacing: 4) {
             Image(systemName: symbol).imageScale(.small)
             Text(label).font(.caption.weight(.medium))
-            Text(detail).font(.caption).foregroundStyle(bad ? .red : .secondary)
+            Text(detail).font(.caption)
+                .foregroundStyle(selected ? AnyShapeStyle(.white.opacity(0.85)) : bad ? AnyShapeStyle(.red)
+                                 : AnyShapeStyle(.secondary))
         }
+        .foregroundStyle(selected ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
-        .background(bad ? AnyShapeStyle(.red.opacity(0.12)) : AnyShapeStyle(.quaternary.opacity(0.6)), in: Capsule())
-        .help(help)
+        .background(selected ? AnyShapeStyle(Color.accentColor)
+                    : bad ? AnyShapeStyle(.red.opacity(0.12)) : AnyShapeStyle(.quaternary.opacity(0.6)),
+                    in: Capsule())
+        .contentShape(Capsule())
+    }
+}
+
+struct RelayDetails: View {
+    var relay: Listener
+    var now: Date
+
+    var body: some View {
+        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
+            GridRow { Text("Połączenie").foregroundStyle(.secondary)
+                Text(relay.connected == true ? "połączony" : "rozłączony") }
+            GridRow { Text("Ostatnie zdarzenie").foregroundStyle(.secondary)
+                Text(ago(relay.lastEventAt)) }
+            GridRow { Text("Sygnał życia").foregroundStyle(.secondary)
+                Text(ago(relay.heartbeat)) }
+        }
+        .font(.callout)
+        .padding(12)
+    }
+
+    private func ago(_ value: Double?) -> String {
+        guard let value else { return "–" }
+        let text = Times.ago(Date(timeIntervalSince1970: value), now: now)
+        return text == "teraz" ? "przed chwilą" : "\(text) temu"
+    }
+}
+
+/// Shown above a list while a source chip is selected; the x clears it.
+struct SourceScopeBar: View {
+    @Bindable var model: Model
+
+    var body: some View {
+        if let source = model.sourceFilter {
+            HStack(spacing: 6) {
+                Image(systemName: sourceSymbol(source)).imageScale(.small)
+                Text("Tylko \(sourceLabel(source))").font(.caption.weight(.medium))
+                Button { withAnimation(.snappy(duration: 0.15)) { model.sourceFilter = nil } } label: {
+                    Image(systemName: "xmark.circle.fill")
+                }
+                .buttonStyle(.borderless)
+                .help("Pokaż wszystkie źródła")
+            }
+            .foregroundStyle(Color.accentColor)
+        }
     }
 }
 

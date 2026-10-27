@@ -10,6 +10,10 @@ explicit corrections. It reads and changes the automation only through the insta
 | Sesje | Sessions the automation opened, with their status | Open in Hermes (`hermes://open/<id>`) |
 | Problemy | `needs_attention` jobs and replies, source read errors, items waiting for a classifier retry | `retry`, `new-session`, `retry-followup`; **Odłóż** hides a problem in the app until it changes |
 
+Source chips (Gmail, GitHub, …) show each source's last successful read; a click lists only that source's
+events and sessions (a second click or the x next to "Tylko …" shows everything again). The ZimaBlade chip opens
+the relay's connection details.
+
 The header pauses and resumes the automation. A check in progress holds the CLI lock; actions retry for 30 s.
 Queued sessions start on the next scheduled check (within a minute).
 
@@ -28,7 +32,7 @@ open -n --env HERMES_AUTO_BAR_FIXTURE=$PWD/Tests/HermesAutoCoreTests/Fixtures \
   --env HERMES_AUTO_BAR_TAB=problems ".build/Hermes Auto Bar.app" --args --window
 ```
 
-`HERMES_AUTO_BAR_EXPAND=<item id>` opens one timeline row. Both only work with `HERMES_AUTO_BAR_FIXTURE`.
+`HERMES_AUTO_BAR_EXPAND=<item id>` opens one timeline row, `HERMES_AUTO_BAR_SOURCE=gmail` selects a source chip. Both only work with `HERMES_AUTO_BAR_FIXTURE`.
 
 Pure logic (decoding, problems, filters, times, links) lives in `HermesAutoCore` with unit tests; the SwiftUI layer
 has no tests and needs a manual check.

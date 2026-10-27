@@ -52,6 +52,20 @@ final class HermesAutoCoreTests: XCTestCase {
         XCTAssertEqual(ids(.todoist), ["t-77"])
     }
 
+    func testSourceChipNarrowsEventsAndSessionsAndTogglesOff() throws {
+        let events = try Decode.events(fixture("events"))
+        XCTAssertEqual(SourceScope.events(events, filter: .all, source: "gmail").map(\.itemId), ["m-201", "m-200"])
+        XCTAssertEqual(SourceScope.events(events, filter: .skipped, source: "gmail").map(\.itemId), ["m-201"])
+        XCTAssertEqual(SourceScope.events(events, filter: .all, source: nil).count, 5)
+        XCTAssertTrue(SourceScope.events(events, filter: .all, source: "linear").isEmpty)
+        let jobs = try Decode.status(fixture("status")).jobs
+        XCTAssertEqual(SourceScope.jobs(jobs, source: "github").map(\.id), [44])
+        XCTAssertEqual(SourceScope.jobs(jobs, source: nil).count, 4)
+        XCTAssertEqual(SourceScope.toggle(nil, "github"), "github")
+        XCTAssertEqual(SourceScope.toggle("gmail", "github"), "github")
+        XCTAssertNil(SourceScope.toggle("github", "github"))
+    }
+
     func testTimesAreUTCAndGroupedByLocalDay() throws {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = try XCTUnwrap(TimeZone(identifier: "Europe/Warsaw"))

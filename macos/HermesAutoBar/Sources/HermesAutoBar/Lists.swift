@@ -6,18 +6,22 @@ struct EventsList: View {
     @Binding var filter: EventFilter
 
     var body: some View {
-        let shown = model.events.filter(filter.includes)
+        let shown = SourceScope.events(model.events, filter: filter, source: model.sourceFilter)
         VStack(spacing: 0) {
-            Picker("Pokaż", selection: $filter) {
-                ForEach(EventFilter.allCases) { Text($0.rawValue).tag($0) }
+            HStack {
+                Picker("Pokaż", selection: $filter) {
+                    ForEach(EventFilter.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.menu)
+                .fixedSize()
+                Spacer()
+                SourceScopeBar(model: model)
             }
-            .pickerStyle(.menu)
-            .fixedSize()
-            .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 12)
             .padding(.bottom, 4)
             if shown.isEmpty {
-                Empty(text: "Brak zdarzeń w tym widoku")
+                Empty(text: model.sourceFilter.map { "Brak zdarzeń z \(sourceLabel($0)) w tym widoku" }
+                      ?? "Brak zdarzeń w tym widoku")
             } else {
                 List {
                     ForEach(Times.grouped(shown, now: model.now), id: \.0) { day, events in
@@ -121,9 +125,23 @@ struct JobsList: View {
     @Bindable var model: Model
 
     var body: some View {
-        let jobs = Array(model.recentJobs.prefix(150))
+        let jobs = Array(SourceScope.jobs(model.recentJobs, source: model.sourceFilter).prefix(150))
+        VStack(spacing: 0) {
+            if model.sourceFilter != nil {
+                SourceScopeBar(model: model)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 4)
+            }
+            sessions(jobs)
+        }
+    }
+
+    @ViewBuilder
+    private func sessions(_ jobs: [Job]) -> some View {
         if jobs.isEmpty {
-            Empty(text: "Automat nie otworzył jeszcze żadnej sesji")
+            Empty(text: model.sourceFilter.map { "Brak sesji z \(sourceLabel($0))" }
+                  ?? "Automat nie otworzył jeszcze żadnej sesji")
         } else {
             List(jobs) { job in
                 HStack(spacing: 6) {

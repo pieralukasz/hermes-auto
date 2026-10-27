@@ -95,6 +95,23 @@ public enum EventFilter: String, CaseIterable, Sendable, Identifiable {
     }
 }
 
+/// What the lists show once a source chip is selected (nil = every source).
+public enum SourceScope {
+    public static func events(_ events: [Event], filter: EventFilter, source: String?) -> [Event] {
+        events.filter { filter.includes($0) && (source == nil || $0.source == source) }
+    }
+
+    public static func jobs(_ jobs: [Job], source: String?) -> [Job] {
+        guard let source else { return jobs }
+        return jobs.filter { $0.source == source }
+    }
+
+    /// A second click on the selected chip clears the selection.
+    public static func toggle(_ current: String?, _ tapped: String) -> String? {
+        current == tapped ? nil : tapped
+    }
+}
+
 public func sourceLabel(_ source: String) -> String {
     switch source {
     case "gmail": return "Gmail"

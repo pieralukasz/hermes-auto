@@ -14,6 +14,8 @@ final class Model {
     var notice: String?
     var noticeIsError = false
     var dismissed: Set<String>
+    /// Source chip selected in the strip: only its events and sessions are listed (nil = all).
+    var sourceFilter: String? = Preview.source
 
     let runner: CommandRunner
     let isFixture: Bool
