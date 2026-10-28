@@ -1,9 +1,8 @@
 import json
-from types import SimpleNamespace
 
 import pytest
 
-from hermes_auto.bridge import guard_agent
+from hermes_auto import bridge
 from hermes_auto.config import defaults
 from hermes_auto.runner import process_jobs
 from hermes_auto.store import Store, locked
@@ -212,20 +211,37 @@ def test_stream_cursor_and_job_are_one_transaction(store):
     assert store.db.execute("SELECT COUNT(*) FROM seen_items").fetchone()[0] == 0
 
 
-@pytest.mark.parametrize("forbidden", ["terminal", "execute_code", "delegate_task", "tool_call", "gmail_send"])
-def test_preparation_guard_blocks_inline_and_registry_tools(forbidden):
-    class Agent:
-        def __init__(self, **kwargs):
-            self.tools = [{"function": {"name": "terminal"}}, {"function": {"name": "web_search"}}]
-        def _execute_tool_calls(self, message, *args, **kwargs):
-            return "executed"
-    guard_agent(Agent, {"web_search"})
-    agent = Agent()
-    assert agent.valid_tool_names == {"web_search"}
-    with pytest.raises(RuntimeError, match="blocked"):
-        agent._execute_tool_calls(SimpleNamespace(tool_calls=[SimpleNamespace(
-            function=SimpleNamespace(name=forbidden))]))
-    assert agent._execute_tool_calls({"tool_calls": [{"function": {"name": "web_search"}}]}) == "executed"
+@pytest.mark.parametrize("deny, full, mode, toolsets, limits", [
+    (False, False, "draft", [], (8, 180)),                       # bounded preparation: no tools at all
+    (False, False, "research", ["web"], (8, 180)),               # ... or web reads only
+    (True, False, "draft", ["hermes-auto", "session_search"], (8, 180)),       # third-party mail
+    ("research", False, "draft", ["hermes-auto", "session_search"], (60, 900)),  # Slack/GitHub research
+    ("private", False, "draft", [], (8, 180)),                   # private content: nothing
+    (False, True, "agent", None, (60, 900)),                     # Todoist task: the profile's own toolsets
+])
+def test_launch_plan_freezes_the_toolsets_of_each_kind_of_run(deny, full, mode, toolsets, limits):
+    """The gateway freezes these at creation: a third-party session never holds terminal, files,
+    skill_manage or a sending tool, even when the guard plugin is missing."""
+    config = {**defaults(), "max_turns": 8, "run_budget_seconds": 180, "agent_max_turns": 60,
+              "agent_run_budget_seconds": 900}
+    _, params = bridge.launch_plan({"deny_tools": deny, "full_tools": full, "job": {"mode": mode},
+                                    "route": {"provider": "work", "model": ""}}, config)
+    assert params.get("toolsets") == toolsets
+    assert (params["max_turns"], params["run_budget"]) == limits
+    assert params["provider"] == "work" and "model" not in params
+    assert params.get("ignore_rules") is (True if not deny and not full else None)
+    for name in ("terminal", "file", "skills", "web", "delegation", "code_execution"):
+        if deny:
+            assert name not in (params.get("toolsets") or [])
+
+
+def test_a_run_refuses_a_session_whose_frozen_launch_differs():
+    params = {"toolsets": ["hermes-auto", "session_search"], "max_turns": 60, "run_budget": 900}
+    assert bridge.launch_mismatch({"source": "gui", **params}, params) == []
+    assert bridge.launch_mismatch(None, params) == ["source", "toolsets", "max_turns", "run_budget"]
+    assert bridge.launch_mismatch({"source": "gui", **params, "toolsets": ["terminal"]}, params) == ["toolsets"]
+    assert bridge.launch_mismatch({"source": "gui", **params, "model": "m", "model_requested": "alias"},
+                                  {**params, "model": "alias"}) == []
 
 
 def test_prompt_treats_source_as_data(store, config):
@@ -283,29 +299,6 @@ def test_full_tools_budget_is_separate(tmp_path):
     assert hermes.budget({"source": "todoist", "mode": "draft"}) == 900
     assert hermes.budget({"source": "gmail", "mode": "draft"}) == 180
     assert hermes.budget({"source": "gmail", "mode": "agent"}) == 900
-
-
-def test_desktop_parity_lifts_oneshot_limits(monkeypatch):
-    import sys
-    import types
-    from hermes_auto.bridge import desktop_parity
-    agent_pkg = types.ModuleType("agent")
-    footprint = types.ModuleType("agent.oneshot_footprint")
-    footprint.is_single_query_session = lambda: True
-    footprint.prune_oneshot_tools = lambda tools: []
-    agent_pkg.oneshot_footprint = footprint
-    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
-    monkeypatch.setitem(sys.modules, "agent.oneshot_footprint", footprint)
-
-    class Agent:
-        def __init__(self, platform=None):
-            self.platform = platform
-
-    desktop_parity(Agent)
-    assert footprint.is_single_query_session() is False
-    assert footprint.prune_oneshot_tools([{"function": {"name": "skill_manage"}}])
-    assert Agent(platform="cli").platform == "desktop"
-    assert Agent(platform="telegram").platform == "telegram"
 
 
 def test_session_title_fits_hermes_limit():

@@ -1,12 +1,9 @@
 """Read-only command grammar and tool policy for unattended third-party turns."""
-import json
-import sys
-import types
-from types import SimpleNamespace
 
 import pytest
 
-from hermes_auto.bridge import deny_tool_execution, read_only_command
+from hermes_auto.guard_plugin import policy
+from hermes_auto.guard_plugin.policy import read_only_command
 
 SLACK = "python3 ~/.hermes/skills/tap-in/tapin-slack/scripts/slack_mcp.py"
 GOOGLE = "python ~/.hermes/skills/productivity/google-workspace/scripts/google_api.py"
@@ -134,62 +131,41 @@ def test_private_profile_allows_no_command(command):
 
 # ── Tool policy at the batch boundary, with a fake agent ─────────────────────
 
-@pytest.fixture
-def agent_class(monkeypatch):
-    errors = []
-
-    def append(messages, calls, payload):
-        for call in calls:
-            result = json.loads(payload(call))
-            # A refused call is a neutral "not run" result: no `error` key (Desktop would paint it red).
-            assert result["skipped"] is True and "error" not in result
-            errors.append((call.function.name, result["note"]))
-
-    module = types.ModuleType("agent.turn_tool_validation")
-    module._append_tool_error_results = append
-    monkeypatch.setitem(sys.modules, "agent", types.ModuleType("agent"))
-    monkeypatch.setitem(sys.modules, "agent.turn_tool_validation", module)
-
-    class Agent:
-        def __init__(self, **kwargs):
-            self.kwargs = kwargs
-
-        def _execute_tool_calls(self, message, messages, *args, **kwargs):
-            return "executed"
-
-    Agent.errors = errors
-    return Agent
+def entry(profile):
+    return {"version": 1, "profile": {True: "mail", "slack": "research", "unknown": "private"}.get(profile, profile),
+            "until": None}
 
 
-def batch(*calls):
-    return SimpleNamespace(tool_calls=[SimpleNamespace(function=SimpleNamespace(
-        name=name, arguments=json.dumps(arguments))) for name, arguments in calls])
+def refused(profile, name, arguments):
+    """Whether the guard (gateway hook) refuses this call in an automatic session of `profile`."""
+    if name == policy.READ_TOOL:
+        return policy.read_argv(arguments.get("command"), entry(profile)["profile"]) is None
+    return policy.decide(name, arguments, entry(profile), dangerous=lambda command: False) is not None
 
 
 WRAPPERS = [("tool_call", {"calls": [{"name": "terminal", "arguments": {"command": "td today"}}]}),
+            ("tool_call", {"name": "hermes_auto_read", "calls": "not json"}),
             ("execute_code", {"code": "print(1)"}),
             ("delegate_task", {"goal": "send the reply"}),
-            ("terminal", {"command": "td today", "background": True})]
+            ("terminal", {"command": "td today", "background": True}),
+            ("skill_manage", {"action": "create", "name": "x"})]
 
 
 @pytest.mark.parametrize("profile", [True, "research", "slack", "private", "unknown"])
-@pytest.mark.parametrize("wrapper", WRAPPERS, ids=[name for name, _ in WRAPPERS])
-def test_restricted_profiles_refuse_tool_wrappers(agent_class, profile, wrapper):
-    deny_tool_execution(agent_class, profile=profile)
-    messages = []
-    assert agent_class()._execute_tool_calls(batch(wrapper), messages) is None
-    assert [name for name, _ in agent_class.errors] == [wrapper[0]]
+@pytest.mark.parametrize("wrapper", WRAPPERS, ids=[f"{name}{index}" for index, (name, _) in enumerate(WRAPPERS)])
+def test_restricted_profiles_refuse_tool_wrappers(profile, wrapper):
+    assert refused(profile, *wrapper)
 
 
 @pytest.mark.parametrize("name, arguments", [
     ("skill_view", {"name": "x"}), ("skills_list", {}), ("session_search", {"query": "x"}),
     ("web_search", {"query": "x"}), ("web_extract", {"urls": ["https://a.test"]}),
-    ("terminal", {"command": "td today"}),
+    ("terminal", {"command": "td today"}), ("hermes_auto_read", {"command": "td today"}),
+    ("tool_search", {"query": "td"}),
 ])
-def test_private_profile_executes_no_tool(agent_class, name, arguments):
-    deny_tool_execution(agent_class, profile="private")
-    assert agent_class()._execute_tool_calls(batch((name, arguments)), []) is None
-    assert agent_class.errors and "no tools" in agent_class.errors[0][1]
+def test_private_profile_executes_no_tool(name, arguments):
+    assert "no tools" in policy.decide(name, arguments, entry("private"))
+    assert policy.read_argv("td today", "private") is None
 
 
 @pytest.mark.parametrize("command", ["git log -p HEAD", "git show HEAD", "git grep phrase", "git branch"])
@@ -199,15 +175,16 @@ def test_unattended_research_never_executes_repository_config(command):
 
 @pytest.mark.parametrize("tool,args", [("web_search", {"query": "x"}),
                                       ("web_extract", {"urls": ["https://external.test"]})])
-def test_research_cannot_send_private_context_to_arbitrary_web(agent_class, tool, args):
-    deny_tool_execution(agent_class, profile="research")
-    assert agent_class()._execute_tool_calls(batch((tool, args)), []) is None
+def test_research_cannot_send_private_context_to_arbitrary_web(tool, args):
+    assert refused("research", tool, args)
+    assert refused("research", "tool_call", {"name": tool, "arguments": args})
 
 
-def test_profiles_keep_their_reads(agent_class):
-    deny_tool_execution(agent_class, profile="research")
-    reads = batch(("skills_list", {}), ("terminal", {"command": "gh pr view 12"}))
-    assert agent_class()._execute_tool_calls(reads, []) == "executed"
+def test_profiles_keep_their_reads():
+    for name, arguments in (("hermes_auto_skills_list", {}), ("hermes_auto_read", {"command": "gh pr view 12"}),
+                            ("tool_search", {"query": "read"}), ("session_search", {"query": "x"}),
+                            ("tool_call", {"name": "hermes_auto_read", "arguments": {"command": "gh pr view 12"}})):
+        assert not refused("research", name, arguments), name
 
 
 @pytest.mark.parametrize("profile", [True, "research"])
@@ -226,7 +203,7 @@ def test_linear_view_requires_no_attachment_download():
     assert read_only_command("linear issue view WEB-12 --no-download", "research") is True
 
 
-def test_mail_profile_keeps_its_reads(agent_class):
-    deny_tool_execution(agent_class, profile=True)
-    assert agent_class()._execute_tool_calls(batch(("terminal", {"command": "td today"})), []) == "executed"
-    assert agent_class()._execute_tool_calls(batch(("web_search", {"query": "x"})), []) is None
+def test_mail_profile_keeps_its_reads():
+    assert not refused(True, "hermes_auto_read", {"command": "td today"})
+    assert refused(True, "hermes_auto_read", {"command": "gh pr view 12"})  # research reads only
+    assert refused(True, "web_search", {"query": "x"})

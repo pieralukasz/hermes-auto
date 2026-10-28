@@ -4,7 +4,7 @@ import json
 import pytest
 
 from hermes_auto import triage
-from hermes_auto.bridge import read_only_command
+from hermes_auto.guard_plugin.policy import read_only_command
 from hermes_auto.cli import fast_sources, run_triage
 from hermes_auto.config import defaults
 from hermes_auto.hermes import Hermes, deny_mode

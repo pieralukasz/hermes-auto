@@ -123,6 +123,15 @@ class Store:
                         (*fields.values(), job_id))
         self.db.commit()
 
+    def rebind_session(self, old, new):
+        """Move every reference to session `old` (a job's reserved id) to `new` (the id Hermes gave it):
+        the job, routed replies and meta values such as a thread's session, in one transaction."""
+        with self.db:
+            self.db.execute("UPDATE jobs SET session_id=?,updated=CURRENT_TIMESTAMP WHERE session_id=?", (new, old))
+            self.db.execute("UPDATE followups SET session_id=?,updated=CURRENT_TIMESTAMP WHERE session_id=?",
+                            (new, old))
+            self.db.execute("UPDATE meta SET value=? WHERE value=?", (json.dumps(new), json.dumps(old)))
+
     def background_runs(self):
         """IDs of `running` jobs that have a background run handle; `collect` settles them, not recovery."""
         return {job["id"] for job in self.rows() if job["status"] == "running" and self.get_meta(f"run:{job['id']}")}

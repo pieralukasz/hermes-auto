@@ -13,6 +13,8 @@ from .runner import full_tools
 
 # Hermes SessionDB.MAX_TITLE_LENGTH; a longer title makes session creation fail.
 TITLE_LIMIT = 100
+# A line the bridge writes to stderr when it refuses a create or run (bridge.REFUSAL_MARK).
+REFUSAL_MARK = "hermes-auto-refusal:"
 
 
 def deny_mode(job):
@@ -136,6 +138,10 @@ class Hermes:
             # Keep private diagnostics locally; CLI output does not expose email/task bodies.
             diagnostic = stderr[-12000:]
             private_json(self.home / "last-error.json", {"action": action, "error": diagnostic})
+            refused = [line.split(REFUSAL_MARK, 1)[1].strip() for line in stderr.splitlines() if REFUSAL_MARK in line]
+            if refused:
+                # The bridge refused before anything reached the session; its sentence is for the user.
+                raise RuntimeError(refused[-1])
             if "hermes-refusal-reason: SESSION_NOT_OWNED" in diagnostic:
                 raise SessionBusy(f"Hermes {action} refused: the session is open in another window")
             raise RuntimeError(f"Hermes {action} failed (exit {returncode}); see local last-error.json")
@@ -254,8 +260,10 @@ class Hermes:
             if self.config["language"].lower() in ("polish", "polski", "pl") else
             "This session is ready. Automatic preparation is disabled; continue when you are ready.")
         hidden = bool(self.config.get("triage", {}).get("hide_sessions", False))
+        # The gateway creates a run's session (its id may differ from the reserved one); `open` keeps it.
         return self.invoke("create", job, title=title, prompt=prompt, open_message=message, hidden=hidden,
-                           route=job_route(job, self.config))
+                           full_tools=full_tools(job), deny_tools=deny_mode(job),
+                           route=job_route(job, self.config))["session_id"]
 
     def run(self, job, prompt, display=None):
         deny = deny_mode(job)

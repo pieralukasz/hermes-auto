@@ -1,48 +1,30 @@
-"""Opt-in contract check with installed Hermes, no network and no model calls."""
+"""Opt-in contract check with installed Hermes (>= v0.22.5: every turn runs in a gateway), no network, no real
+model: a local fake Anthropic server answers. Each test gets its own Hermes root OUTSIDE ~/.hermes (a home under
+it would be served by the user's own gateway), started and stopped here; nothing touches the user's sessions.
+
+Run: HERMES_AUTO_TEST_PYTHON=<first element of `hermes --print-runtime-command`> \
+     HERMES_AUTO_TEST_SOURCE=~/.hermes/hermes-agent .venv/bin/pytest -q tests/test_real_hermes.py
+"""
 import http.server
 import json
 import os
+import shutil
+import signal
+import sqlite3
 import threading
+import time
+import uuid
+from pathlib import Path
 
 import pytest
 
+from hermes_auto import guard
 from hermes_auto.config import defaults
+from hermes_auto.guard_plugin import policy
 from hermes_auto.hermes import Hermes
 from hermes_auto.store import Store
 
-
-@pytest.mark.skipif(not os.environ.get("HERMES_AUTO_TEST_PYTHON"), reason="local Hermes runtime not configured")
-def test_real_session_api_two_profiles(tmp_path):
-    ids = []
-    for name in ("profile-a", "profile-b", "profile-a"):
-        home = tmp_path / name
-        home.mkdir(exist_ok=True)
-        hermes_home = home / "hermes"
-        hermes_home.mkdir(exist_ok=True)
-        config = {**defaults(), "hermes_home": str(hermes_home),
-                  "hermes_python": os.environ["HERMES_AUTO_TEST_PYTHON"],
-                  "hermes_source": os.environ["HERMES_AUTO_TEST_SOURCE"],
-                  "triage": {"hide_sessions": True}}
-        store = Store(home, initialize=True)
-        try:
-            store.enqueue("example", "todoist", "x", "Integration test", "open", {})
-            store.db.commit()
-            job = store.rows()[0]
-            hermes = Hermes(config, home)
-            assert hermes.invoke("doctor")["ok"]
-            hermes.create(job, "Synthetic test context")
-            hermes.create(job, "Synthetic test context")
-            info = hermes.invoke("inspect", job)
-            assert (info["exists"], info["messages"], info["archived"]) == (True, 2, False)
-            assert hermes.invoke("inspect", job, needles=["Synthetic test context"])["delivered"] is True
-            assert hermes.invoke("inspect", job, needles=["not delivered"])["delivered"] is False
-            assert hermes.archive_states([job["session_id"], "missing"]) == {
-                job["session_id"]: False, "missing": None}
-            assert hermes.find_session(subject="Synthetic subject", sent=[{"ts": 1.0, "to": []}]) is None
-            ids.append(job["session_id"])
-        finally:
-            store.close()
-    assert ids[0] == ids[2] and ids[0] != ids[1]
+CONTRACT = pytest.mark.skipif(not os.environ.get("HERMES_AUTO_TEST_PYTHON"), reason="local Hermes runtime not configured")
 
 
 @pytest.mark.skipif(not os.environ.get("HERMES_AUTO_TEST_PYTHON"), reason="local Hermes runtime not configured")
@@ -104,39 +86,6 @@ def test_classify_route_reads_provider_key_from_hermes_env(tmp_path):
     assert seen and all("synthetic-work-key" in header for header in seen)
 
 
-@pytest.mark.skipif(not os.environ.get("HERMES_AUTO_TEST_PYTHON"), reason="local Hermes runtime not configured")
-def test_routed_session_row_records_its_provider(tmp_path):
-    """Desktop resumes a session on `model_config.provider`: a routed job's row must carry the route's provider,
-    or a reply in a work-account session runs on the profile's default account."""
-    import sqlite3
-
-    hermes_home = tmp_path / "hermes"
-    hermes_home.mkdir()
-    config = {**defaults(), "hermes_home": str(hermes_home),
-              "hermes_python": os.environ["HERMES_AUTO_TEST_PYTHON"],
-              "hermes_source": os.environ["HERMES_AUTO_TEST_SOURCE"],
-              "routes": [{"match": {"source": "example", "owner": "acme"}, "provider": "work-test"}]}
-    store = Store(tmp_path, initialize=True)
-    try:
-        store.enqueue("routed", "example", "r", "Routed", "open", {"owner": "acme"})
-        store.enqueue("plain", "example", "p", "Plain", "open", {"owner": "other"})
-        store.db.commit()
-        routed, plain = store.rows()
-        hermes = Hermes(config, tmp_path)
-        hermes.create(routed, "Synthetic test context")
-        hermes.create(plain, "Synthetic test context")
-    finally:
-        store.close()
-    db = sqlite3.connect(hermes_home / "state.db")
-    try:
-        stored = dict(db.execute("SELECT id, json_extract(model_config, '$.provider') FROM sessions").fetchall())
-    finally:
-        db.close()
-    assert stored[routed["session_id"]] == "work-test"
-    assert stored[plain["session_id"]] is None
-
-
-
 def fake_anthropic(turns, seen):
     """A local Anthropic Messages server answering each request with the next scripted turn (streamed)."""
     class Server(http.server.BaseHTTPRequestHandler):
@@ -182,57 +131,214 @@ def fake_anthropic(turns, seen):
     return server
 
 
-@pytest.mark.skipif(not os.environ.get("HERMES_AUTO_TEST_PYTHON"), reason="local Hermes runtime not configured")
-def test_sorted_run_shows_the_card_and_skips_only_the_refused_call(tmp_path):
-    """Real Hermes, local fake model: the transcript shows the card while the sent prompt is kept as api_content;
-    in a batch of a read and a refused call, the read runs and the refused call gets a neutral result."""
-    import sqlite3
+class World:
+    """A temporary Hermes root with a fake model, optionally the guard plugin, and one gateway (idle-exit)."""
 
-    seen = []
-    turns = [([{"type": "tool_use", "id": "toolu_read", "name": "skills_list", "input": {}},
-               {"type": "tool_use", "id": "toolu_git", "name": "terminal", "input": {"command": "git log -3"}}],
-              "tool_use")]
-    server = fake_anthropic(turns, seen)
-    hermes_home = tmp_path / "hermes"
-    hermes_home.mkdir()
-    (hermes_home / "config.yaml").write_text(
-        "providers:\n  work-test:\n    name: Work (test)\n"
-        f"    api: http://127.0.0.1:{server.server_port}\n    transport: anthropic_messages\n"
-        "    key_env: HERMES_AUTO_TEST_WORK_KEY\n    default_model: test-model\n    models: [test-model]\n")
-    (hermes_home / ".env").write_text("HERMES_AUTO_TEST_WORK_KEY=synthetic-work-key\n")
-    config = {**defaults(), "hermes_home": str(hermes_home),
-              "hermes_python": os.environ["HERMES_AUTO_TEST_PYTHON"],
-              "hermes_source": os.environ["HERMES_AUTO_TEST_SOURCE"],
-              "routes": [{"match": {"source": "example"}, "provider": "work-test"}]}
-    store = Store(tmp_path, initialize=True)
+    def __init__(self, root, turns, *, guard_enabled=True, approvals_off=False):
+        self.root, self.seen = root, []
+        self.server = fake_anthropic(turns, self.seen)
+        self.home = root / "hermes"
+        self.home.mkdir(parents=True)
+        # Dependency state is per Hermes root: borrow the installed one, as every Hermes process reads it.
+        (self.home / "installs").symlink_to(Path.home() / ".hermes" / "installs")
+        (self.home / "config.yaml").write_text(
+            "model:\n  default: test-model\n  provider: work-test\n"
+            "providers:\n  work-test:\n    name: Work (test)\n"
+            f"    api: http://127.0.0.1:{self.server.server_port}\n    transport: anthropic_messages\n"
+            "    key_env: HERMES_AUTO_TEST_WORK_KEY\n    default_model: test-model\n    models: [test-model]\n"
+            + ("plugins:\n  enabled: [hermes-auto-guard]\n" if guard_enabled else "")
+            + ("approvals:\n  mode: 'off'\n" if approvals_off else ""))
+        (self.home / ".env").write_text("HERMES_AUTO_TEST_WORK_KEY=synthetic-work-key\n")
+        guard.install(self.home)
+        bin_dir = root / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "td").write_text("#!/bin/sh\necho \"synthetic td: $*\"\n")
+        (bin_dir / "td").chmod(0o755)
+        self.path = f"{bin_dir}:{os.environ['PATH']}"
+        self.config = {**defaults(), "hermes_home": str(self.home),
+                       "hermes_python": os.environ["HERMES_AUTO_TEST_PYTHON"],
+                       "hermes_source": os.environ["HERMES_AUTO_TEST_SOURCE"],
+                       "routes": [{"match": {"source": "example"}, "provider": "work-test"}]}
+        self.store = Store(root, initialize=True)
+        self.hermes = Hermes(self.config, root)
+
+    def job(self, key, title="Synthetic: review", mode="draft", source="example", **payload):
+        self.store.enqueue(key, source, key, title, mode, payload)
+        self.store.db.commit()
+        return next(job for job in self.store.rows() if job["event_key"] == key)
+
+    def db(self):
+        db = sqlite3.connect(self.home / "state.db")
+        db.row_factory = sqlite3.Row
+        return db
+
+    def tool_results(self, sid):
+        db = self.db()
+        try:
+            return {row["tool_call_id"]: json.loads(row["content"]) if row["content"].startswith("{") else row["content"]
+                    for row in db.execute("SELECT tool_call_id, content FROM messages WHERE session_id=? AND role='tool'",
+                                          (sid,))}
+        finally:
+            db.close()
+
+    def close(self):
+        self.store.close()
+        self.server.shutdown()
+        pid_file = self.home / "gateway.pid"
+        try:
+            record = json.loads(pid_file.read_text())
+        except (OSError, ValueError):
+            record = {}
+        if record.get("hermes_home") == str(self.home) and record.get("pid"):
+            try:
+                os.kill(record["pid"], signal.SIGTERM)
+                for _ in range(50):
+                    os.kill(record["pid"], 0)
+                    time.sleep(0.2)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.fixture
+def make_world(monkeypatch):
+    base = Path(os.environ.get("HERMES_AUTO_TEST_ROOT") or "~/.cache/hermes-auto-contract").expanduser()
+    worlds = []
+    monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")  # never sync or re-mint the checkout's launchers
+
+    def make(turns=(), **options):
+        world = World(base / uuid.uuid4().hex[:12], list(turns), **options)
+        monkeypatch.setenv("PATH", world.path)
+        worlds.append(world)
+        return world
+    yield make
+    for world in worlds:
+        world.close()
+        shutil.rmtree(world.root, ignore_errors=True)
+
+
+def bridged(call_id, name, arguments):
+    """A call through Hermes' Tool Search bridge (plugin tools and session_search are deferred behind it)."""
+    return {"type": "tool_use", "id": call_id, "name": "tool_call", "input": {"name": name, "arguments": arguments}}
+
+
+@CONTRACT
+def test_open_sessions_are_imported_by_the_gateway_under_their_reserved_id(make_world):
+    world = make_world()
+    brief = world.job("brief", title="Brief", mode="open")
+    routed = world.job("routed", title="Routed", mode="open", owner="acme")
+    assert world.hermes.invoke("doctor")["ok"]
+    for _ in range(2):  # idempotent
+        assert world.hermes.create(brief, "Synthetic test context") == brief["session_id"]
+    world.hermes.create(routed, "Synthetic test context")
+    info = world.hermes.invoke("inspect", brief)
+    assert (info["exists"], info["messages"], info["archived"]) == (True, 2, False)
+    assert world.hermes.invoke("inspect", brief, needles=["Synthetic test context"])["delivered"] is True
+    assert world.hermes.invoke("inspect", brief, needles=["not delivered"])["delivered"] is False
+    assert world.hermes.archive_states([brief["session_id"], "missing"]) == {brief["session_id"]: False, "missing": None}
+    assert world.hermes.find_session(subject="Synthetic subject", sent=[{"ts": 1.0, "to": []}]) is None
+    db = world.db()
     try:
-        for key in ("one", "two"):  # the same title twice: Hermes keeps titles unique
-            store.enqueue(key, "example", key, "Synthetic: review", "draft",
-                          {"deny_tools": "research", "triage": {"reason": "test"}})
-        store.db.commit()
-        job, twin = store.rows()
-        hermes = Hermes(config, tmp_path)
-        hermes.create(job, "unused")
-        hermes.create(twin, "unused")
-        prompt = "FULL SYNTHETIC PROMPT with the third-party text"
-        hermes.run(job, prompt, display="Synthetic card")
+        rows = {row["id"]: row for row in db.execute("SELECT id, title, json_extract(model_config, '$.provider') "
+                                                      "AS provider FROM sessions")}
     finally:
-        store.close()
-        server.shutdown()
-    db = sqlite3.connect(hermes_home / "state.db")
-    db.row_factory = sqlite3.Row
+        db.close()
+    assert rows[brief["session_id"]]["title"] == "Brief" and rows[routed["session_id"]]["provider"] == "work-test"
+
+
+@CONTRACT
+def test_sorted_run_reads_through_the_guard_and_shows_the_card(make_world):
+    """Real gateway, fake model: the transcript shows the card while the full prompt is the api_content; the
+    session's tools are the guard's reads only; reads run, a refused command gets a neutral result."""
+    world = make_world([([bridged("toolu_list", "hermes_auto_skills_list", {}),
+                          bridged("toolu_td", "hermes_auto_read", {"command": "td today --json"}),
+                          bridged("toolu_git", "hermes_auto_read", {"command": "git log -3"}),
+                          {"type": "tool_use", "id": "toolu_term", "name": "terminal", "input": {"command": "echo x"}},
+                          bridged("toolu_term2", "terminal", {"command": "echo x"})], "tool_use")])
+    job = world.job("one", deny_tools="research", triage={"reason": "test"})
+    twin = world.job("two", deny_tools="research", triage={"reason": "test"})
+    sid = world.hermes.create(job, "unused")
+    world.hermes.create(twin, "unused")
+    assert sid != job["session_id"]  # the gateway names the session; the reserved id was its creation key
+    assert world.hermes.create(job, "unused") == sid  # same creation key, same session
+    assert policy.read_registration(world.home, sid)["profile"] == "research"
+    prompt = "FULL SYNTHETIC PROMPT with the third-party text"
+    result = world.hermes.run({**job, "session_id": sid}, prompt, display="Synthetic card")
+    assert result["type"] == "result" and result["exit_code"] == 0
+    db = world.db()
     try:
         titles = sorted(row[0] for row in db.execute("SELECT title FROM sessions"))
         user = db.execute("SELECT content, api_content FROM messages WHERE session_id=? AND role='user' "
-                          "ORDER BY id LIMIT 1", (job["session_id"],)).fetchone()
-        tools = {row["tool_call_id"]: json.loads(row["content"]) if row["content"].startswith("{") else row["content"]
-                 for row in db.execute("SELECT tool_call_id, content FROM messages WHERE session_id=? AND role='tool'",
-                                       (job["session_id"],))}
+                          "ORDER BY id LIMIT 1", (sid,)).fetchone()
     finally:
         db.close()
     assert titles == ["Synthetic: review", "Synthetic: review (2)"]
     assert user["content"] == "Synthetic card" and prompt in (user["api_content"] or "")
-    assert any(prompt in json.dumps(request) for request in seen)  # the model was sent the full prompt
-    assert isinstance(tools["toolu_git"], dict) and tools["toolu_git"]["skipped"] is True
-    assert "error" not in tools["toolu_git"]
-    assert not (isinstance(tools["toolu_read"], dict) and tools["toolu_read"].get("skipped"))
+    assert any(prompt in json.dumps(request) for request in world.seen)  # the model was sent the full prompt
+    # A gui-source session gets the Desktop platform prompt (Markdown renders), not the terminal one.
+    agent_turns = [request for request in world.seen if prompt in json.dumps(request.get("messages"))]
+    assert agent_turns and all("inside the Hermes desktop app" in json.dumps(request.get("system"))
+                               for request in agent_turns)
+    sent = {tool["name"] for request in world.seen for tool in request.get("tools") or []}
+    assert "terminal" not in sent and sent <= {"tool_search", "tool_describe", "tool_call", "hermes_auto_read",
+                                                "hermes_auto_skill_view", "hermes_auto_skills_list", "session_search"}
+    tools = world.tool_results(sid)
+    assert tools["toolu_td"] == {"output": "synthetic td: today --json\n", "exit_code": 0}
+    assert tools["toolu_list"]["success"] is True
+    assert tools["toolu_git"]["skipped"] is True and "error" not in tools["toolu_git"]
+    assert "does not exist" in str(tools["toolu_term"]) and "Not run" in str(tools["toolu_term2"])
+
+
+@CONTRACT
+def test_without_the_guard_third_party_and_unguarded_full_runs_are_refused(make_world):
+    world = make_world(guard_enabled=False, approvals_off=True)
+    research = world.job("one", deny_tools="research", triage={"reason": "test"})
+    mail = world.job("mail", deny_tools=True, triage={"reason": "test"})
+    task = world.job("task", source="todoist", mode="agent")
+    for job in (research, mail, task):
+        with pytest.raises(RuntimeError, match="hermes-auto-guard"):
+            world.hermes.create(job, "unused")
+    db = world.db()
+    try:
+        assert db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0  # nothing was created
+    finally:
+        db.close()
+    # Bounded preparation needs no guard: its frozen toolsets are empty.
+    draft = world.job("draft")
+    sid = world.hermes.create(draft, "unused")
+    assert world.hermes.run({**draft, "session_id": sid}, "Synthetic prompt")["exit_code"] == 0
+    assert not any(request.get("tools") for request in world.seen if "Synthetic prompt" in json.dumps(request))
+
+
+@CONTRACT
+def test_full_run_refuses_approval_gated_calls_only_during_its_turn(make_world):
+    """approvals.mode off would auto-approve them; the guard refuses them while the automatic turn runs."""
+    turns = [([{"type": "tool_use", "id": "toolu_rm", "name": "terminal",
+                "input": {"command": "rm -rf ~/hermes-auto-contract-does-not-exist"}},
+               {"type": "tool_use", "id": "toolu_echo", "name": "terminal", "input": {"command": "echo synthetic-ok"}},
+               {"type": "tool_use", "id": "toolu_code", "name": "execute_code", "input": {"code": "print(1)"}}],
+              "tool_use")]
+    world = make_world(turns, approvals_off=True)
+    task = world.job("task", source="todoist", mode="agent")
+    sid = world.hermes.create(task, "unused")
+    assert world.hermes.run({**task, "session_id": sid}, "Synthetic task")["exit_code"] == 0
+    tools = world.tool_results(sid)
+    assert "cannot ask the user" in str(tools["toolu_rm"]) and "cannot ask the user" in str(tools["toolu_code"])
+    assert "synthetic-ok" in str(tools["toolu_echo"])
+    assert policy.read_registration(world.home, sid)["until"] == 0  # the user's own later turns are unrestricted
+    sent = {tool["name"] for request in world.seen for tool in request.get("tools") or []}
+    assert "terminal" in sent  # a full run keeps the profile's normal tools
+
+
+@CONTRACT
+def test_a_session_without_the_tool_policy_is_refused_with_a_new_session_hint(make_world):
+    world = make_world()
+    old = world.job("old", mode="open")
+    world.hermes.create(old, "Synthetic old session")  # a session created without hermes-auto's policy
+    job = world.job("one", deny_tools="research", triage={"reason": "test"})
+    with pytest.raises(RuntimeError, match="new-session"):
+        world.hermes.run({**job, "session_id": old["session_id"]}, "Synthetic prompt")
+    with pytest.raises(RuntimeError, match="new-session"):
+        world.hermes.create({**job, "session_id": old["session_id"]}, "Synthetic prompt")
+    assert world.hermes.message_count(old) == 2  # nothing was sent
+
+

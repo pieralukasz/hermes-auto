@@ -136,6 +136,23 @@ def collect_runs(store, hermes):
     return failures
 
 
+def create_session(store, hermes, job, prompt):
+    """Create the job's session and return the job with its final session id.
+
+    The gateway names a run's session itself; the reserved id is the creation key, so a create interrupted
+    after the gateway committed returns the same session on retry. `create:<job>` marks that window: the
+    reserved id is not in Hermes yet, and a retry must create (idempotently) instead of calling it deleted.
+    Every stored reference to the reserved id moves to the new one at once."""
+    key = f"create:{job['id']}"
+    store.set_meta(key, job["session_id"])
+    session_id = hermes.create(job, prompt) or job["session_id"]
+    if session_id != job["session_id"]:
+        store.rebind_session(job["session_id"], session_id)
+        job = {**job, "session_id": session_id}
+    store.set_meta(key, None)
+    return job
+
+
 def process_jobs(store, config, hermes, blocked_sources=()):
     """Create sessions and start every due run at once, in the background; no queue, no per-check cap.
 
@@ -155,8 +172,13 @@ def process_jobs(store, config, hermes, blocked_sources=()):
             if job["status"] == "pending":
                 # ID was persisted at enqueue time, before any Hermes process starts.
                 store.update(job["id"], status="creating")
-                hermes.create(job, prompt)
+                job = create_session(store, hermes, job, prompt)
                 store.update(job["id"], status="created")
+            elif not hermes.exists(job) and store.get_meta(f"create:{job['id']}"):
+                # Interrupted between the gateway's create and recording its id: finish that create.
+                store.update(job["id"], status="creating")
+                job = create_session(store, hermes, job, prompt_for(job, config))
+                prompt, continuation = prompt_for(job, config), False
             elif not hermes.exists(job):
                 store.update(job["id"], status="deleted", error="Session deleted; automatic recreation suppressed")
                 continue
@@ -172,7 +194,7 @@ def process_jobs(store, config, hermes, blocked_sources=()):
                 prompt = prompt_for(job, config)
                 continuation = False
                 store.update(job["id"], status="creating")  # interrupted again -> needs_attention, no loop
-                hermes.create(job, prompt)
+                job = create_session(store, hermes, job, prompt)
             if job["mode"] == "open":
                 store.update(job["id"], status="ready", error="")
                 continue

@@ -7,7 +7,8 @@ import sqlite3
 import pytest
 
 from hermes_auto import triage
-from hermes_auto.bridge import find_session, normalized_subject, parse_json_block, read_only_command
+from hermes_auto.bridge import find_session, normalized_subject, parse_json_block
+from hermes_auto.guard_plugin.policy import read_only_command
 from hermes_auto.config import defaults
 from hermes_auto.runner import process_jobs, prompt_for
 from hermes_auto.store import Store

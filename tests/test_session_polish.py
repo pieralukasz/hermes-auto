@@ -1,107 +1,51 @@
 """Clean first messages, per-call read policy, short names and session titles."""
 import json
-import os
-import sys
-import types
 from types import SimpleNamespace
 
 import pytest
 
 from hermes_auto import bridge, triage
-from hermes_auto.bridge import deny_tool_execution, read_only_command, show_clean_prompt
+from hermes_auto.guard_plugin import policy
+from hermes_auto.guard_plugin.policy import read_only_command
 from hermes_auto.config import defaults
 from hermes_auto.runner import display_for, process_jobs
 from hermes_auto.store import Store
 
 
-# ── Per-call policy at the batch boundary ────────────────────────────────────
+# ── Per-call policy in the gateway (guard plugin) ────────────────────────────
 
-@pytest.fixture
-def agent_class(monkeypatch):
-    results = []
-
-    def append(messages, calls, payload):
-        for call in calls:
-            results.append((call.function.name, json.loads(payload(call))))
-
-    module = types.ModuleType("agent.turn_tool_validation")
-    module._append_tool_error_results = append
-    monkeypatch.setitem(sys.modules, "agent", types.ModuleType("agent"))
-    monkeypatch.setitem(sys.modules, "agent.turn_tool_validation", module)
-
-    class Agent:
-        def __init__(self, **kwargs):
-            self.executed = []
-
-        def _execute_tool_calls(self, message, messages, *args, **kwargs):
-            self.executed.append([call.function.name for call in message.tool_calls])
-            return "executed"
-
-    Agent.results = results
-    return Agent
+RESEARCH = {"version": 1, "profile": "research", "until": None}
 
 
-def batch(*calls):
-    return SimpleNamespace(content="thinking", tool_calls=[SimpleNamespace(function=SimpleNamespace(
-        name=name, arguments=json.dumps(arguments))) for name, arguments in calls])
-
-
-def test_reads_in_a_mixed_batch_still_run_and_only_the_refused_call_is_skipped(agent_class):
-    deny_tool_execution(agent_class, profile="research")
-    agent = agent_class()
-    message = batch(("skill_view", {"name": "tapin-github"}), ("terminal", {"command": "git log -5"}),
-                    ("terminal", {"command": "gh pr view 12 --repo acme/app"}))
-    assert agent._execute_tool_calls(message, []) == "executed"
-    assert agent.executed == [["skill_view", "terminal"]]  # the two reads, in order
-    [(name, result)] = agent_class.results
-    assert name == "terminal" and result["skipped"] is True and "error" not in result
-    # Desktop shows an empty exit 1 of a terminal call as a grey notice, not a red failure.
+def test_reads_in_a_mixed_batch_still_run_and_only_the_refused_call_is_skipped(monkeypatch):
+    """Hermes asks the guard per call: reads in a batch run, the refused one alone gets a neutral result."""
+    monkeypatch.setattr(policy.subprocess, "run", lambda argv, **kw: SimpleNamespace(
+        returncode=0, stdout="PR 12", stderr=""))
+    assert policy.decide("hermes_auto_skill_view", {"name": "tapin-github"}, RESEARCH) is None
+    assert json.loads(policy.run_read("gh pr view 12 --repo acme/app", "research")) == {"output": "PR 12",
+                                                                                       "exit_code": 0}
+    result = json.loads(policy.run_read("git log -5", "research"))
+    assert result["skipped"] is True and "error" not in result
+    # Desktop shows an empty exit 1 as a grey notice, not a red failure.
     assert result["output"] == "" and result["exit_code"] == 1
-    assert "gh api repos/OWNER/REPO/contents" in result["note"]
 
 
-def test_a_batch_with_nothing_allowed_runs_nothing(agent_class):
-    deny_tool_execution(agent_class, profile=True)
-    agent = agent_class()
-    assert agent._execute_tool_calls(batch(("web_search", {"query": "x"})), []) is None
-    assert agent.executed == []
-    [(name, result)] = agent_class.results
-    assert name == "web_search" and "exit_code" not in result and "error" not in result
+def test_a_read_session_has_no_web_or_write_tools():
+    for name in ("web_search", "terminal", "write_file", "read_file", "skill_manage", "send_message"):
+        assert policy.decide(name, {}, RESEARCH) is not None
+        assert policy.decide(name, {}, {**RESEARCH, "profile": "mail"}) is not None
 
 
-@pytest.fixture
-def cache(tmp_path, monkeypatch):
-    home = tmp_path / "hermes"
-    (home / "cache" / "terminal-output").mkdir(parents=True)
-    (home / "cache" / "terminal-output" / "out-1.log").write_text("long gh output")
-    (tmp_path / "secret.txt").write_text("x")
-    monkeypatch.setattr(bridge, "hermes_homes", lambda: {str(home)})
-    return home / "cache" / "terminal-output"
+def test_read_output_is_bounded_and_run_without_a_shell(monkeypatch):
+    seen = {}
 
-
-@pytest.mark.parametrize("profile", [True, "research"])
-def test_saved_command_output_can_be_read_back(agent_class, cache, profile):
-    deny_tool_execution(agent_class, profile=profile)
-    agent = agent_class()
-    message = batch(("read_file", {"path": str(cache / "out-1.log")}),
-                    ("search_files", {"pattern": "author", "path": str(cache / "out-1.log")}))
-    assert agent._execute_tool_calls(message, []) == "executed"
-    assert agent_class.results == []
-
-
-@pytest.mark.parametrize("path", ["{tmp}/secret.txt", "{cache}/../../../secret.txt", "{cache}/link", "", None,
-                                  "{cache}", "{cache}/missing,{tmp}", "{cache}/missing {tmp}", "{cache}/out-1.log,{tmp}"])
-def test_reads_outside_the_output_cache_are_refused(agent_class, cache, tmp_path, path):
-    os.symlink(tmp_path / "secret.txt", cache / "link")
-    value = path.format(tmp=tmp_path, cache=cache) if path is not None else None
-    deny_tool_execution(agent_class, profile="research")
-    assert agent_class()._execute_tool_calls(batch(("read_file", {"path": value})), []) is None
-    assert [name for name, _ in agent_class.results] == ["read_file"]
-
-
-def test_private_profile_cannot_read_the_cache_either(agent_class, cache):
-    deny_tool_execution(agent_class, profile="private")
-    assert agent_class()._execute_tool_calls(batch(("read_file", {"path": str(cache / "out-1.log")})), []) is None
+    def run(argv, **kwargs):
+        seen.update(argv=argv, shell=kwargs.get("shell", False))
+        return SimpleNamespace(returncode=0, stdout="x" * (policy.OUTPUT_LIMIT + 10), stderr="warn")
+    monkeypatch.setattr(policy.subprocess, "run", run)
+    result = json.loads(policy.run_read("td task list --filter 'search: a | b' --json", "mail"))
+    assert seen == {"argv": ["td", "task", "list", "--filter", "search: a | b", "--json"], "shell": False}
+    assert len(result["output"]) < policy.OUTPUT_LIMIT + 200 and "truncated" in result["output"]
 
 
 @pytest.mark.parametrize("command,allowed", [
@@ -122,54 +66,24 @@ def test_gh_api_jq_filters_are_reads(command, allowed):
 
 # ── Clean first message ──────────────────────────────────────────────────────
 
-def test_session_shows_the_card_while_the_model_gets_the_prompt():
-    calls = []
-
-    class Agent:
-        def run_conversation(self, user_message, system_message=None, persist_user_message=None, **kwargs):
-            calls.append((user_message, persist_user_message, kwargs.get("title_user_message")))
-            return {}
-
-    show_clean_prompt(Agent, "FULL PROMPT", "card")
-    Agent().run_conversation("FULL PROMPT")
-    Agent().run_conversation("a later turn")
-    assert calls == [("FULL PROMPT", "card", "card"), ("a later turn", None, None)]
-
-
-def test_no_display_leaves_hermes_untouched():
-    class Agent:
-        def run_conversation(self, user_message, **kwargs):
-            return kwargs
-
-    original = Agent.run_conversation
-    show_clean_prompt(Agent, "P", None)
-    show_clean_prompt(Agent, "P", "P")
-    assert Agent.run_conversation is original
-
-
 def test_unique_title_adds_a_counter_on_a_clash():
-    class Db:
-        MAX_TITLE_LENGTH = 20
-        taken = {"GitHub · Aviad", "GitHub · Aviad (2)"}
+    taken = {"GitHub · Aviad", "GitHub · Aviad (2)"}
 
-        def set_session_title(self, sid, title):
-            if title in self.taken:
-                raise ValueError(f"Title '{title}' is already in use by session x")
-            self.taken.add(title)
+    def set_title(title):
+        if title in taken:
+            raise ValueError(f"Title '{title}' is already in use by session x")
+        taken.add(title)
 
-    assert bridge.unique_title(Db(), "s", "GitHub · Aviad") == "GitHub · Aviad (3)"
-    assert len(bridge.unique_title(Db(), "s", "x" * 40)) == 20
+    assert bridge.unique_title(set_title, "GitHub · Aviad", limit=20) == "GitHub · Aviad (3)"
+    assert len(bridge.unique_title(set_title, "x" * 40, limit=20)) == 20
 
 
 def test_unique_title_keeps_other_errors():
-    class Db:
-        MAX_TITLE_LENGTH = 100
-
-        def set_session_title(self, sid, title):
-            raise ValueError("Title too long")
+    def set_title(title):
+        raise ValueError("Title too long")
 
     with pytest.raises(ValueError, match="too long"):
-        bridge.unique_title(Db(), "s", "t")
+        bridge.unique_title(set_title, "t")
 
 
 GITHUB = {"kind": "github", "id": "9@t", "thread_id": "9", "from": "aviadr1", "why": "review_requested",
@@ -313,16 +227,6 @@ def test_slack_card_does_not_repeat_the_sender_and_cleans_old_titles():
         "Slack · Bart napisał do Ciebie", "DM · https://example.slack.com/archives/D1/p1",
         "Ciąg dalszy rozmowy: Slack: Bart · DM"]
 
-
-
-def test_cache_files_from_before_this_run_are_refused(cache):
-    old = cache / "out-old.log"
-    old.write_text("another session's output")
-    os.utime(old, (1, 1))
-    assert bridge.cached_output_read("read_file", {"path": str(old)}) is False
-    assert bridge.cached_output_read("read_file", {"path": str(cache / "out-1.log")}, since=0) is True
-    # A file search over the cache would list other sessions' files.
-    assert bridge.cached_output_read("search_files", {"path": str(cache / "out-1.log"), "target": "files"}) is False
 
 
 @pytest.mark.parametrize("index", [1e400, "0", True, None, -1, 5])

@@ -325,6 +325,10 @@ def parser():
     commands = root.add_subparsers(dest="command", required=True)
     commands.add_parser("init", help="Create configuration and durable state once")
     commands.add_parser("doctor", help="Check the Hermes API bridge without an LLM call")
+    commands.add_parser("install-guard", help="Copy the hermes-auto-guard plugin into the Hermes home "
+                        "(does not enable or load it)")
+    commands.add_parser("guard-reload", help="Ask the running Hermes gateway to reload its plugins "
+                        "(loads hermes-auto-guard without a restart), then show the guard's state")
     commands.add_parser("status", help="Show jobs, source errors and pause state")
     events = commands.add_parser("events", help="Read-only: the sorter's latest decisions, newest first (JSON)")
     events.add_argument("--limit", type=int, default=200)
@@ -402,6 +406,12 @@ def dispatch(args, home, config, store):
         settings["enabled"] = args.action == "enable"
         private_json(home / "config.json", config)
         print(f"{args.name}: {args.action}d")
+    elif command == "install-guard":
+        from . import guard
+        guard.install(config["hermes_home"])
+        print(guard.activation_steps(config["hermes_home"]))
+    elif command == "guard-reload":
+        print(json.dumps(Hermes(config, home).invoke("reload_plugins"), indent=2))
     elif command == "doctor":
         print(json.dumps(Hermes(config, home).invoke("doctor"), indent=2))
         print("Installed adapters:", ", ".join(sorted(sources())) or "none")

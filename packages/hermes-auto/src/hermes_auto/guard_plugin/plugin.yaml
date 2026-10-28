@@ -1,0 +1,12 @@
+name: hermes-auto-guard
+version: "1.0.0"
+description: "hermes-auto's automatic sessions: the hermes-auto read toolset (one grammar-checked read command, skill reads) and a pre_tool_call guard keyed by the session ids hermes-auto registers. Other sessions are untouched."
+author: Lukasz Piera
+hooks:
+  - pre_tool_call
+provides_hooks:
+  - pre_tool_call
+provides_tools:
+  - hermes_auto_read
+  - hermes_auto_skill_view
+  - hermes_auto_skills_list

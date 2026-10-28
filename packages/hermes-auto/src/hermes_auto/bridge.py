@@ -1,6 +1,14 @@
-"""Executed by Hermes' Python, not the package's Python. No changes to Hermes source files."""
+"""Executed by Hermes' Python, not the package's Python. No changes to Hermes source files.
+
+Hermes >= v0.22.5 runs every turn in the gateway that owns ~/.hermes (the only writer of its sessions), so
+this bridge is a gateway client: sessions are created and run over the gateway's RPC (`session.create`
+with a frozen launch policy, `prompt.submit`), never by patching an in-process agent or writing state.db.
+Reads (inspect, archive states, sorter context, reply provenance) stay read-only SQLite queries.
+"""
 from __future__ import annotations
 
+import asyncio
+import importlib.util
 import json
 import os
 import re
@@ -8,496 +16,327 @@ import sys
 import time
 from pathlib import Path
 
-
-def guard_agent(agent_class, allowed):
-    """Guard the batch boundary, including inline tools that bypass model_tools dispatch."""
-    original = agent_class._execute_tool_calls
-
-    def guarded(self, assistant_message, *args, **kwargs):
-        calls = (assistant_message.get("tool_calls", []) if isinstance(assistant_message, dict)
-                 else getattr(assistant_message, "tool_calls", []) or [])
-        for call in calls:
-            function = call.get("function", {}) if isinstance(call, dict) else call.function
-            name = function.get("name") if isinstance(function, dict) else function.name
-            if name not in allowed:
-                raise RuntimeError(f"Hermes Auto preparation policy blocked tool: {name}")
-        return original(self, assistant_message, *args, **kwargs)
-
-    agent_class._execute_tool_calls = guarded
-    init = agent_class.__init__
-
-    def restricted_init(self, *args, **kwargs):
-        kwargs["skip_background_review"] = True
-        kwargs["skip_memory"] = True
-        init(self, *args, **kwargs)
-        self.tools = [tool for tool in self.tools if tool.get("function", {}).get("name") in allowed]
-        self.valid_tool_names = {tool["function"]["name"] for tool in self.tools}
-
-    agent_class.__init__ = restricted_init
+GUARD_DIR = Path(__file__).with_name("guard_plugin")
+SHELL_META = set(";|&<>`$\n\r\\(){}")
+GOOGLE_API = "skills/productivity/google-workspace/scripts/google_api.py"
+REFUSAL_MARK = "hermes-auto-refusal:"
+TITLE_LIMIT = 100  # Hermes SessionDB.MAX_TITLE_LENGTH
+# Launch fields a run compares with the session's frozen creation request (`launch_request`).
+LAUNCH_KEYS = ("source", "toolsets", "max_turns", "run_budget", "ignore_rules", "provider", "model")
 
 
-def desktop_parity(agent_class):
-    """Make an unattended full-tools run indistinguishable from a new Desktop session.
-
-    `cli.main(oneshot=True)` marks the process as a finite one-shot run, which Hermes uses to (a) render
-    the prompt for a plain terminal ("Markdown does NOT render"), (b) drop the skill-loading guidance and
-    skill_manage, and (c) cap delegation at delegation.oneshot_max_children. The result is read in the
-    Desktop app, so the agent gets the desktop platform prompt and the interactive skill/delegation rules.
-    The approval gate keeps reading the env marker directly, so dangerous commands are still denied.
-    """
-    import agent.oneshot_footprint as footprint
-    footprint.is_single_query_session = lambda: False
-    footprint.prune_oneshot_tools = lambda tools: list(tools)
-    init = agent_class.__init__
-
-    def desktop_init(self, *args, **kwargs):
-        if kwargs.get("platform") in (None, "cli"):
-            kwargs["platform"] = "desktop"
-        init(self, *args, **kwargs)
-
-    agent_class.__init__ = desktop_init
+class Refusal(RuntimeError):
+    """A run or create the bridge refuses before anything reaches the session; the message is for the user."""
 
 
-def show_clean_prompt(agent_class, prompt, display):
-    """The session shows `display` (a short card) as the first message; the model gets `prompt`.
-
-    Hermes' own mechanism: `persist_user_message` is the transcript text, and the sent bytes are kept as the
-    row's `api_content`, so later turns (the user continuing in Desktop) still see the full prompt and source.
-    Only the turn carrying exactly `prompt` is affected."""
-    if not display or display == prompt:
-        return
-    original = agent_class.run_conversation
-
-    def run_conversation(self, user_message, *args, **kwargs):
-        if user_message == prompt and kwargs.get("persist_user_message") is None:
-            kwargs["persist_user_message"] = display
-            kwargs.setdefault("title_user_message", display)
-        return original(self, user_message, *args, **kwargs)
-
-    agent_class.run_conversation = run_conversation
+def guard_policy():
+    """The guard plugin's policy module, loaded by path under a name nothing else uses (this script runs
+    with `-I`, so hermes_auto is not importable here, and its sibling modules would shadow Hermes')."""
+    module = sys.modules.get("hermes_auto_guard_policy")
+    if module is None:
+        spec = importlib.util.spec_from_file_location("hermes_auto_guard_policy", GUARD_DIR / "policy.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["hermes_auto_guard_policy"] = module
+        spec.loader.exec_module(module)
+    return module
 
 
-def unique_title(db, sid, title):
-    """Hermes keeps titles unique; a second "GitHub · Aviad: review" becomes "GitHub · Aviad: review (2)"."""
-    limit = db.MAX_TITLE_LENGTH
+def unique_title(set_title, title, limit=TITLE_LIMIT):
+    """Hermes keeps titles unique; a second "GitHub · Aviad: review" becomes "GitHub · Aviad: review (2)".
+
+    `set_title(candidate)` raises on a clash with a message containing "already in use" (SessionDB) or the
+    gateway's `title_conflict`; any other error propagates."""
     for attempt in range(1, 50):
         suffix = "" if attempt == 1 else f" ({attempt})"
         candidate = title[:limit - len(suffix)].rstrip() + suffix
         try:
-            db.set_session_title(sid, candidate)
+            set_title(candidate)
             return candidate
-        except ValueError as exc:
-            if "already in use" not in str(exc):
+        except Exception as exc:  # noqa: BLE001 - only a title clash is retried
+            if not any(mark in str(exc) for mark in ("already in use", "title_conflict", "title_in_use")):
                 raise
     raise RuntimeError("No free session title")
 
 
-SHELL_META = set(";|&<>`$\n\r\\(){}")
-GOOGLE_API = "skills/productivity/google-workspace/scripts/google_api.py"
-GOOGLE_READS = {("calendar", "list"), ("gmail", "search"), ("gmail", "get"), ("gmail", "labels")}
-TODOIST_READS = {("today",), ("upcoming",), ("inbox",), ("completed",), ("activity",),
-                 ("task", "list"), ("task", "view"), ("project", "list"), ("project", "view"),
-                 ("section", "list"), ("label", "list"), ("filter", "list"), ("filter", "view")}
-READ_TOOLS = frozenset({"skill_view", "skills_list", "session_search"})
-# Unattended research cannot send private context to arbitrary web endpoints.
-SLACK_READ_TOOLS = READ_TOOLS
-# Research read profiles (Slack, GitHub); "slack" is kept for sessions queued before the rename.
-RESEARCH_PROFILES = ("research", "slack")
-# Tools each deny profile may execute. "private" (redacted private Slack content) and any unknown
-# profile execute nothing.
-PROFILE_TOOLS = {True: READ_TOOLS, "research": SLACK_READ_TOOLS, "slack": SLACK_READ_TOOLS}
-SLACK_MCP = "skills/tap-in/tapin-slack/scripts/slack_mcp.py"
-SLACK_MCP_READS = {"slack_search_public", "slack_search_public_and_private", "slack_search_users",
-                   "slack_search_channels", "slack_read_channel", "slack_read_thread", "slack_read_canvas",
-                   "slack_read_user_profile", "slack_read_file", "slack_list_channel_members",
-                   "slack_list_user_channels"}
-# Programs given by path must live here; a bare name resolves through the worker's own PATH.
-TRUSTED_BIN = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin")
+def route_kwargs(request):
+    """Launch fields for the job's `routes` rule (provider/model); empty keeps Hermes' configured model."""
+    route = request.get("route") or {}
+    return {key: route[key] for key in ("provider", "model") if route.get(key)}
 
 
-def grammar(flags=(), values=(), patterns=(), equals_only=False):
-    """Options a read subcommand accepts: plain flags, options taking one value, attached-value regexes.
+def launch_plan(request, config):
+    """(guard profile or None, session.create fields) for a job's automatic session.
 
-    Anything else that starts with `-` is refused, so an unknown or ambiguous option never runs.
-    """
-    return {"flags": frozenset(flags), "values": frozenset(values),
-            "patterns": tuple(re.compile(pattern) for pattern in patterns), "equals_only": equals_only}
-
-
-def split_options(args, spec, value_ok=lambda option, value: True):
-    """Positional arguments of `args` under `spec`, or None when an option is not in the grammar.
-
-    Value options take `--name=value`, or `--name value` unless the grammar is `equals_only`.
-    Attached short values (`-XPOST`, `-Ovim`) only pass through an explicit pattern.
-    """
-    positionals, index = [], 0
-    while index < len(args):
-        token = args[index]
-        index += 1
-        if token == "--":
-            positionals.extend(args[index:])
-            break
-        if not token.startswith("-") or token == "-":
-            positionals.append(token)
-        elif token in spec["flags"] or any(pattern.fullmatch(token) for pattern in spec["patterns"]):
-            continue
-        elif token.startswith("--") and token.split("=", 1)[0] in spec["values"] and "=" in token:
-            option, value = token.split("=", 1)
-            if not value_ok(option, value):
-                return None
-        elif token in spec["values"] and not spec["equals_only"]:
-            if index >= len(args) or args[index].startswith("-") or not value_ok(token, args[index]):
-                return None
-            index += 1
-        else:
-            return None
-    return positionals
-
-
-TD_OUTPUT = ("--json", "--ndjson", "--ids-only", "--full", "--raw", "--show-urls")
-TD_PAGE = ("--limit", "--cursor")
-TD_LIST = grammar(TD_OUTPUT + ("--all",), TD_PAGE)
-TD_READS = {
-    ("today",): grammar(TD_OUTPUT + ("--all", "--any-assignee", "--personal"), TD_PAGE + ("--workspace",)),
-    ("upcoming",): grammar(TD_OUTPUT + ("--all", "--any-assignee", "--personal"), TD_PAGE + ("--workspace",)),
-    ("inbox",): TD_LIST,
-    ("task", "list"): grammar(TD_OUTPUT + ("--all", "--unassigned", "--personal"),
-                              TD_PAGE + ("--project", "--parent", "--label", "--priority", "--due", "--filter",
-                                         "--assignee", "--workspace")),
-    ("task", "view"): grammar(TD_OUTPUT + ("--include-children",)),
-    ("project", "list"): grammar(TD_OUTPUT + ("--all", "--personal"), TD_PAGE + ("--search",)),
-    ("project", "view"): grammar(TD_OUTPUT + ("--detailed", "--include-children")),
-    ("comment", "list"): grammar(TD_OUTPUT + ("--all", "-P", "--project"), ("--limit", "--lines")),
-    ("section", "list"): grammar(TD_OUTPUT + ("--all",), ("--project", "--search", "--limit")),
-    ("label", "list"): grammar(TD_OUTPUT + ("--all",), ("--search", "--limit")),
-    ("filter", "list"): grammar(TD_OUTPUT),
-    ("filter", "view"): grammar(TD_OUTPUT + ("--all",), TD_PAGE + ("--sort", "--sort-order")),
-}
-
-
-def todoist_read(tokens):
-    args = tokens[1:]
-    for prefix, spec in TD_READS.items():
-        if tuple(args[:len(prefix)]) != prefix:
-            continue
-        positional = split_options(args[len(prefix):], spec)
-        if positional is None or any(value.startswith("-") for value in positional):
-            return False
-        count = 1 if prefix[-1] == "view" or prefix == ("comment", "list") else 0
-        return len(positional) == count
-    return False
-
-
-def hermes_homes():
-    homes = {os.path.normpath(os.path.expanduser("~/.hermes"))}
-    if os.environ.get("HERMES_HOME"):
-        homes.add(os.path.normpath(os.environ["HERMES_HOME"]))
-    return homes
-
-
-def literal_path(token, words):
-    """Absolute path of an unquoted `token`, or None.
-
-    A quoted `~` stays literal in the shell and would resolve against the working directory, so the
-    token has to appear verbatim among the command's words. `..` components are refused.
-    """
-    if token not in words:
-        return None
-    path = os.path.expanduser(token)
-    if not os.path.isabs(path) or ".." in path.split("/"):
-        return None
-    return os.path.normpath(path)
-
-
-def trusted_program(token, words, name):
-    """`name` itself, or `name` at an absolute path inside TRUSTED_BIN."""
-    if token == name:
-        return True
-    path = literal_path(token, words)
-    return path is not None and path in {os.path.join(directory, name) for directory in TRUSTED_BIN}
-
-
-def trusted_python(token, words):
-    if token in ("python", "python3"):
-        return True
-    path = literal_path(token, words)
-    venvs = {os.path.join(home, "hermes-agent/venv/bin", name) for home in hermes_homes()
-             for name in ("python", "python3")}
-    return path is not None and path in venvs | {os.path.normpath(sys.executable), "/usr/bin/python3",
-                                                 "/opt/homebrew/bin/python3"}
-
-
-def skill_script(tokens, words, relative):
-    """`python <hermes home>/<relative> ...` with a trusted interpreter and the exact skill script."""
-    if len(tokens) < 4 or not trusted_python(tokens[0], words):
-        return False
-    return literal_path(tokens[1], words) in {os.path.join(home, relative) for home in hermes_homes()}
-
-
-GH_REPO = re.compile(r"[\w.-]+/[\w.-]+")
-GH_ENDPOINT = re.compile(r"/?[A-Za-z0-9_.{}/-]+(\?[A-Za-z0-9_.,%+=&-]*)?")
-REPO = ("--repo", "-R")
-GH_READS = {
-    ("pr", "view"): grammar(("--comments", "-c"), REPO + ("--json",)),
-    ("pr", "list"): grammar((), REPO + ("--json", "--limit", "-L", "--state", "-s", "--author", "-A", "--label",
-                                        "-l", "--assignee", "-a", "--search", "-S", "--base", "-B", "--head",
-                                        "-H")),
-    ("pr", "diff"): grammar(("--patch", "--name-only"), REPO + ("--color",)),
-    ("pr", "checks"): grammar(("--required",), REPO + ("--json",)),
-    ("pr", "status"): grammar((), REPO + ("--json",)),
-    ("issue", "view"): grammar(("--comments", "-c"), REPO + ("--json",)),
-    ("issue", "list"): grammar((), REPO + ("--json", "--limit", "-L", "--state", "-s", "--author", "-A",
-                                           "--label", "-l", "--assignee", "-a", "--search", "-S", "--milestone",
-                                           "-m", "--mention")),
-    ("search", "prs"): grammar((), ("--repo", "-R", "--owner", "--limit", "-L", "--state", "--author", "--label",
-                                    "--json", "--sort", "--order", "--language")),
-    ("search", "issues"): grammar((), ("--repo", "-R", "--owner", "--limit", "-L", "--state", "--author",
-                                       "--label", "--json", "--sort", "--order", "--language")),
-    ("search", "code"): grammar((), ("--repo", "-R", "--owner", "--limit", "-L", "--language", "--filename",
-                                     "--extension", "--json")),
-    ("search", "commits"): grammar((), ("--repo", "-R", "--owner", "--limit", "-L", "--author", "--json")),
-    ("run", "list"): grammar((), REPO + ("--json", "--limit", "-L", "--branch", "-b", "--workflow", "--status",
-                                         "-s", "--event", "-e", "--user", "-u")),
-    ("run", "view"): grammar(("--log", "--log-failed", "--verbose", "-v", "--exit-status"),
-                             REPO + ("--json", "--job", "-j", "--attempt", "-a")),
-    ("repo", "view"): grammar((), ("--json", "--branch", "-b")),
-    ("release", "list"): grammar((), REPO + ("--json", "--limit", "-L")),
-    ("release", "view"): grammar((), REPO + ("--json",)),
-    ("workflow", "list"): grammar(("--all", "-a"), REPO + ("--json", "--limit", "-L")),
-}
-# `gh api` stays a GET: no fields, input, method, headers, host or template options. gh's jq can read the
-# process environment (`env`, `$ENV`: the worker holds API keys), so `--jq` takes only filters on this list.
-GH_API = grammar(("--paginate", "--include", "-i", "--slurp"), ("--jq", "-q"))
-GH_JQ_FILTERS = frozenset({".content | @base64d", ".content|@base64d", ".[].filename", ".[] | .filename",
-                           ".[].body", ".[] | .body"})
-
-
-def gh_value(option, value):
-    if option in ("--repo", "-R"):
-        return bool(GH_REPO.fullmatch(value))
-    if option in ("--jq", "-q"):
-        return " ".join(value.split()) in GH_JQ_FILTERS
-    return "://" not in value
-
-
-def github_argument(token):
-    return "://" not in token or token.startswith("https://github.com/")
-
-
-def gh_read(tokens):
-    """`gh <group> <read command>` or `gh api <GET endpoint>` with only the options in its grammar."""
-    args = tokens[1:]
-    if args[:1] == ["api"]:
-        positionals = split_options(args[1:], GH_API, gh_value)
-        return (positionals is not None and len(positionals) == 1 and bool(GH_ENDPOINT.fullmatch(positionals[0]))
-                and not positionals[0].lstrip("/").startswith("graphql"))
-    spec = GH_READS.get(tuple(args[:2]))
-    if spec is None:
-        return False
-    positionals = split_options(args[2:], spec, gh_value)
-    if tuple(args[:2]) == ("repo", "view"):
-        return (positionals is not None and len(positionals) == 1
-                and bool(GH_REPO.fullmatch(positionals[0].removeprefix("https://github.com/"))))
-    return positionals is not None and all(github_argument(token) for token in positionals)
-
-
-LINEAR_LIST = grammar(("--json", "-j", "--no-pager"), ("--team", "--limit"))
-LINEAR_READS = {
-    ("issue", "view"): grammar(("--json", "-j", "--no-pager", "--no-comments", "--no-download")),
-    ("issue", "list"): grammar(("--json", "-j", "--no-pager", "--all-states", "--all-assignees", "-A",
-                                "--unassigned", "-U"),
-                               ("--state", "-s", "--assignee", "--sort", "--team", "--project", "--limit")),
-    # Search and filters only; no --workspace (another account's credential).
-    ("issue", "query"): grammar(("--json", "-j", "--no-pager", "--search-comments", "--all-teams", "--unassigned", "-U",
-                                 "--include-archived"),
-                                ("--search", "--team", "--state", "-s", "--sort", "--assignee", "--project",
-                                 "--project-label", "--cycle", "--milestone", "--label", "-l", "--created-after",
-                                 "--updated-after", "--limit")),
-    ("project", "view"): LINEAR_LIST, ("project", "list"): LINEAR_LIST,
-    ("team", "list"): LINEAR_LIST, ("cycle", "list"): LINEAR_LIST, ("cycle", "view"): LINEAR_LIST,
-}
-
-
-def linear_read(tokens):
-    args = tokens[1:]
-    if args[:1] == ["api"]:
-        # One GraphQL query and nothing else: no variables, no options.
-        query = args[1].strip() if len(args) == 2 else ""
-        return query.startswith(("query", "{")) and "mutation" not in query.lower()
-    spec = LINEAR_READS.get(tuple(args[:2]))
-    if tuple(args[:2]) == ("issue", "view") and "--no-download" not in args[2:]:
-        return False
-    return spec is not None and split_options(args[2:], spec) is not None
-
-
-def slack_read_command(tokens, words=None):
-    """Reads of the Slack session's research: trusted Slack, GitHub and Linear commands."""
-    words = set(tokens) if words is None else words
-    if skill_script(tokens, words, SLACK_MCP):
-        return tokens[2] == "call" and tokens[3] in SLACK_MCP_READS and len(tokens) <= 5
-    if trusted_program(tokens[0], words, "gh"):
-        return gh_read(tokens)
-    if trusted_program(tokens[0], words, "linear"):
-        return linear_read(tokens)
-    return False
-
-
-def read_only_command(command, profile=True):
-    """True only for a single plain read command: calendar/Gmail reads via the Google script, Todoist reads.
-    With a research profile also the Slack session's research reads (`slack_read_command`). Profile
-    "private" and unknown profiles allow no command.
-
-    No shell syntax at all (pipes, redirects, substitutions, chaining), so the allowed program is the
-    only thing that runs. Programs and scripts must be the trusted ones, and their options must be in an
-    explicit read grammar. Anything else is refused, however harmless it looks.
-    """
-    import shlex
-    if profile is not True and profile not in RESEARCH_PROFILES:
-        return False
-    text = str(command or "").strip()
-    # Single-quoted text is literal in sh (Todoist filters use `|` and `&`); everything else may not
-    # contain shell syntax.
-    bare = re.sub(r"'[^']*'", "''", text)
-    if not text or "'" in bare.replace("''", "") or SHELL_META & set(bare):
-        return False
-    try:
-        tokens = shlex.split(text)
-    except ValueError:
-        return False
-    if not tokens:
-        return False
-    words = set(text.split())
-    if trusted_program(tokens[0], words, "td"):
-        return todoist_read(tokens)
-    if skill_script(tokens, words, GOOGLE_API):
-        return (tokens[2], tokens[3]) in GOOGLE_READS
-    if profile in RESEARCH_PROFILES:
-        return slack_read_command(tokens, words)
-    return False
-
-
-def terminal_output_dirs():
-    """Where Hermes spills a long command output; the agent reads it back with read_file/search_files."""
-    return [os.path.join(home, "cache", "terminal-output") for home in hermes_homes()]
-
-
-RUN_STARTED = time.time()
-
-
-def cached_output_read(name, arguments, since=None):
-    """read_file/search_files on one output file this run saved in Hermes' terminal-output cache.
-
-    One existing regular file, no directory: Hermes treats a missing path with commas or spaces as several
-    roots, and the shared cache also holds other sessions' output. The path is resolved (symlinks, `..`) and
-    the file must be written after this run started."""
-    if name not in ("read_file", "search_files"):
-        return False
-    path = arguments.get("path")
-    if not isinstance(path, str) or not path.strip() or "," in path or any(c.isspace() for c in path):
-        return False
-    if name == "search_files" and (arguments.get("file_glob") or arguments.get("target") == "files"):
-        return False
-    real = os.path.realpath(os.path.expanduser(path))
-    try:
-        if not os.path.isfile(real) or os.path.getmtime(real) < (RUN_STARTED if since is None else since) - 1:
-            return False
-    except OSError:
-        return False
-    for directory in terminal_output_dirs():
-        root = os.path.realpath(directory)
-        if real.startswith(root + os.sep):
-            return True
-    return False
-
-
-def refusal(call, note):
-    """A neutral result for a call the automatic step does not run: no `error` key, so Desktop shows a
-    skipped step instead of a red failure; the note still tells the model what to do instead."""
-    payload = {"skipped": True, "note": note}
-    if call.function.name == "terminal":
-        payload.update(output="", exit_code=1)  # Desktop renders an empty exit 1 as a grey notice
-    return json.dumps(payload, ensure_ascii=False)
-
-
-class CallSubset:
-    """The assistant message with only some of its tool calls; Hermes' executors read nothing else."""
-
-    def __init__(self, message, calls):
-        self._message = message
-        self.tool_calls = calls
-
-    def __getattr__(self, name):
-        return getattr(self._message, name)
-
-
-def deny_tool_execution(agent_class, allowed=None, profile=True):
-    """Keep the session's normal tool list (and so its stored prompt) but execute only reads.
-
-    Used when third-party content enters a conversation: every call outside `allowed` (by default the
-    profile's PROFILE_TOOLS; none for "private" or an unknown profile), and every terminal command that
-    is not a plain read (`read_only_command`), gets an error result instead of running, and the turn
-    continues. Wrappers such as tool_call, execute_code and delegate_task are never allowed. Filtering
-    the tool list instead would rebuild the stored system prompt with a reduced toolset, and the user's
-    later turns in that session would lose their tools.
-    """
-    from agent.turn_tool_validation import _append_tool_error_results
-    if allowed is None:
-        allowed = PROFILE_TOOLS.get(profile, frozenset())
-    original = agent_class._execute_tool_calls
-
-    def permitted(call):
-        name = call.function.name
-        if name in allowed:
-            return True
-        if name not in ("terminal", "read_file", "search_files") or profile not in PROFILE_TOOLS:
-            return False
-        try:
-            arguments = json.loads(call.function.arguments or "{}")
-        except (TypeError, ValueError):
-            return False
-        if not isinstance(arguments, dict):
-            return False
-        if name != "terminal":
-            return cached_output_read(name, arguments)
-        return not arguments.get("background") and read_only_command(arguments.get("command"), profile)
-
-    if profile in RESEARCH_PROFILES:
-        refused = ("Not run: this automatic step only reads (third-party messages). Allowed: Slack MCP reads, "
-                   "gh/linear reads (code via `gh api repos/OWNER/REPO/contents/PATH?ref=SHA --jq '.content | @base64d'`), calendar list, "
-                   "td list/view (search: `td task list --filter 'search: phrase'`), session_search, skills, and "
-                   "read_file/search_files on saved command output. Local git and the web are off. One plain "
-                   "command per call, no pipes. Sending and writing wait for the user's explicit OK.")
-    elif profile is True:
-        refused = ("Not run: this automatic step only reads (third-party mail). Allowed: calendar list, gmail "
-                   "search/get, td list/view/today (search: `td task list --filter 'search: phrase'`), "
-                   "session_search, skills, and read_file/search_files on saved command output. One plain command "
-                   "per call, no pipes.")
+    The toolsets are the first boundary and the gateway freezes them: third-party mail and Slack/GitHub
+    research get only the guard plugin's read toolset and past-session search (no terminal, files,
+    skill_manage or anything that sends), private content no tools, bounded preparation web only (research
+    and agent modes) or nothing. Full-tools jobs keep the profile's normal Desktop toolsets."""
+    policy = guard_policy()
+    job = request.get("job") or {}
+    profile = policy.profile_for(request.get("deny_tools"), request.get("full_tools"))
+    if profile in (policy.MAIL, policy.RESEARCH):
+        toolsets = [policy.TOOLSET, "session_search"]
+    elif profile == policy.PRIVATE:
+        toolsets = []
+    elif profile == policy.FULL:
+        toolsets = None
     else:
-        refused = ("Not run: no tools in this automatic step (private third-party content). Answer from the "
-                   "conversation only.")
+        toolsets = ["web"] if job.get("mode") in ("research", "agent") else []
+    agent_limits = profile in (policy.RESEARCH, policy.FULL)
+    params = {"max_turns": int(config["agent_max_turns" if agent_limits else "max_turns"]),
+              "run_budget": int(config["agent_run_budget_seconds" if agent_limits else "run_budget_seconds"])}
+    if toolsets is not None:
+        params["toolsets"] = toolsets
+    if profile is None:
+        params["ignore_rules"] = True  # bounded preparation: no project rules, as before
+    params.update(route_kwargs(request))
+    return profile, params
 
-    def guarded(self, assistant_message, messages, *args, **kwargs):
-        calls = list(getattr(assistant_message, "tool_calls", None) or [])
-        allowed_calls = [call for call in calls if permitted(call)]
-        if len(allowed_calls) == len(calls):
-            return original(self, assistant_message, messages, *args, **kwargs)
-        # Per call, not per batch: the reads in a parallel batch still run; only the refused calls get a
-        # neutral "not run" result. Every tool call keeps exactly one result.
-        result = None
-        if allowed_calls:
-            result = original(self, CallSubset(assistant_message, allowed_calls), messages, *args, **kwargs)
-        _append_tool_error_results(messages, [call for call in calls if call not in allowed_calls],
-                                   lambda call: refusal(call, refused))
-        return result
 
-    agent_class._execute_tool_calls = guarded
-    init = agent_class.__init__
+def launch_mismatch(launch, params):
+    """The launch fields where a session's frozen creation request differs from what this job needs."""
+    expected = {"source": "gui", **params}
+    launch = dict(launch or {})
+    if "model_requested" in launch:
+        launch["model"] = launch["model_requested"]
+    return [key for key in LAUNCH_KEYS if launch.get(key) != expected.get(key)]
 
-    def quiet_init(self, *args, **kwargs):
-        kwargs["skip_background_review"] = True
-        init(self, *args, **kwargs)
 
-    agent_class.__init__ = quiet_init
+def approvals_unattended_unsafe():
+    """True when this profile's approval settings would let an automatic turn run a dangerous command
+    (`approvals.mode: off`, or `single_query_mode: approve`); then even a full-tools run needs the guard."""
+    try:
+        from tools.approval_context import _binary_approval_mode, _get_approval_mode
+        return _get_approval_mode() == "off" or _binary_approval_mode("single_query_mode") == "approve"
+    except Exception:  # noqa: BLE001 - unknown settings: assume the unsafe ones
+        return True
+
+
+def guard_required(profile):
+    policy = guard_policy()
+    return profile in (policy.MAIL, policy.RESEARCH) or (profile == policy.FULL and approvals_unattended_unsafe())
+
+
+def plugin_version():
+    match = re.search(r'^version:\s*"?([^"\n]+)"?', (GUARD_DIR / "plugin.yaml").read_text(), re.M)
+    return match.group(1).strip() if match else ""
+
+
+async def guard_status(client):
+    """What the RUNNING gateway loaded of the guard plugin (`plugins.list` answers from its own manager)."""
+    policy = guard_policy()
+    listing = await client.rpc("plugins.list")
+    for plugin in listing.get("plugins") or []:
+        if policy.GUARD_NAME in (plugin.get("name"), str(plugin.get("key") or "").rsplit("/", 1)[-1]):
+            ok = (plugin.get("enabled") is True and not plugin.get("error") and int(plugin.get("hooks") or 0) >= 1
+                  and int(plugin.get("tools") or 0) >= len(policy.PLUGIN_TOOLS)
+                  and plugin.get("version") == plugin_version())
+            return {"loaded": True, "ok": ok, **{key: plugin.get(key) for key in
+                                                 ("version", "enabled", "hooks", "tools", "error")},
+                    "expected_version": plugin_version()}
+    return {"loaded": False, "ok": False, "expected_version": plugin_version()}
+
+
+def guard_message(status):
+    if not status.get("loaded"):
+        why = "the running Hermes gateway has not loaded the hermes-auto-guard plugin"
+    elif status.get("version") != status.get("expected_version"):
+        why = (f"the running gateway has hermes-auto-guard {status.get('version')!r}, this hermes-auto needs "
+               f"{status.get('expected_version')!r}")
+    else:
+        why = f"hermes-auto-guard is loaded but not active ({status.get('error') or 'disabled or incomplete'})"
+    return (f"Refused: {why}. Sessions with third-party content (and full-tools runs while approvals are off) "
+            "run only behind it. Run `hermes-auto install-guard`, then reload the gateway's plugins "
+            "(`hermes-auto install-guard` prints how); nothing was sent to the session.")
+
+
+async def require_guard(client, profile):
+    if guard_required(profile):
+        status = await guard_status(client)
+        if not status["ok"]:
+            raise Refusal(guard_message(status))
+
+
+def run_gateway(work):
+    """Run `work(client)` attached to this home's gateway (started if needed, as `hermes chat` does)."""
+    from hermes_cli.gateway_client import connect_gateway
+
+    async def attached():
+        async with connect_gateway() as client:
+            return await work(client)
+    return asyncio.run(attached())
+
+
+def title_owner(hermes_home, title):
+    """Read-only: the session holding `title`, or None (Hermes keeps titles unique)."""
+    import sqlite3
+    conn = sqlite3.connect(Path(hermes_home, "state.db").as_uri() + "?mode=ro", uri=True, timeout=10)
+    try:
+        row = conn.execute("SELECT id FROM sessions WHERE title=? LIMIT 1", (title,)).fetchone()
+    finally:
+        conn.close()
+    return row[0] if row else None
+
+
+async def rename(client, hermes_home, sid, title):
+    """Title the session through the gateway; a title another session holds takes the next " (n)".
+
+    The gateway answers a clash only with a generic refusal, so the clash is read from state.db."""
+    snapshot = await client.rpc("session.resume", session_id=sid)
+
+    async def set_title(candidate):
+        owner = title_owner(hermes_home, candidate)
+        if owner == sid:
+            return
+        if owner is not None:
+            raise ValueError("already in use")
+        try:
+            await client.rpc("session.mutate", session_id=sid, request_id=f"hermes-auto-title:{sid}:{candidate}",
+                             expected_revision=snapshot["revision"], operation="rename", payload={"title": candidate})
+        except Exception:
+            if title_owner(hermes_home, candidate) not in (None, sid):
+                raise ValueError("already in use") from None  # taken meanwhile
+            raise
+    for attempt in range(1, 50):
+        suffix = "" if attempt == 1 else f" ({attempt})"
+        candidate = title[:TITLE_LIMIT - len(suffix)].rstrip() + suffix
+        try:
+            await set_title(candidate)
+            return candidate
+        except ValueError:
+            continue
+    raise RuntimeError("No free session title")
+
+
+def create_agent_session(request, config, job, db):
+    """A gateway session for an automatic run: frozen toolsets, turn limit, budget and model route; the
+    guard registration and the title follow. Idempotent: the creation key is the job's reserved id."""
+    policy = guard_policy()
+    profile, params = launch_plan(request, config)
+    home = config["hermes_home"]
+
+    async def work(client):
+        contract = (await client.rpc("runtime.describe")).get("session_create") or {}
+        missing = sorted(set(params) - set(contract.get("parameters") or []))
+        if "gui" not in (contract.get("sources") or []) or missing:
+            raise Refusal("Refused: this Hermes gateway cannot create automatic sessions with "
+                          f"{', '.join(missing) or 'source gui'}; update Hermes.")
+        await require_guard(client, profile)
+        snapshot = await client.rpc("session.create", request_id=f"hermes-auto:{job['session_id']}",
+                                    source="gui", cwd=str(Path.home()), **params,
+                                    **({"hidden": True} if request.get("hidden") else {}))
+        sid = snapshot["stored_session_id"]
+        if profile is not None:
+            # Before any turn: the plugin reads this to apply the profile (read profiles for good, a full
+            # run only while its automatic turn is running).
+            policy.write_registration(home, sid, profile, until=None if profile != policy.FULL else 0,
+                                      job=job.get("id"))
+        row = db.get_session(sid) or {}
+        if not row.get("title"):
+            await rename(client, home, sid, request["title"])
+        return sid
+    return run_gateway(work)
+
+
+def create_open_session(request, config, job, db):
+    """An `open` job (brief, plan, proposals): the prompt and a ready message, no run. The gateway imports
+    it as a finished conversation under the job's reserved id; the user continues it with normal tools."""
+    sid = job["session_id"]
+    if db.get_session(sid) is not None:
+        return sid
+    def free(candidate):
+        if title_owner(config["hermes_home"], candidate) is not None:
+            raise ValueError("already in use")
+    title = unique_title(free, request["title"])
+    now = time.time()
+    session = {"id": sid, "source": "cli", "title": title, "started_at": now, "hidden": int(bool(request.get("hidden"))),
+               "messages": [{"role": "user", "content": request["prompt"], "timestamp": now},
+                            {"role": "assistant", "content": request["open_message"], "timestamp": now + 0.001}]}
+    provider = route_kwargs(request).get("provider")
+    if provider:
+        # Desktop resumes a session on model_config.provider: a routed brief keeps its account.
+        session["model_config"] = {"provider": provider}
+
+    async def work(client):
+        return await client.rpc("session.mutate", session_id=sid, request_id=f"hermes-auto-import:{sid}",
+                                expected_revision=0, operation="import", payload={"sessions": [session]})
+    result = run_gateway(work)
+    if sid not in (result.get("imported_ids") or []) + (result.get("skipped_ids") or []):
+        raise RuntimeError("Hermes did not import the session")
+    return sid
+
+
+def run_session(request, config, job):
+    """Submit the job's prompt to its gateway session as one finite turn and print the stream-json result.
+
+    Refused (nothing submitted) when the session has no hermes-auto registration (created by an older
+    hermes-auto, by hand, or before the guard), when its frozen launch differs from what this job needs, or
+    when the guard plugin this job needs is not active in the running gateway."""
+    policy = guard_policy()
+    sid = job["session_id"]
+    profile, params = launch_plan(request, config)
+    home = config["hermes_home"]
+    entry = policy.read_registration(home, sid) if profile is not None else None
+    if profile is not None and (entry is None or entry["profile"] != profile):
+        raise Refusal("Refused: this session was not created by this hermes-auto with the job's tool policy "
+                      "(an older session, or created before Hermes v0.22.5). Nothing was sent. Use "
+                      f"`hermes-auto new-session {job.get('id', 'JOB_ID')}` for a fresh conversation.")
+    prompt, display = request["prompt"], request.get("display")
+
+    async def work(client):
+        await require_guard(client, profile)
+        snapshot = await client.rpc("session.resume", session_id=sid)
+        different = launch_mismatch((snapshot.get("info") or {}).get("launch_request"), params)
+        if different:
+            raise Refusal(f"Refused: this session's frozen launch differs from the job's ({', '.join(different)}); "
+                          f"nothing was sent. Use `hermes-auto new-session {job.get('id', 'JOB_ID')}`.")
+        from hermes_cli.gateway_chat_view import GatewayChatView
+        from hermes_cli.stream_json import StreamJsonEmitter
+        rpc = client.rpc
+
+        async def submit_with_card(method, **fields):
+            if method == "prompt.submit" and display and display != prompt:
+                # The transcript shows the card; the model is sent the full prompt (kept as api_content).
+                fields = {**fields, "text": display, "api_text": prompt}
+            return await rpc(method, **fields)
+        client.rpc = submit_with_card
+        emitter = StreamJsonEmitter(model=str((snapshot.get("info") or {}).get("model") or ""))
+        emitter.bind_session(sid)
+        view = GatewayChatView(client, snapshot, quiet=True, emitter=emitter)
+        view.unattended = False  # finite, never auto-approving: no one can answer, so approvals resolve to deny
+        return await view.run(prompt, oneshot=True)
+
+    if profile == policy.FULL:
+        # The guard refuses approval-gated calls only while this automatic turn runs; the user's own
+        # later turns in the session keep their normal approvals.
+        policy.write_registration(home, sid, profile, until=time.time() + params["run_budget"] + 300,
+                                  job=job.get("id"))
+    try:
+        return run_gateway(work)
+    finally:
+        if profile == policy.FULL:
+            policy.write_registration(home, sid, profile, until=0, job=job.get("id"))
+
+
+def doctor(config, db):
+    """Import and contract checks without a model call: the gateway client, its creation contract, the
+    guard plugin in the running gateway, and the read-only state.db API the sorter uses."""
+    from hermes_cli.gateway_chat_view import GatewayChatView
+    from hermes_cli.stream_json import StreamJsonEmitter
+    from agent.auxiliary_client import call_llm
+    assert callable(call_llm) and callable(GatewayChatView.run) and callable(StreamJsonEmitter.emit_result)
+    assert callable(db.get_compression_lineage) and callable(db.resolve_resume_session_id)
+
+    async def work(client):
+        contract = (await client.rpc("runtime.describe")).get("session_create") or {}
+        needed = {"toolsets", "max_turns", "run_budget", "provider", "model", "cwd", "ignore_rules"}
+        missing = sorted(needed - set(contract.get("parameters") or []))
+        if "gui" not in (contract.get("sources") or []) or missing:
+            raise Refusal(f"Hermes gateway lacks the creation contract hermes-auto needs: {missing or 'source gui'}")
+        return await guard_status(client)
+    guard = run_gateway(work)
+    return {"ok": True, "python": sys.executable, "source": config["hermes_source"], "guard": guard,
+            "approvals_off": approvals_unattended_unsafe()}
 
 
 def parse_json_block(text):
@@ -514,26 +353,6 @@ def parse_json_block(text):
             except ValueError:
                 continue
     raise ValueError("Model reply contained no JSON")
-
-
-def route_kwargs(request):
-    """`cli.main` keyword arguments for the job's `routes` rule; empty keeps Hermes' configured model."""
-    route = request.get("route") or {}
-    return {key: route[key] for key in ("provider", "model") if route.get(key)}
-
-
-def pin_route(db, sid, session, request):
-    """Record a routed job's provider on its session row: Desktop resumes a session on `model_config.provider`,
-    else on the profile default, so a reply in a work-account session would run on the personal account.
-    The row is created here, before the agent, so the agent never writes its own route."""
-    provider = route_kwargs(request).get("provider")
-    stored = (session or {}).get("model_config") or "{}"
-    try:
-        stored = json.loads(stored) if isinstance(stored, str) else dict(stored)
-    except (TypeError, ValueError):
-        stored = {}
-    if provider and not stored.get("provider"):
-        db.patch_session_model_config(sid, {"provider": provider})
 
 
 def classify(config, request):
@@ -790,7 +609,8 @@ def main():
     request = json.loads(Path(sys.argv[1]).read_text())
     config = request["config"]
     os.environ["HERMES_HOME"] = config.get("hermes_runtime_home", config["hermes_home"])
-    for key in ("HERMES_YOLO", "HERMES_KANBAN_TASK", "HERMES_KANBAN_GOAL_MODE"):
+    for key in ("HERMES_YOLO", "HERMES_YOLO_MODE", "HERMES_KANBAN_TASK", "HERMES_KANBAN_GOAL_MODE",
+                "HERMES_TUI_GATEWAY_URL"):
         os.environ.pop(key, None)
     sys.path.insert(0, config["hermes_source"])
     import hermes_bootstrap  # noqa: F401
@@ -805,122 +625,81 @@ def main():
     action = request["action"]
     job = request.get("job", {})
     sid = job.get("session_id")
-    if action == "doctor":
-        from run_agent import AIAgent
-        from cli import main as cli_main
-        import inspect
-        assert callable(AIAgent._execute_tool_calls)
-        assert "output_format" in inspect.signature(cli_main).parameters
-        # Sorter dependencies: no-tools turns and the classifier's model call.
-        from agent.turn_tool_validation import _append_tool_error_results
-        from agent.auxiliary_client import call_llm
-        assert callable(_append_tool_error_results) and callable(call_llm)
-        assert callable(db.set_session_hidden) and callable(db.set_session_archived)
-        # Clean first message: the transcript text differs from what the model is sent.
-        assert "persist_user_message" in inspect.signature(AIAgent.run_conversation).parameters
-        # Delivery guard of retry-followup reads the whole compression lineage.
-        assert callable(db.get_compression_lineage) and callable(db.resolve_resume_session_id)
-        print(json.dumps({"ok": True, "python": sys.executable, "source": config["hermes_source"]}))
-        db.close()
-        return
-    if action == "archive_states":
-        # Read-only: None = session missing, otherwise whether the user archived it (whole lineage).
-        states = {}
-        for item in request.get("session_ids", []):
-            row = db.get_session(item)
-            states[item] = None if row is None else bool(row.get("archived"))
-        print(json.dumps({"states": states}))
-        db.close()
-        return
-    if action == "classify":
-        db.close()
-        print(json.dumps(classify(config, request), ensure_ascii=False))
-        return
-    if action in ("recent_sessions", "session_excerpts"):
-        db.close()
-        reader = recent_sessions if action == "recent_sessions" else session_excerpts
-        print(json.dumps({"result": reader(Path(config["hermes_home"]) / "state.db", request)}, ensure_ascii=False))
-        return
-    if action == "find_session":
-        found = find_session(Path(config["hermes_home"]) / "state.db", request)
-        if found:
-            # A compression continuation carries the conversation on under a newer id.
-            found = db.resolve_resume_session_id(found) or found
-        print(json.dumps({"session_id": found}))
-        db.close()
-        return
-    session = db.get_session(sid)
-    if action == "inspect":
-        info = {"exists": session is not None, "owned_by": live_owner(sid),
-                "messages": session.get("message_count", 0) if session else 0,
-                "archived": bool(session.get("archived")) if session else False,
-                "last_active": session.get("last_activity_at") if session else None}
-        if request.get("needles"):
-            # Retry of an interrupted reply: was its text already appended anywhere in the compression
-            # lineage? None (unknown) when the lineage cannot be read; the caller then refuses.
-            ids = delivery_scope(db, sid) if session is not None else None
-            info["delivered"] = (reply_delivered(Path(config["hermes_home"]) / "state.db", ids, request["needles"])
-                                 if ids else None)
-        print(json.dumps(info))
-        db.close()
-        return
-    if action == "create":
-        if session is None:
-            db.create_session(sid, source="cli")
-        if session is None or not session.get("title"):
-            # A failed earlier create can leave an untitled session; finish it instead of skipping.
-            unique_title(db, sid, request["title"])
-        if request.get("hidden"):
-            # Listed in the Desktop "Auto" page instead of the main Sessions list.
-            db.set_session_hidden(sid, True)
-        pin_route(db, sid, session, request)
-        if job["mode"] == "open" and not db.get_messages(sid):
-            db.append_message(sid, "user", content=request["prompt"])
-            db.append_message(sid, "assistant", content=request["open_message"])
-        db.close()
-        print(json.dumps({"session_id": sid}))
-        return
-    if action != "run" or session is None:
-        raise RuntimeError("Target session is missing; it will not be recreated")
-    pin_route(db, sid, session, request)
-    db.close()
-    from run_agent import AIAgent
-    import cli
-    import toolsets
-    # Only this worker's in-memory configuration changes. Interactive Hermes keeps its settings.
-    # Unattended runs never get interactive approval: dangerous commands are denied.
-    cli.CLI_CONFIG["approvals"] = {"mode": "manual", "single_query_mode": "deny"}
-    show_clean_prompt(AIAgent, request["prompt"], request.get("display"))
-    profile = request.get("deny_tools")
-    if profile:
-        # Third-party content inside a normal session: the session keeps its full toolset and prompt.
-        # Research profiles (Slack, GitHub) run reads only (Slack, code, PRs, Linear, web) and draft; mail
-        # runs plain reads (calendar, Gmail search/get, Todoist, past sessions, skills); "private" and
-        # unknown profiles execute no tool. Nothing is sent.
-        desktop_parity(AIAgent)
-        deny_tool_execution(AIAgent, profile=profile)
-        research = profile in RESEARCH_PROFILES
-        cli.main(query=request["prompt"], resume=sid, quiet=True, oneshot=True, output_format="stream-json",
-                 max_turns=config["agent_max_turns" if research else "max_turns"],
-                 run_budget=config["agent_run_budget_seconds" if research else "run_budget_seconds"],
-                 **route_kwargs(request))
-        return
-    if request.get("full_tools"):
-        # Todoist tasks and mail the user labelled for the agent: normal toolsets, skills and project rules.
-        desktop_parity(AIAgent)
-        cli.main(query=request["prompt"], resume=sid, quiet=True, oneshot=True, output_format="stream-json",
-                 max_turns=config["agent_max_turns"], run_budget=config["agent_run_budget_seconds"],
-                 **route_kwargs(request))
-        return
-    allowed = {"web_search", "web_extract"} if job["mode"] in ("research", "agent") else set()
-    guard_agent(AIAgent, allowed)
-    toolsets.TOOLSETS["hermes-auto-preparation"] = {
-        "description": "Hermes Auto bounded preparation", "tools": sorted(allowed), "includes": [],
-    }
-    cli.CLI_CONFIG["tool_search"] = {"enabled": "off"}
-    cli.main(query=request["prompt"], resume=sid, quiet=True, oneshot=True,
-             output_format="stream-json", toolsets="hermes-auto-preparation", ignore_rules=True,
-             max_turns=config["max_turns"], run_budget=config["run_budget_seconds"], **route_kwargs(request))
+    try:
+        if action == "doctor":
+            print(json.dumps(doctor(config, db)))
+            return
+        if action == "reload_plugins":
+            # The gateway's own `reload-plugins` control verb (what `hermes plugins enable` sends): plugins
+            # are re-discovered in the running gateway, open conversations keep running.
+            from gateway.control_socket import reload_gateway_plugins
+            answer = reload_gateway_plugins(Path(config["hermes_home"])) or {"reloaded": False,
+                                                                               "error": "no gateway answered"}
+            answer = {key: answer.get(key) for key in ("reloaded", "error", "plugins")}
+            answer["guard"] = run_gateway(guard_status) if answer.get("reloaded") else None
+            print(json.dumps(answer))
+            return
+        if action == "archive_states":
+            # Read-only: None = session missing, otherwise whether the user archived it (whole lineage).
+            states = {}
+            for item in request.get("session_ids", []):
+                row = db.get_session(item)
+                states[item] = None if row is None else bool(row.get("archived"))
+            print(json.dumps({"states": states}))
+            return
+        if action == "classify":
+            print(json.dumps(classify(config, request), ensure_ascii=False))
+            return
+        if action in ("recent_sessions", "session_excerpts"):
+            reader = recent_sessions if action == "recent_sessions" else session_excerpts
+            print(json.dumps({"result": reader(Path(config["hermes_home"]) / "state.db", request)}, ensure_ascii=False))
+            return
+        if action == "find_session":
+            found = find_session(Path(config["hermes_home"]) / "state.db", request)
+            if found:
+                # A compression continuation carries the conversation on under a newer id.
+                found = db.resolve_resume_session_id(found) or found
+            print(json.dumps({"session_id": found}))
+            return
+        session = db.get_session(sid)
+        if action == "inspect":
+            info = {"exists": session is not None, "owned_by": live_owner(sid),
+                    "messages": session.get("message_count", 0) if session else 0,
+                    "archived": bool(session.get("archived")) if session else False,
+                    "last_active": session.get("last_activity_at") if session else None}
+            if request.get("needles"):
+                # Retry of an interrupted reply: was its text already appended anywhere in the compression
+                # lineage? None (unknown) when the lineage cannot be read; the caller then refuses.
+                ids = delivery_scope(db, sid) if session is not None else None
+                info["delivered"] = (reply_delivered(Path(config["hermes_home"]) / "state.db", ids, request["needles"])
+                                     if ids else None)
+            print(json.dumps(info))
+            return
+        if action == "create":
+            if job["mode"] == "open":
+                print(json.dumps({"session_id": create_open_session(request, config, job, db)}))
+                return
+            if session is not None:
+                # A retry before anything was sent: the gateway session already exists under this id.
+                if guard_policy().profile_for(request.get("deny_tools"), request.get("full_tools")) is not None \
+                        and guard_policy().read_registration(config["hermes_home"], sid) is None:
+                    raise Refusal("Refused: this session was created by an older hermes-auto without the tool "
+                                  f"policy; use `hermes-auto new-session {job.get('id', 'JOB_ID')}`.")
+                print(json.dumps({"session_id": sid}))
+                return
+            print(json.dumps({"session_id": create_agent_session(request, config, job, db)}))
+            return
+        if action != "run" or session is None:
+            raise RuntimeError("Target session is missing; it will not be recreated")
+        db.close()  # nothing here writes state.db; the gateway owns the session from now on
+        db = None
+        sys.exit(run_session(request, config, job))
+    except Refusal as exc:
+        print(f"{REFUSAL_MARK} {exc}", file=sys.stderr, flush=True)
+        sys.exit(3)
+    finally:
+        if db is not None:
+            db.close()
 
 
 if __name__ == "__main__":
