@@ -8,8 +8,10 @@ profile's home, written at install; without it every read is refused.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
+import sqlite3
 
 from . import policy
 
@@ -24,24 +26,53 @@ def _home():
         return os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
 
 
-def _families():
-    """The reads of the profile this turn runs in, read from that profile's own plugin directory each call (one
-    module may serve several profiles in one gateway, so nothing per profile is cached here)."""
-    return policy.read_scope(os.path.join(_home(), "plugins", policy.GUARD_NAME))
+POLICY_KEY = "gateway.local_policy.v1:"  # Hermes' immutable per-session creation policy in state_meta
 
 
-def pre_tool_call(tool_name=None, args=None, **_):
+def _provider(session_id):
+    """The provider a session was created with: the `provider` of its frozen creation request (hermes-auto's
+    `routes` account), read-only from this profile's state.db. "" when the request named none (the profile's own
+    account); None when it cannot be told (the row or its policy is missing or unreadable)."""
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{os.path.join(_home(), 'state.db')}?mode=ro", uri=True, timeout=5)
+        try:
+            row = conn.execute("SELECT value FROM state_meta WHERE key=?", (POLICY_KEY + session_id,)).fetchone()
+        finally:
+            conn.close()
+        saved = json.loads(row[0]) if row else None
+        request = json.loads(saved["policy"]["request_json"] or "{}")
+    except (sqlite3.Error, ValueError, TypeError, KeyError):
+        return None
+    if not isinstance(request, dict):
+        return None
+    provider = request.get("provider") or ""
+    return provider if isinstance(provider, str) else None
+
+
+def _scope(session_id):
+    """(read families, session_search allowed) for this session: its own profile's scope (read from that profile's
+    plugin directory each call; one module may serve several profiles in one gateway) and its account."""
+    data = policy.load_scope(os.path.join(_home(), "plugins", policy.GUARD_NAME))
+    return policy.session_scope(data, _provider(session_id) if data and data.get("providers") else "")
+
+
+def pre_tool_call(tool_name=None, args=None, session_id="", task_id="", **_):
     """Refuse what a read-only bot may not run. An exception here is a refusal (Hermes fails a raising
     pre_tool_call closed)."""
-    message = policy.decide(tool_name, args)
+    search = True
+    if tool_name == "session_search":
+        search = _scope(session_id or task_id)[1]
+    message = policy.decide(tool_name, args, search)
     return {"action": "block", "message": message} if message else None
 
 
 def read_tool(args, **kwargs):
-    families = _families()
+    families, _search = _scope(kwargs.get("session_id") or kwargs.get("task_id") or "")
     if not families:
-        return policy.neutral("Not run: this profile's hermes-auto-guard has no read scope; reinstall it with "
-                              "`hermes-auto install-guard`.")
+        return policy.neutral("Not run: no reads for this session (no read scope installed for this bot, or none for "
+                              "this account); reinstall it with `hermes-auto install-guard` if that is wrong.")
     return policy.run_read((args or {}).get("command"), families)
 
 

@@ -102,15 +102,37 @@ def launch_mismatch(launch, params):
     return [key for key in LAUNCH_KEYS if launch.get(key) != expected.get(key)]
 
 
-def approvals_unattended_unsafe():
+def raw_settings(config):
+    """This home's config.yaml exactly as written, parsed strictly. Hermes' own readers fall back to defaults or the
+    last good copy on a broken file; a readiness check must refuse instead, so it reads the file itself."""
+    path = Path(config["hermes_home"]) / "config.yaml"
+    if not path.is_file():
+        return {}
+    from utils import fast_safe_load  # Hermes' own strict YAML reader (raises on a parse error)
+    try:
+        data = fast_safe_load(path.read_text(encoding="utf-8-sig")) or {}
+    except Exception as exc:  # noqa: BLE001 - any read or parse error refuses
+        raise Refusal(f"Refused: {path} cannot be read ({exc.__class__.__name__}); nothing was sent.") from None
+    if not isinstance(data, dict):
+        raise Refusal(f"Refused: {path} is not a mapping; nothing was sent.")
+    return data
+
+
+def approvals_unattended_unsafe(config=None):
     """True when this profile's approval settings would let an automatic turn run a dangerous command
     (`approvals.mode: off`, or `single_query_mode: approve`). An automatic turn is finite, so with any other
-    mode Hermes resolves an approval-gated action from `approvals.single_query_mode` (deny) at once."""
-    try:
-        from tools.approval_context import _binary_approval_mode, _get_approval_mode
-        return _get_approval_mode() == "off" or _binary_approval_mode("single_query_mode") == "approve"
-    except Exception:  # noqa: BLE001 - unknown settings: assume the unsafe ones
+    mode Hermes resolves an approval-gated action from `approvals.single_query_mode` (deny) at once. Read from
+    the file itself (defaults as Hermes: mode smart, single_query_mode deny); an unreadable file refuses."""
+    if config is None:
         return True
+    approvals = raw_settings(config).get("approvals") or {}
+    if not isinstance(approvals, dict):
+        return True
+    mode = approvals.get("mode", "smart")
+    mode = ("off" if mode is False else "manual") if isinstance(mode, bool) else str(mode).strip().lower()
+    single = approvals.get("single_query_mode", "deny")
+    single = ("approve" if single is True else "deny") if isinstance(single, bool) else str(single).strip().lower()
+    return mode == "off" or single == "approve" or os.environ.get("HERMES_YOLO_MODE") not in (None, "", "0")
 
 
 # What a read-only bot's profile must switch off and may switch on (its `platform_toolsets.cli`).
@@ -131,16 +153,26 @@ def bot_of(config):
     return config.get("bot") or {"name": "default", "read_only": False, "reads": []}
 
 
+def expected_scope(config):
+    """scope.json as `hermes-auto install-guard` writes it for this bot (guard.scope_data, without importing it)."""
+    bot = bot_of(config)
+    data = {"version": 1, "reads": sorted(set(bot.get("reads") or []))}
+    if bot.get("providers"):
+        data["providers"] = {name: {"reads": sorted(set(spec.get("reads") or [])),
+                                    "session_search": bool(spec.get("session_search", False))}
+                             for name, spec in sorted(bot["providers"].items())}
+    return data
+
+
 def profile_problems(config):
     """Why this home is not a ready read-only bot, read from its config.yaml as Hermes reads it (empty: ready).
     The boundary is the profile's own configuration: only the hermes-auto read toolset and session_search,
     everything that runs code, touches files, browses or sends switched off, the guard plugin enabled."""
     from agent.skill_utils import parse_config_string_list
-    from hermes_cli.config import load_config
     home = Path(config["hermes_home"])
     if not (home / "config.yaml").is_file():
         return [f"profile {bot_of(config)['name']!r} does not exist ({home})"]
-    settings = load_config() or {}
+    settings = raw_settings(config)
     problems = []
     platform = set(parse_config_string_list((settings.get("platform_toolsets") or {}).get("cli")))
     if not platform or not platform <= read_only_toolsets():
@@ -158,10 +190,9 @@ def profile_problems(config):
         problems.append("auxiliary.background_review.enabled must be false (no memory or skill patches after a turn)")
     if guard_policy().GUARD_NAME not in parse_config_string_list((settings.get("plugins") or {}).get("enabled")):
         problems.append("plugins.enabled lacks hermes-auto-guard")
-    scope = guard_policy().read_scope(home / "plugins" / guard_policy().GUARD_NAME)
-    if scope != frozenset(bot_of(config).get("reads") or []):
-        problems.append(f"installed read scope {sorted(scope)} differs from config {bot_of(config).get('reads')}; "
-                        "run `hermes-auto install-guard`")
+    scope = guard_policy().load_scope(home / "plugins" / guard_policy().GUARD_NAME)
+    if scope != expected_scope(config):
+        problems.append("the installed read scope differs from hermes-auto's config; run `hermes-auto install-guard`")
     return problems
 
 
@@ -190,30 +221,39 @@ def guard_message(status):
     return f"hermes-auto-guard is loaded but not active ({status.get('error') or 'disabled or incomplete'})"
 
 
-async def require_bot(client, config, profile, job):
-    """Fail closed before anything reaches a session: third-party content only in a ready read-only bot; a
-    full-tools automatic turn only in a working bot whose approvals deny what nobody can approve."""
+INTERNAL_SOURCES = ("brief", "questions", "proposals", "unblocked")  # triage.INTERNAL_SOURCES
+
+
+def third_party(profile, job, request):
+    """Whether a job carries someone else's content: a read profile, or anything that is neither the user's own
+    full-tools job nor an internal source (a brief or plan hermes-auto wrote)."""
+    return profile in guard_policy().DENY_PROFILES or (
+        profile is None and not request.get("full_tools") and job.get("source") not in INTERNAL_SOURCES)
+
+
+async def require_bot(client, config, profile, job, request):
+    """Fail closed before anything reaches a session (create, import or run): third-party content only in a ready
+    read-only bot; a full-tools automatic turn only in a working bot whose approvals deny what nobody can approve.
+    Without a `bots` section (no `bot` in the request) only the old bounded preparation, with no tools, passes."""
     bot = bot_of(config)
     retry = f"Nothing was sent. Fix it, then `hermes-auto new-session {job.get('id', 'JOB_ID')}`."
-    if profile in guard_policy().DENY_PROFILES:
-        if not bot.get("read_only"):
-            raise Refusal(f"Refused: third-party content goes only to a read-only bot, not to profile "
-                          f"{bot['name']!r} (configure `bots` in hermes-auto's config.json). {retry}")
+    if bot.get("read_only"):
+        if profile == guard_policy().FULL:
+            raise Refusal(f"Refused: a full-tools job cannot run in the read-only bot {bot['name']!r}. {retry}")
         problems = profile_problems(config)
-        if profile != guard_policy().PRIVATE:
-            status = await guard_status(client)
-            if not status["ok"]:
-                problems.append(guard_message(status) + f" (`hermes-auto guard-reload {bot['name']}`)")
+        status = await guard_status(client)
+        if not status["ok"]:
+            problems.append(guard_message(status) + f" (`hermes-auto guard-reload {bot['name']}`)")
         if problems:
             raise Refusal(f"Refused: bot {bot['name']!r} is not a ready read-only bot: {'; '.join(problems)}. {retry}")
-    elif profile == guard_policy().FULL:
-        if bot.get("read_only"):
-            raise Refusal(f"Refused: a full-tools job cannot run in the read-only bot {bot['name']!r}. {retry}")
-        if approvals_unattended_unsafe():
-            raise Refusal(f"Refused: bot {bot['name']!r} has approvals.mode off (or single_query_mode approve), so "
-                          "an automatic turn would run approval-gated commands without anyone. Set `hermes "
-                          f"-p {bot['name']} config set approvals.mode manual` (single_query_mode stays deny) "
-                          f"or route these tasks to another bot. {retry}")
+    elif third_party(profile, job, request) and (profile is not None or config.get("bot")):
+        raise Refusal(f"Refused: third-party content goes only to a read-only bot, not to profile "
+                      f"{bot['name']!r} (configure `bots` in hermes-auto's config.json). {retry}")
+    elif profile == guard_policy().FULL and approvals_unattended_unsafe(config):
+        raise Refusal(f"Refused: bot {bot['name']!r} has approvals.mode off (or single_query_mode approve), so "
+                      "an automatic turn would run approval-gated commands without anyone. Set `hermes "
+                      f"-p {bot['name']} config set approvals.mode manual` (single_query_mode stays deny) "
+                      f"or route these tasks to another bot. {retry}")
 
 
 def run_gateway(work):
@@ -282,7 +322,7 @@ def create_agent_session(request, config, job, db):
         if "gui" not in (contract.get("sources") or []) or missing:
             raise Refusal("Refused: this Hermes gateway cannot create automatic sessions with "
                           f"{', '.join(missing) or 'source gui'}; update Hermes.")
-        await require_bot(client, config, profile, job)
+        await require_bot(client, config, profile, job, request)
         snapshot = await client.rpc("session.create", request_id=f"hermes-auto:{job['session_id']}",
                                     source="gui", cwd=str(Path.home()), **params,
                                     **({"hidden": True} if request.get("hidden") else {}))
@@ -316,6 +356,9 @@ def create_open_session(request, config, job, db):
             session["model"] = route["model"]
 
     async def work(client):
+        policy = guard_policy()
+        await require_bot(client, config, policy.profile_for(request.get("deny_tools"), request.get("full_tools")),
+                          job, request)
         return await client.rpc("session.mutate", session_id=sid, request_id=f"hermes-auto-import:{sid}",
                                 expected_revision=0, operation="import", payload={"sessions": [session]})
     result = run_gateway(work)
@@ -334,7 +377,7 @@ def run_session(request, config, job):
     prompt, display = request["prompt"], request.get("display")
 
     async def work(client):
-        await require_bot(client, config, profile, job)
+        await require_bot(client, config, profile, job, request)
         snapshot = await client.rpc("session.resume", session_id=sid)
         different = launch_mismatch((snapshot.get("info") or {}).get("launch_request"), params)
         if different:
@@ -388,7 +431,7 @@ def doctor(config, db):
         problems = profile_problems(config) + ([] if guard["ok"] else [guard_message(guard)])
         report.update(guard=guard, reads=bot.get("reads"), problems=problems, ready=not problems)
     else:
-        unsafe = approvals_unattended_unsafe()
+        unsafe = approvals_unattended_unsafe(config)
         report.update(approvals_off=unsafe, ready=not unsafe,
                       problems=["approvals.mode off: automatic Todoist runs here are refused"] if unsafe else [])
     return report

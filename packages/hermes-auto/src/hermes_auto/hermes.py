@@ -106,7 +106,8 @@ class Hermes:
         spec = bots.read_only(self.config).get(profile)
         return {**self.config, "hermes_home": bots.profile_home(self.config, profile),
                 "bot": {"name": profile, "read_only": spec is not None,
-                        "reads": sorted((spec or {}).get("reads") or [])}}
+                        "reads": sorted((spec or {}).get("reads") or []),
+                        "providers": (spec or {}).get("providers") or {}}}
 
     def invoke(self, action, job=None, profile=None, **extra):
         """Run one bridge action. `profile`: the bot whose home it targets (default: the job's bot)."""
@@ -184,10 +185,10 @@ class Hermes:
         runs.mkdir(mode=0o700, exist_ok=True)
         directory = Path(tempfile.mkdtemp(prefix=f"job-{job['id']}-", dir=runs))
         request = directory / "request.json"
-        deny = deny_mode(job)
+        full, deny = self.tools_of(job)
         private_json(request, {"action": "run", "config": self.profile_config(bots.of(job)), "job": job,
                                "prompt": prompt,
-                               "display": display, "full_tools": full_tools(job), "deny_tools": deny,
+                               "display": display, "full_tools": full, "deny_tools": deny,
                                "route": job_route(job, self.config)})
         command = [self.python, "-I", str(Path(__file__).with_name("bridge.py")), str(request)]
         script = 'umask 077; "$@" >"$OUT" 2>"$ERR"; echo $? >"$CODE.tmp" && mv "$CODE.tmp" "$CODE"'
@@ -231,6 +232,13 @@ class Hermes:
             return self.parse("run", returncode, stdout, stderr)
         finally:
             shutil.rmtree(directory, ignore_errors=True)
+
+    def tools_of(self, job):
+        """(full_tools, deny_tools) for a job's session: a job in a read-only bot never has full tools and always
+        has a read profile (an agent-labelled mail thread there reads like any other mail)."""
+        if bots.is_read_only(self.config, bots.of(job)):
+            return False, deny_mode(job) or True
+        return full_tools(job), deny_mode(job)
 
     def budget(self, job):
         # Slack sessions research before drafting (reads only), so they get the full agent budget.
@@ -296,11 +304,12 @@ class Hermes:
             "This session is ready. Automatic preparation is disabled; continue when you are ready.")
         hidden = bool(self.config.get("triage", {}).get("hide_sessions", False))
         # The gateway creates a run's session (its id may differ from the reserved one); `open` keeps it.
+        full, deny = self.tools_of(job)
         return self.invoke("create", job, title=title, prompt=prompt, open_message=message, hidden=hidden,
-                           full_tools=full_tools(job), deny_tools=deny_mode(job),
+                           full_tools=full, deny_tools=deny,
                            route=job_route(job, self.config))["session_id"]
 
     def run(self, job, prompt, display=None):
-        deny = deny_mode(job)
-        return self.invoke("run", job, prompt=prompt, display=display, full_tools=full_tools(job), deny_tools=deny,
+        full, deny = self.tools_of(job)
+        return self.invoke("run", job, prompt=prompt, display=display, full_tools=full, deny_tools=deny,
                            route=job_route(job, self.config))

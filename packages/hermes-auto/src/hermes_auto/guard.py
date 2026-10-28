@@ -18,34 +18,44 @@ def target(hermes_home):
     return Path(hermes_home).expanduser() / "plugins" / PLUGIN
 
 
-def scope_bytes(reads):
-    return (json.dumps({"version": 1, "reads": sorted(set(reads))}) + "\n").encode()
+def scope_data(reads, providers=None):
+    """The scope.json content: default reads, plus per-provider reads for sessions on another account."""
+    data = {"version": 1, "reads": sorted(set(reads))}
+    if providers:
+        data["providers"] = {name: {"reads": sorted(set(spec.get("reads") or [])),
+                                    "session_search": bool(spec.get("session_search", False))}
+                             for name, spec in sorted(providers.items())}
+    if not policy.valid_scope(data):
+        raise ValueError(f"invalid read scope: {data}")
+    return data
 
 
-def differences(hermes_home, reads=None):
+def scope_bytes(reads, providers=None):
+    return (json.dumps(scope_data(reads, providers), sort_keys=True) + "\n").encode()
+
+
+def differences(hermes_home, reads=None, providers=None):
     """Files of the installed plugin that differ from this package's copy (all of them when absent), plus
     `scope.json` when `reads` is given and the installed scope differs."""
     installed = target(hermes_home)
     changed = [name for name in FILES
                if not (installed / name).is_file() or (installed / name).read_bytes() != (SOURCE / name).read_bytes()]
-    if reads is not None and policy.read_scope(installed) != frozenset(reads):
+    if reads is not None and policy.load_scope(installed) != scope_data(reads, providers):
         changed.append(policy.SCOPE_FILE)
     return changed
 
 
-def install(hermes_home, reads):
+def install(hermes_home, reads, providers=None):
     """Copy the plugin and its read scope into <profile home>/plugins/hermes-auto-guard, replacing the directory
     atomically. Does not enable it and does not touch the running gateway (see `activation_steps`)."""
-    unknown = set(reads) - set(policy.FAMILIES)
-    if unknown:
-        raise ValueError(f"unknown read families: {sorted(unknown)}")
+    scope = scope_bytes(reads, providers)  # validates before anything is replaced
     destination = target(hermes_home)
     destination.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{PLUGIN}-", dir=destination.parent))
     for name in FILES:
         shutil.copyfile(SOURCE / name, staging / name)
         os.chmod(staging / name, 0o644)
-    (staging / policy.SCOPE_FILE).write_bytes(scope_bytes(reads))
+    (staging / policy.SCOPE_FILE).write_bytes(scope)
     os.chmod(staging / policy.SCOPE_FILE, 0o644)
     os.chmod(staging, 0o755)
     retired = None

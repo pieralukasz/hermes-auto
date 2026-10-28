@@ -100,7 +100,10 @@ def _payload(job):
 
 
 def full_tools(job):
-    return job["source"] == "todoist" or job.get("mode") == "agent"  # runner.full_tools
+    """With bots, only the user's own Todoist tasks run with full tools. A mail thread with the agent label still
+    carries other people's replies, so it goes to a read-only bot like any third-party matter (handing it to a
+    full bot is the user's own step: "Kontynuuj w Dolores")."""
+    return job["source"] == "todoist"
 
 
 def choose(job, config):
@@ -109,6 +112,10 @@ def choose(job, config):
     if not bots:
         return DEFAULT
     default = bots.get("default", DEFAULT)
+    if job["source"] == "brief":
+        # The digest quotes senders, subjects and snippets written by other people: a read-only bot, never a
+        # session the user would continue with full tools by accident.
+        return bots.get("inbox") or default
     if job["source"] in INTERNAL_SOURCES:
         return default
     payload = _payload(job)

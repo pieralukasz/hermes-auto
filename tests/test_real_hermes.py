@@ -139,6 +139,9 @@ def provider_yaml(port):
     return ("model:\n  default: test-model\n  provider: work-test\n"
             "providers:\n  work-test:\n    name: Work (test)\n"
             f"    api: http://127.0.0.1:{port}\n    transport: anthropic_messages\n"
+            "    key_env: HERMES_AUTO_TEST_WORK_KEY\n    default_model: test-model\n    models: [test-model]\n"
+            "  work-two:\n    name: Second account (test)\n"
+            f"    api: http://127.0.0.1:{port}\n    transport: anthropic_messages\n"
             "    key_env: HERMES_AUTO_TEST_WORK_KEY\n    default_model: test-model\n    models: [test-model]\n")
 
 
@@ -161,7 +164,7 @@ class World:
         self.config = {**defaults(), "hermes_home": str(self.home),
                        "hermes_python": os.environ["HERMES_AUTO_TEST_PYTHON"],
                        "hermes_source": os.environ["HERMES_AUTO_TEST_SOURCE"],
-                       "routes": [{"match": {"source": "example"}, "provider": "work-test", "model": "test-model"}]}
+                       "routes": [{"match": {"source": "example"}, "provider": "work-two", "model": "test-model"}]}
         if bots:
             inbox = self.profile("inbox", "platform_toolsets:\n  cli: [hermes-auto, session_search]\n"
                                  f"agent:\n  disabled_toolsets: {json.dumps(READ_ONLY_DISABLED)}\n"
@@ -169,10 +172,12 @@ class World:
                                  + "approvals:\n  mode: manual\n"
                                  "memory:\n  memory_enabled: false\n  user_profile_enabled: false\n"
                                  "auxiliary:\n  background_review:\n    enabled: false\n")
-            guard.install(inbox, ["todoist", "github"])
+            # One inbox, two accounts: sessions routed to `work-two` (source "example") read only GitHub.
+            work = {"work-two": {"reads": ["github"], "session_search": False}}
+            guard.install(inbox, ["todoist", "github"], work)
             self.profile("work", f"approvals:\n  mode: '{work_approvals}'\n")
             self.config["bots"] = {"default": "default", "inbox": "inbox",
-                                   "read_only": {"inbox": {"reads": ["github", "todoist"]}},
+                                   "read_only": {"inbox": {"reads": ["github", "todoist"], "providers": work}},
                                    "rules": [{"match": {"source": "todoist"}, "profile": "work"}]}
         bin_dir = root / "bin"
         bin_dir.mkdir()
@@ -288,7 +293,7 @@ def test_open_sessions_are_imported_by_the_gateway_under_their_reserved_id(make_
                                                       "'$.provider') AS provider FROM sessions")}
     finally:
         db.close()
-    assert rows[routed_example["session_id"]]["provider"] == "work-test"
+    assert rows[routed_example["session_id"]]["provider"] == "work-two"
     assert rows[routed_example["session_id"]]["model"] == "test-model"  # the route's model, not only its account
 
 
@@ -339,13 +344,40 @@ def test_the_inbox_bot_reads_through_the_guard_and_shows_the_card(make_world):
     assert "terminal" not in sent and sent <= {"tool_search", "tool_describe", "tool_call", "hermes_auto_read",
                                                 "hermes_auto_skill_view", "hermes_auto_skills_list", "session_search"}
     tools = world.tool_results(sid, "inbox")
-    assert tools["toolu_td"] == {"output": "synthetic td: today --json\n", "exit_code": 0}
+    # This session runs on the second (work) account: its reads are GitHub only, no Todoist, no session_search.
+    assert tools["toolu_td"].get("skipped") is True
     assert tools["toolu_list"]["success"] is True
     assert tools["toolu_skill"]["skipped"] is True and "no-such-skill" in tools["toolu_skill"]["note"]
-    assert "only its own" in str(tools["toolu_other"])
+    assert "not searchable" in str(tools["toolu_other"])
     assert tools["toolu_google"]["skipped"] is True  # Google is not in this bot's read scope
     assert tools["toolu_git"]["skipped"] is True and "error" not in tools["toolu_git"]
     assert "does not exist" in str(tools["toolu_term"]) and "Not run" in str(tools["toolu_term2"])
+
+
+@CONTRACT
+def test_a_private_matter_in_the_same_inbox_reads_with_the_private_scope(make_world):
+    world = make_world([([bridged("toolu_td", "hermes_auto_read", {"command": "td today --json"}),
+                          bridged("toolu_other", "session_search", {"query": "x", "profile": "default"}),
+                          bridged("toolu_own", "session_search", {"query": "x"})], "tool_use")])
+    job = world.job("mail", source="mailish", deny_tools=True, triage={"reason": "test"})
+    assert job["profile"] == "inbox"
+    sid = world.hermes.create(job, "unused")
+    assert world.hermes.run({**job, "session_id": sid}, "Synthetic private matter")["exit_code"] == 0
+    tools = world.tool_results(sid, "inbox")
+    assert tools["toolu_td"] == {"output": "synthetic td: today --json\n", "exit_code": 0}
+    assert "only its own" in str(tools["toolu_other"]) and "skipped" not in str(tools["toolu_own"])
+
+
+@CONTRACT
+def test_a_broken_bot_config_or_an_unready_bot_refuses_imports_too(make_world):
+    world = make_world(inbox_plugin=False)
+    opened = world.job("opened", mode="open", source="mailish")  # someone's mail opened without a run
+    with pytest.raises(RuntimeError, match="hermes-auto-guard"):
+        world.hermes.create(opened, "Synthetic third-party text")
+    (world.home / "profiles" / "work" / "config.yaml").write_text("approvals: [unclosed\n")
+    with pytest.raises(RuntimeError, match="cannot be read"):
+        world.hermes.create(world.job("task", source="todoist", mode="agent"), "unused")
+    assert (world.count("inbox"), world.count("work")) == (0, 0)
 
 
 @CONTRACT

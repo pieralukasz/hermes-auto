@@ -420,7 +420,7 @@ def dispatch(args, home, config, store):
             profile_home = bots.profile_home(config, name)
             if not (Path(profile_home) / "config.yaml").is_file():
                 raise ValueError(f"Profile {name!r} does not exist; create it first (hermes profile create {name})")
-            guard.install(profile_home, targets[name].get("reads") or [])
+            guard.install(profile_home, targets[name].get("reads") or [], targets[name].get("providers"))
             print(guard.activation_steps(name, profile_home))
     elif command == "guard-reload":
         from . import bots

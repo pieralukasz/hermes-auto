@@ -121,6 +121,41 @@ def test_the_scope_is_read_from_the_home_of_the_turn(tmp_path, monkeypatch):
     assert len(calls) == 1
 
 
+def provider_db(home, rows):
+    """Sessions with their frozen creation request, as Hermes stores it (state_meta local policy)."""
+    import sqlite3
+    db = sqlite3.connect(home / "state.db")
+    db.execute("CREATE TABLE state_meta (key TEXT PRIMARY KEY, value TEXT)")
+    db.executemany("INSERT INTO state_meta VALUES (?,?)",
+                   [(plugin.POLICY_KEY + sid, json.dumps({"policy": {"request_json": json.dumps(request)}}))
+                    for sid, request in rows])
+    db.commit()
+    db.close()
+
+
+def test_one_bot_two_accounts_each_session_reads_what_its_account_may(home, monkeypatch):
+    """The inbox bot serves private and work matters; the account frozen into a session picks its reads."""
+    calls = fake_run(monkeypatch)
+    guard.install(home, ["google", "todoist", "github"],
+                  {"anthropic-work": {"reads": ["github", "slack"], "session_search": False}})
+    provider_db(home, [("private", {"toolsets": ["hermes-auto"]}),
+                       ("work", {"provider": "anthropic-work", "toolsets": ["hermes-auto"]}),
+                       ("work-custom", {"provider": "anthropic-work", "model": "m"})])
+    google = "python3 ~/.hermes/skills/productivity/google-workspace/scripts/google_api.py gmail search x"
+    assert json.loads(plugin.read_tool({"command": google}, session_id="private"))["exit_code"] == 0
+    assert hook("session_search", {"query": "x"}, session_id="private") is None
+    for work in ("work", "work-custom"):
+        assert json.loads(plugin.read_tool({"command": google}, session_id=work))["skipped"] is True
+        assert json.loads(plugin.read_tool({"command": "td today"}, session_id=work))["skipped"] is True
+        assert json.loads(plugin.read_tool({"command": "gh pr view 1 --repo a/b"}, session_id=work))["exit_code"] == 0
+        assert "not searchable" in hook("session_search", {"query": "x"}, session_id=work)["message"]
+    # A session whose row cannot be read gets only what every account may and no search.
+    assert json.loads(plugin.read_tool({"command": google}, session_id="unknown"))["skipped"] is True
+    assert json.loads(plugin.read_tool({"command": "gh pr view 2 --repo a/b"}, session_id="unknown"))["exit_code"] == 0
+    assert hook("session_search", {"query": "x"}, session_id="unknown")["action"] == "block"
+    assert len(calls) == 4
+
+
 def test_trusted_script_paths_are_expanded_without_a_shell():
     command = "python3 ~/.hermes/skills/productivity/google-workspace/scripts/google_api.py gmail search 'from:a'"
     argv = policy.read_argv(command, "mail")
@@ -163,6 +198,11 @@ def test_install_copies_the_plugin_with_its_scope_and_reports_differences(tmp_pa
     assert guard.differences(hermes_home, ["google"]) == [] and not list(target.parent.glob(".hermes-auto-guard*"))
     with pytest.raises(ValueError):
         guard.install(hermes_home, ["shell"])
+    with pytest.raises(ValueError):
+        guard.install(hermes_home, ["google"], {"work": {"reads": ["shell"]}})
+    guard.install(hermes_home, ["google"], {"work": {"reads": ["github"]}})
+    assert guard.differences(hermes_home, ["google"], {"work": {"reads": ["github"]}}) == []
+    assert guard.differences(hermes_home, ["google"]) == [policy.SCOPE_FILE]
 
 
 def test_plugin_manifest_version_matches_the_policy():

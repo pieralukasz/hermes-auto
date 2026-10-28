@@ -43,8 +43,10 @@ def job(source, mode="draft", **payload):
     (job("todoist", "agent", projectId=TAPIN_PROJECT), "tapin"),
     (job("todoist", "agent", projectId=ECMR_PROJECT), "ecmr"),
     (job("todoist", "agent", projectId="other"), "default"),
-    (job("gmail", "agent"), "ecmr"),  # the user's agent label: full tools, first full rule that matches
-    (job("brief", "open"), "default"),
+    (job("proton", "agent"), "inbox"),
+    (job("gmail", "agent"), "inbox"),  # an agent-labelled thread still carries other people's replies
+    (job("brief", "open"), "inbox"),  # the digest quotes other people's subjects and snippets
+    (job("questions", "open"), "default"),
     (job("proposals", "open"), "default"),
 ])
 def test_each_job_goes_to_its_bot(item, expected):
@@ -71,6 +73,17 @@ def test_a_reply_stays_in_the_read_only_bot_of_its_conversation_but_never_moves_
     assert bots.choose(job("slack", deny_tools="research", bot="inbox2", dm=True), two) == "inbox2"
     assert bots.choose(job("gmail", deny_tools=True, bot="default"), config()) == "inbox"
     assert bots.choose(job("todoist", "agent", bot="inbox"), config()) == "default"
+
+
+def test_a_job_in_a_read_only_bot_never_gets_full_tools_and_always_reads_only(tmp_path):
+    from hermes_auto.hermes import Hermes
+    hermes = Hermes.__new__(Hermes)
+    hermes.config = {**config(), "hermes_home": str(tmp_path)}
+    labelled = {**job("gmail", "agent"), "profile": "inbox"}
+    assert hermes.tools_of(labelled) == (False, True)
+    assert hermes.tools_of({**job("slack", deny_tools="research"), "profile": "inbox"}) == (False, "research")
+    assert hermes.tools_of({**job("brief", "open"), "profile": "inbox"}) == (False, True)
+    assert hermes.tools_of({**job("todoist", "agent"), "profile": "tapin"}) == (True, False)
 
 
 def test_without_bots_everything_stays_in_the_default_profile():
@@ -162,7 +175,7 @@ def test_bridge_requests_target_the_bots_home(tmp_path, monkeypatch):
     inbox = hermes.profile_config("inbox")
     assert inbox["hermes_home"] == "/h/profiles/inbox"
     assert inbox["bot"] == {"name": "inbox", "read_only": True,
-                            "reads": ["github", "google", "linear", "slack", "todoist"]}
+                            "reads": ["github", "google", "linear", "slack", "todoist"], "providers": {}}
     assert hermes.profile_config("tapin")["bot"]["read_only"] is False
     legacy = Hermes.__new__(Hermes)
     legacy.config = {**defaults(), "hermes_home": "/h"}

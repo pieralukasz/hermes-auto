@@ -66,19 +66,53 @@ def families_for(profile):
 
 
 def valid_scope(data):
-    return (isinstance(data, dict) and data.get("version") == 1 and isinstance(data.get("reads"), list)
-            and all(item in FAMILIES for item in data["reads"]))
+    """scope.json: {"version": 1, "reads": [families], "providers": {provider: {"reads": [...], "session_search":
+    bool}}}. `reads` apply to sessions on any other account; a provider entry (e.g. a work account chosen by a
+    hermes-auto route) replaces them for sessions running on that provider."""
+    if not (isinstance(data, dict) and data.get("version") == 1 and isinstance(data.get("reads"), list)
+            and all(item in FAMILIES for item in data["reads"])):
+        return False
+    providers = data.get("providers", {})
+    return isinstance(providers, dict) and all(
+        isinstance(name, str) and isinstance(spec, dict) and isinstance(spec.get("reads"), list)
+        and all(item in FAMILIES for item in spec["reads"]) and isinstance(spec.get("session_search", False), bool)
+        for name, spec in providers.items())
 
 
-def read_scope(plugin_dir):
-    """The read families a profile's plugin was installed with; none (every read refused) when the file is
-    missing or malformed."""
+def load_scope(plugin_dir):
+    """The scope a profile's plugin was installed with, or None when the file is missing or malformed."""
     try:
         with open(os.path.join(str(plugin_dir), SCOPE_FILE), encoding="utf-8") as stream:
             data = json.load(stream)
     except (OSError, ValueError):
-        return frozenset()
-    return frozenset(data["reads"]) if valid_scope(data) else frozenset()
+        return None
+    return data if valid_scope(data) else None
+
+
+def read_scope(plugin_dir):
+    """The default read families of a profile's plugin; none (every read refused) without a valid scope."""
+    data = load_scope(plugin_dir)
+    return frozenset(data["reads"]) if data else frozenset()
+
+
+def session_scope(data, provider):
+    """(read families, session_search allowed) for a session running on `provider` under scope `data`.
+
+    One bot may serve two accounts (private and work): a session on a provider with its own entry gets only that
+    entry's reads, others the default reads with session_search. An unknown provider (None: the session's row could
+    not be read) gets what every entry allows and no session_search; no scope gets nothing."""
+    if not data:
+        return frozenset(), False
+    providers = data.get("providers") or {}
+    if provider is None:
+        reads = frozenset(data["reads"])
+        for spec in providers.values():
+            reads &= frozenset(spec["reads"])
+        return reads, False
+    spec = providers.get(provider)
+    if spec is not None:
+        return frozenset(spec["reads"]), bool(spec.get("session_search", False))
+    return frozenset(data["reads"]), True
 
 
 SHELL_META = set(";|&<>`$\n\r\\(){}")
@@ -407,10 +441,17 @@ def bridged_names(args):
     return frozenset(str(call.get("name") or "") if isinstance(call, dict) else "" for call in calls)
 
 
-def decide(tool_name, args):
+REFUSED_SEARCH = ("Not run: earlier conversations are not searchable from a session on this account (the bot also "
+                  "serves another account's matters).")
+
+
+def decide(tool_name, args, search=True):
     """The block message for one tool call in a read-only bot's session, or None to let it run: only the
-    plugin's tools, session_search in this profile and the Tool Search bridge to them."""
+    plugin's tools, session_search in this profile (when the session's account may search) and the Tool Search
+    bridge to them."""
     if tool_name == "session_search":
+        if not search:
+            return REFUSED_SEARCH
         return None if own_profile_search(args) else REFUSED_PROFILE
     if tool_name in ALLOWED_TOOLS or tool_name in CATALOG_TOOLS:
         return None
