@@ -13,6 +13,9 @@ from hermes_auto import guard_plugin as plugin
 from hermes_auto.guard_plugin import policy
 
 
+cwd = {}  # task id -> working directory the fake resolver uses
+
+
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     home = tmp_path / "hermes"
@@ -20,12 +23,16 @@ def home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(plugin, "_dangerous", lambda command: command.startswith("rm -rf"))
     monkeypatch.setattr(plugin, "_gated_write", lambda paths: any(path.endswith(".ssh/config") for path in paths))
+    monkeypatch.setattr(plugin, "_resolver", lambda task_id: lambda path: str(cwd.get(task_id, home) / path)
+                        if not str(path).startswith(("/", "~")) else str(path))
     plugin._parents.clear()
+    plugin._latch.clear()
     return home
 
 
-def hook(name, args=None, session_id="s1"):
-    return plugin.pre_tool_call(tool_name=name, args=args or {}, session_id=session_id, task_id="")
+def hook(name, args=None, session_id="s1", turn_id="t1", task_id=""):
+    return plugin.pre_tool_call(tool_name=name, args=args or {}, session_id=session_id, task_id=task_id,
+                                turn_id=turn_id)
 
 
 # ── Sessions hermes-auto did not register are never touched ─────────────────
@@ -129,6 +136,26 @@ def test_a_full_run_refuses_gated_writes_desktop_control_and_changes_to_the_guar
         assert "guard" in hook("write_file", args)["message"]
     assert "guard" in hook("terminal", {"command": f"echo x > {registry}"})["message"]
     assert hook("patch", {"path": "notes.md", "old_string": "a", "new_string": "b"}) is None
+
+
+def test_relative_writes_and_terminal_workdirs_are_checked_where_they_land(home):
+    policy.write_registration(home, "s1", "full", until=time.time() + 600)
+    registry = os.path.dirname(policy.registration_path(home, "s1"))
+    cwd["task"] = __import__("pathlib").Path(registry)
+    assert "guard" in hook("write_file", {"path": "s1.json"}, task_id="task")["message"]
+    assert "guard" in hook("terminal", {"command": "printf x > s1.json", "workdir": registry})["message"]
+    cwd.clear()
+
+
+def test_a_full_turn_stays_restricted_after_its_registration_is_rewritten(home):
+    policy.write_registration(home, "s1", "full", until=time.time() + 600)
+    assert hook("execute_code", turn_id="auto")["action"] == "block"
+    policy.write_registration(home, "s1", "full", until=0)  # what a hostile run could do itself
+    assert hook("execute_code", turn_id="auto")["action"] == "block"
+    os.remove(policy.registration_path(home, "s1"))
+    assert hook("execute_code", turn_id="auto")["action"] == "block"
+    policy.write_registration(home, "s1", "full", until=0)
+    assert hook("execute_code", turn_id="users-own-turn") is None  # the user's later turn follows the file
 
 
 def test_gated_write_detector_failure_refuses_the_write(home, monkeypatch):

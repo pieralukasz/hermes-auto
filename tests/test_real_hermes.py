@@ -320,15 +320,25 @@ def test_full_run_refuses_approval_gated_calls_only_during_its_turn(make_world):
     turns = [([{"type": "tool_use", "id": "toolu_rm", "name": "terminal",
                 "input": {"command": "rm -rf ~/hermes-auto-contract-does-not-exist"}},
                {"type": "tool_use", "id": "toolu_echo", "name": "terminal", "input": {"command": "echo synthetic-ok"}},
-               {"type": "tool_use", "id": "toolu_code", "name": "execute_code", "input": {"code": "print(1)"}}],
+               {"type": "tool_use", "id": "toolu_code", "name": "execute_code", "input": {"code": "print(1)"}},
+               {"type": "tool_use", "id": "toolu_rules", "name": "write_file",
+                "input": {"path": "{root}/AGENTS.md", "content": "synthetic"}},
+               {"type": "tool_use", "id": "toolu_notes", "name": "write_file",
+                "input": {"path": "{root}/notes.txt", "content": "synthetic"}}],
               "tool_use")]
     world = make_world(turns, approvals_off=True)
+    for block in turns[0][0]:  # the world's temporary root is known only now
+        if block["name"] == "write_file":
+            block["input"]["path"] = block["input"]["path"].format(root=world.root)
     task = world.job("task", source="todoist", mode="agent")
     sid = world.hermes.create(task, "unused")
     assert world.hermes.run({**task, "session_id": sid}, "Synthetic task")["exit_code"] == 0
     tools = world.tool_results(sid)
     assert "cannot ask the user" in str(tools["toolu_rm"]) and "cannot ask the user" in str(tools["toolu_code"])
     assert "synthetic-ok" in str(tools["toolu_echo"])
+    # A protected instruction file needs an approval Hermes would grant itself with approvals off: refused.
+    assert "cannot ask the user" in str(tools["toolu_rules"]) and not (world.root / "AGENTS.md").exists()
+    assert (world.root / "notes.txt").read_text() == "synthetic"
     assert policy.read_registration(world.home, sid)["until"] == 0  # the user's own later turns are unrestricted
     sent = {tool["name"] for request in world.seen for tool in request.get("tools") or []}
     assert "terminal" in sent  # a full run keeps the profile's normal tools

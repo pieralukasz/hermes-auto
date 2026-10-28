@@ -131,8 +131,8 @@ class Store:
             self.db.execute("UPDATE jobs SET session_id=?,updated=CURRENT_TIMESTAMP WHERE session_id=?", (new, old))
             self.db.execute("UPDATE followups SET session_id=?,updated=CURRENT_TIMESTAMP WHERE session_id=?",
                             (new, old))
-            self.db.execute("UPDATE meta SET value=? WHERE value=? AND (key LIKE 'thread_session:%' OR key LIKE "
-                            "'create:%')", (json.dumps(new), json.dumps(old)))
+            self.db.execute("UPDATE meta SET value=? WHERE value=? AND (key GLOB 'thread_session:*' OR key GLOB "
+                            "'create:*')", (json.dumps(new), json.dumps(old)))
 
     def background_runs(self):
         """IDs of `running` jobs that have a background run handle; `collect` settles them, not recovery."""

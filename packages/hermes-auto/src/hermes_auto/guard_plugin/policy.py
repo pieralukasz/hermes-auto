@@ -512,7 +512,7 @@ def touches_guard(paths, homes=None):
     return False
 
 
-def decide(tool_name, args, entry, dangerous=None, now=None, gated_write=None):
+def decide(tool_name, args, entry, dangerous=None, now=None, gated_write=None, resolve=None):
     """The block message for one tool call of a registered session, or None to let it run.
 
     `dangerous(command) -> bool` is Hermes' own approval detector (tools.approval) and
@@ -520,7 +520,8 @@ def decide(tool_name, args, entry, dangerous=None, now=None, gated_write=None):
     files), injected so this stays pure; when one is missing the call is refused. Read profiles allow
     only their tool list; "full" refuses, while its automatic turn runs, what an attended session would
     have to approve (with `approvals.mode: off` Hermes would approve it on its own) and any change to
-    the guard itself."""
+    the guard itself. `resolve(path) -> path` makes a relative path absolute against the session's working
+    directory (Hermes keeps a `cd` across terminal calls); without it relative paths count from ~."""
     if not active(entry, now):
         return None
     profile = entry["profile"]
@@ -539,12 +540,16 @@ def decide(tool_name, args, entry, dangerous=None, now=None, gated_write=None):
         command = (args or {}).get("command") if isinstance(args, dict) else None
         if not isinstance(command, str) or dangerous is None:
             return REFUSED_FULL.format(what="this command")
-        if GUARD_MARK in command:
+        workdir = args.get("workdir")
+        if GUARD_MARK in command or (isinstance(workdir, str) and (GUARD_MARK in workdir
+                                                                     or touches_guard([workdir]))):
             return REFUSED_GUARD_FILES
         if dangerous(command):
             return REFUSED_FULL.format(what="this command")
     if tool_name in WRITE_TOOLS:
         paths = write_paths(tool_name, args)
+        if resolve is not None:
+            paths = [resolve(path) for path in paths]
         if touches_guard(paths):
             return REFUSED_GUARD_FILES
         if gated_write is None or gated_write(paths):

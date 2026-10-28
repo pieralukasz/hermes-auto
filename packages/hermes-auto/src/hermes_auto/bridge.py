@@ -323,10 +323,10 @@ def run_session(request, config, job):
         if profile == policy.FULL:  # refused before anything was submitted: nothing runs
             policy.write_registration(home, sid, profile, until=0, job=job.get("id"))
         raise
-    if profile == policy.FULL:
-        # Lifted only once the turn's result arrived. A lost connection leaves the turn possibly still
-        # running in the gateway, so the restriction then stays until its deadline (the gateway stops the
-        # turn at run_budget).
+    if profile == policy.FULL and result == 0:
+        # Lifted only when the turn finished. A lost connection, a detach (exit 3: input required, a queued
+        # input) or an unknown outcome may leave the turn running in the gateway, so the restriction then
+        # stays until its deadline.
         policy.write_registration(home, sid, profile, until=0, job=job.get("id"))
     return result
 

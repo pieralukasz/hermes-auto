@@ -153,6 +153,8 @@ def test_rebinding_moves_only_session_references(store):
     store.set_meta("thread_session:gmail:a:t1", "old-id")
     store.set_meta("create:7", "old-id")
     store.set_meta("cursor:example", "old-id")  # an unrelated value that happens to be equal
+    store.set_meta("threadXsession:x", "old-id")  # `_` would be a LIKE wildcard
     store.rebind_session("old-id", "new-id")
+    assert store.get_meta("threadXsession:x") == "old-id"
     assert store.get_meta("thread_session:gmail:a:t1") == "new-id" and store.get_meta("create:7") == "new-id"
     assert store.get_meta("cursor:example") == "old-id"

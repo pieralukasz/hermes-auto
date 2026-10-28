@@ -46,24 +46,30 @@ def _parent(home, session_id):
     return parent
 
 
-def _entry(session_id):
-    """The registration governing `session_id`: its own, else its nearest registered ancestor's (a delegated
-    child, or the row a compression continued under a new id), so restrictions follow the conversation.
+def _owner(session_id):
+    """(session id holding the registration, its registration) governing `session_id`: its own, else its
+    nearest registered or latched ancestor's (a delegated child, or the row a compression continued under a
+    new id), so restrictions follow the conversation. (session_id, None) when it is not an automatic session.
     Nothing is read beyond one directory listing while hermes-auto has registered no session."""
     home = _home()
     entry = policy.read_registration(home, session_id)
-    if entry is not None or not policy.has_registrations(home):
-        return entry
+    if entry is not None or session_id in _latch or not (policy.has_registrations(home) or _latch):
+        return session_id, entry
     current, seen = session_id, {session_id}
     for _ in range(MAX_ANCESTORS):
         current = _parent(home, current)
         if not current or current in seen:
-            return None
+            return session_id, None
         seen.add(current)
         entry = policy.read_registration(home, current)
-        if entry is not None:
-            return entry
-    return None  # a lineage this deep is a long-lived conversation of the user's, not an automatic run
+        if entry is not None or current in _latch:
+            return current, entry
+    return session_id, None  # a lineage this deep is a long-lived conversation of the user's
+
+
+def _entry(session_id, turn_id=""):
+    owner, entry = _owner(session_id)
+    return _latched(owner, entry, turn_id)
 
 
 def _dangerous(command):
@@ -76,28 +82,60 @@ def _gated_write(paths):
     from agent.file_safety import is_write_approval_required
     from tools.file_tools_write_guards import _protected_instruction_config, _protected_instruction_reason
     enabled, extra = _protected_instruction_config()
-    resolved = [os.path.join(os.path.expanduser("~"), os.path.expanduser(path)) for path in paths]  # cwd is ~
+    resolved = [os.path.join(os.path.expanduser("~"), os.path.expanduser(path)) for path in paths]
     return any(is_write_approval_required(path)
                or (enabled and _protected_instruction_reason(path, enabled=enabled, extra_patterns=extra))
                for path in resolved)
 
 
-def pre_tool_call(tool_name=None, args=None, session_id="", task_id="", **_):
+def _resolver(task_id):
+    """A path resolved the way the file tools resolve it (the task's working directory, which a terminal
+    `cd` moves), so a relative `config` after `cd ~/.ssh` is checked as ~/.ssh/config."""
+    from tools.file_tools_write_guards import _resolved_or_raw
+    return lambda path: _resolved_or_raw(str(path), task_id or "default")
+
+
+# Full-run restrictions seen in this gateway process: owner session -> (until, turn ids seen while active).
+# A full run could rewrite or delete its own registration file (same user); while the deadline the plugin
+# saw has not passed, the turns that ran under it stay restricted whatever the file says now. Another turn
+# (the user's own, after the run) follows the file, so it is released as soon as the bridge lifts it.
+_latch: dict = {}
+
+
+def _latched(owner, entry, turn_id, now=None):
+    now = now or time.time()
+    if entry is not None and entry["profile"] == policy.FULL and policy.active(entry, now):
+        until, turns = _latch.get(owner, (0, frozenset()))
+        _latch[owner] = (max(until, entry["until"]), turns | {turn_id})
+        return entry
+    held = _latch.get(owner)
+    if entry is not None and entry["profile"] != policy.FULL:
+        return entry  # a read or private profile is stricter than any full-run restriction
+    if held is not None and held[0] > now and turn_id in held[1]:
+        return {"version": 1, "profile": policy.FULL, "until": held[0], "job": None}
+    if held is not None and held[0] <= now:
+        _latch.pop(owner, None)
+    return entry
+
+
+def pre_tool_call(tool_name=None, args=None, session_id="", task_id="", turn_id="", **_):
     """Refuse what an automatic session may not run. An exception here is a refusal (Hermes fails a raising
     pre_tool_call closed). When the session's lineage cannot be read, the call is refused only if it may
     be ours: the session itself is registered, or a "full" automatic turn is running right now."""
     sid = session_id or task_id or ""
     home = _home()
     try:
-        entry = _entry(sid)
+        entry = _entry(sid, turn_id or "")
     except Exception:  # noqa: BLE001 - never break the user's own sessions without cause
         logger.warning("hermes-auto-guard: could not resolve session %s", sid, exc_info=True)
-        if (sid and os.path.exists(policy.registration_path(home, sid) or "")) or policy.active_full_registration(home):
+        if ((sid and os.path.exists(policy.registration_path(home, sid) or "")) or policy.active_full_registration(home)
+                or any(until > time.time() for until, _turns in _latch.values())):
             raise
         return None
     if entry is None:
         return None
-    message = policy.decide(tool_name, args, entry, dangerous=_dangerous, gated_write=_gated_write)
+    message = policy.decide(tool_name, args, entry, dangerous=_dangerous, gated_write=_gated_write,
+                            resolve=_resolver(task_id) if entry["profile"] == policy.FULL else None)
     return {"action": "block", "message": message} if message else None
 
 

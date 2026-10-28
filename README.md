@@ -62,8 +62,9 @@ This creates the `hermes` label only; it does not select or edit any task. All p
 Add **`hermes`** to a task and the run behaves like opening a new Hermes Desktop session and typing the task yourself:
 
 - The first message is the task title and description, plus one note that you are away: no questions, and nothing is sent, paid, ordered or changed; it is prepared for your approval instead.
-- The agent gets your normal Hermes setup: all configured toolsets, skills, memory, project rules and subagents, with the Desktop platform prompt (Markdown, tables, links). Hermes' one-shot limits (plain-terminal prompt, reduced skill guidance, `delegation.oneshot_max_children`) are lifted for these runs.
+- The agent gets your normal Hermes setup: all configured toolsets, skills, memory, project rules and subagents, with the Desktop platform prompt (Markdown, tables, links). Runs go through the Hermes gateway as Desktop (`gui`) sessions, so the prompt and limits match an interactive session.
 - Budget: 900 s / 60 turns by default (`agent_run_budget_seconds`, `agent_max_turns`). Commands that would need approval are denied, because nobody can approve them.
+- Sessions with someone else's content (mail, Slack, GitHub) need the `hermes-auto-guard` Hermes plugin: `hermes-auto install-guard`, enable it as printed, then `hermes-auto guard-reload` (or restart Hermes.app); `hermes-auto doctor` shows `guard.ok`. Without it those sessions (and full-tools runs while `approvals.mode` is off) are refused.
 
 Write the goal, the skill to use and the limits ("don't send without my OK") in the description. `language` in `config.json` sets the answer language. Legacy mode labels (`hermes-open`, `hermes-draft`, `hermes-research`, `hermes-agent`) are still recognised for existing tasks; `hermes-open` creates the conversation without a model call. They are no longer created.
 
