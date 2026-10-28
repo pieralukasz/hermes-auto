@@ -116,7 +116,7 @@ def test_session_researches_never_writes_and_uses_the_work_route(store, config):
     job = store.rows()[0]
     assert deny_mode(job) == "research" and job["title"].startswith("Linear: WEB-1")
     prompt = prompt_for(job, config)
-    assert "NIGDY sam nic nie zmieniaj w Linearze" in prompt and "LINEAR-" in prompt and "tapin-linear" in prompt
+    assert "NIGDY sam nic nie zmieniaj w Linearze" in prompt and "LINEAR-" in prompt and "linear issue view" in prompt
 
 
 def test_brief_section(store, config):

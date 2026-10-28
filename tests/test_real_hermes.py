@@ -166,7 +166,9 @@ class World:
             inbox = self.profile("inbox", "platform_toolsets:\n  cli: [hermes-auto, session_search]\n"
                                  f"agent:\n  disabled_toolsets: {json.dumps(READ_ONLY_DISABLED)}\n"
                                  + ("plugins:\n  enabled: [hermes-auto-guard]\n" if inbox_plugin else "")
-                                 + "approvals:\n  mode: manual\n")
+                                 + "approvals:\n  mode: manual\n"
+                                 "memory:\n  memory_enabled: false\n  user_profile_enabled: false\n"
+                                 "auxiliary:\n  background_review:\n    enabled: false\n")
             guard.install(inbox, ["todoist", "github"])
             self.profile("work", f"approvals:\n  mode: '{work_approvals}'\n")
             self.config["bots"] = {"default": "default", "inbox": "inbox",

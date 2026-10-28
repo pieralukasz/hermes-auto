@@ -5,14 +5,13 @@ memory, skills and tool configuration. `config.json` → `bots`:
 
     "bots": {
       "default": "default",                      # briefs, plans, proposals and any task no rule names
-      "inbox": "inbox",                          # third-party content no rule names
-      "read_only": {"inbox": {"reads": ["google", "todoist", "github"]},
-                    "tapin-inbox": {"reads": ["github", "linear", "slack"]}},
-      "rules": [{"match": {"source": "slack", "dm": true}, "profile": "inbox"},
-                {"match": {"source": "slack"}, "profile": "tapin-inbox"},
-                {"match": {"source": "todoist", "projectId": "..."}, "profile": "tapin"}]
+      "inbox": "inbox",                          # every matter written by someone else (mail, Slack, GitHub, Linear)
+      "read_only": {"inbox": {"reads": ["google", "todoist", "github", "linear", "slack"]}},
+      "rules": [{"match": {"source": "todoist", "projectId": "..."}, "profile": "tapin"}]
     }
 
+The model account is a separate choice: `routes` (e.g. TapIn's Slack, GitHub and Linear on the work account,
+Slack DMs on the private one) is frozen into the session at creation, whatever bot it lives in.
 Third-party content (mail, Slack, GitHub, Linear) only ever goes to a read-only bot: a rule naming another
 profile for it is ignored. A full-tools job (a Todoist task, a mail the user gave the agent label) goes to the
 first matching rule that names a working bot, else to `default`. Internal sources (brief, plans) go to `default`.

@@ -149,6 +149,13 @@ def profile_problems(config):
     disabled = set(parse_config_string_list((settings.get("agent") or {}).get("disabled_toolsets")))
     if READ_ONLY_DISABLED - disabled:
         problems.append(f"agent.disabled_toolsets lacks {sorted(READ_ONLY_DISABLED - disabled)}")
+    memory = settings.get("memory") or {}
+    if memory.get("memory_enabled", True) is not False or memory.get("user_profile_enabled", True) is not False:
+        problems.append("memory.memory_enabled and memory.user_profile_enabled must be false (no memory written "
+                        "from third-party content)")
+    review = (settings.get("auxiliary") or {}).get("background_review") or {}
+    if review.get("enabled", True) is not False:
+        problems.append("auxiliary.background_review.enabled must be false (no memory or skill patches after a turn)")
     if guard_policy().GUARD_NAME not in parse_config_string_list((settings.get("plugins") or {}).get("enabled")):
         problems.append("plugins.enabled lacks hermes-auto-guard")
     scope = guard_policy().read_scope(home / "plugins" / guard_policy().GUARD_NAME)

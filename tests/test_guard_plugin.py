@@ -111,7 +111,7 @@ def test_without_a_valid_scope_every_read_is_refused(home, monkeypatch, scope):
 def test_the_scope_is_read_from_the_home_of_the_turn(tmp_path, monkeypatch):
     """One module may serve two bots in one gateway: each turn reads its own profile's scope."""
     calls = fake_run(monkeypatch)
-    private, work = tmp_path / "profiles" / "inbox", tmp_path / "profiles" / "tapin-inbox"
+    private, work = tmp_path / "profiles" / "inbox", tmp_path / "profiles" / "work-inbox"
     guard.install(private, ["todoist"])
     guard.install(work, ["github"])
     monkeypatch.setenv("HERMES_HOME", str(work))

@@ -441,7 +441,7 @@ NOTICE_EN = ("Tell me briefly (1-3 sentences) who wrote and what they want, plus
 
 
 SLACK_READS_PL = (
-    "W tym automatycznym kroku działają tylko odczyty: skille (skill_view), wcześniejsze rozmowy (session_search), "
+    "W tym automatycznym kroku działają tylko odczyty: skille (hermes_auto_skill_view), wcześniejsze rozmowy (session_search), "
     "pojedyncze polecenia terminala bez potoków: Slack tylko do odczytu "
     "(`python3 ~/.hermes/profiles/tapin/skills/tap-in/tapin-slack/scripts/slack_mcp.py call slack_read_thread|slack_read_channel|"
     "slack_search_public_and_private|slack_read_user_profile|slack_read_file ...`), `gh` (pr view/list/diff/checks, "
@@ -452,8 +452,7 @@ SLACK_READS_PL = (
     "plików i inne zmiany są zablokowane. Lokalny git oraz web_search/web_extract są wyłączone w tym "
     "automatycznym kroku; dalszy research można zrobić po odpowiedzi użytkownika.")
 SLACK_NOTICE_PL = (
-    "Wczytaj skill tapin-slack (zasady, style.md) i skille, których sprawa dotyczy (np. tapin-web-app, "
-    "tapin-github, tapin-linear, tapin-environments). Zrób research potrzebny do odpowiedzi: przeczytaj cały wątek "
+    "Zrób research potrzebny do odpowiedzi (skille TapIn ma bot tapin, nie ta sesja): przeczytaj cały wątek "
     "i wcześniejszą rozmowę z tą osobą, sprawdź fakty u źródła (kod i PR-y przez GitHub, Linear, "
     "Todoist, kalendarz). Potem napisz mi: kto i czego chce (1–3 zdania), "
     "co ustaliłeś (ze źródłami, np. plik:linia, PR, ticket) i szkic odpowiedzi w moim stylu w bloku kodu, z "
@@ -508,8 +507,7 @@ def slack_session_prompt(item, reason, config):
 
 
 GITHUB_NOTICE_PL = (
-    "Wczytaj skille, których sprawa dotyczy: dla gigaverse-app tapin-github (i tapin-web-app, tapin-linear), dla "
-    "ecmr-one ecmr-branch-verification, dla pozostałych github. Zrób research potrzebny do reakcji: przeczytaj "
+    "Polecenia gh opisuje skill github (hermes_auto_skill_view). Zrób research potrzebny do reakcji: przeczytaj "
     "PR lub issue z dyskusją (`gh pr view N --repo R --comments`, `gh pr diff`, `gh pr checks`), kod przez "
     "`gh api repos/R/contents/ŚCIEŻKA?ref=SHA --jq '.content | @base64d'` (lokalny git jest w tym kroku wyłączony), powiązany "
     "ticket w Linear. Potem napisz mi: kto i czego chce (1–3 zdania), co ustaliłeś (ze "
@@ -549,7 +547,6 @@ def github_session_prompt(item, reason, config):
 
 
 LINEAR_NOTICE_PL = (
-    "Wczytaj skill tapin-linear i skille, których sprawa dotyczy (np. tapin-github, tapin-web-app, tapin-slack). "
     "Zrób research potrzebny do reakcji: przeczytaj ticket z komentarzami (`linear issue view ID --no-download`), "
     "powiązane PR-y (`gh pr view`, `gh pr checks`), kod przez `gh api repos/R/contents/ŚCIEŻKA?ref=SHA --jq '.content | @base64d'` "
     "(lokalny git jest w tym kroku wyłączony) i wątek na Slacku, jeśli ticket go linkuje. Potem napisz mi: kto i czego chce (1–3 zdania), co ustaliłeś (ze źródłami, np. ticket, PR, "
