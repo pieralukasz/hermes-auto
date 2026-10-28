@@ -120,7 +120,7 @@ def test_recover_moves_interrupted_followup_to_needs_attention_not_replay(store,
     class Recorder:
         runs = []
 
-        def inspect(self, session_id):
+        def inspect(self, session_id, profile=None):
             return {"exists": True, "last_active": None}
 
         def unarchive(self, session_id):
@@ -129,7 +129,7 @@ def test_recover_moves_interrupted_followup_to_needs_attention_not_replay(store,
         def run(self, job, prompt):
             self.runs.append(job["id"])
             return {"session_id": job["session_id"]}
-        def session_excerpts(self, ids):
+        def session_excerpts(self, ids, profile=None):
             return {}
     hermes = Recorder()
     triage.process_followups(store, config, hermes)
@@ -182,7 +182,7 @@ def test_retry_followup_requeues_in_the_same_session(store):
     cli.retry_followup(store, hermes, row)
     assert (followup(store, row)["status"], followup(store, row)["session_id"]) == ("retry_pending", "S1")
     action, job, extra = hermes.calls[0]
-    assert action == "inspect" and job == {"session_id": "S1"}
+    assert action == "inspect" and job == {"session_id": "S1", "profile": "default"}
     assert extra["needles"] == [MAIL["date"], MAIL["from"]]  # raw From, as the mail prompt prints it
 
 

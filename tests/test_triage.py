@@ -60,12 +60,12 @@ class Fake(BackgroundShim):
         self.queries.append(query)
         return self.found
 
-    def inspect(self, session_id):
+    def inspect(self, session_id, profile=None):
         info = self.sessions.get(session_id)
         return {"exists": info is not None, "last_active": (info or {}).get("last_active"),
                 "owned_by": (info or {}).get("owned_by")}
 
-    def session_excerpts(self, ids):
+    def session_excerpts(self, ids, profile=None):
         return {sid: {"title": "Google Ads", "date": "2026-10-22", "last_user": "przypomnij tacie",
                       "last_assistant": "Czekamy na dostęp."} for sid in ids if sid in self.sessions}
 
@@ -336,7 +336,7 @@ class ContextFake(Fake):
         return [{"id": "S-ads", "title": "Google Ads account invitation", "date": "2026-10-22"},
                 {"id": "S-other", "title": "Przegląd maili", "date": "2026-10-21"}]
 
-    def session_excerpts(self, ids):
+    def session_excerpts(self, ids, profile=None):
         self.excerpt_ids = list(ids)
         return {"S-ads": {"title": "Google Ads account invitation", "date": "2026-10-22",
                           "last_user": "przypomnij tacie", "last_assistant": "Czekamy na dostęp do Analytics."}}

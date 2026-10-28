@@ -131,16 +131,12 @@ def test_private_profile_allows_no_command(command):
 
 # ── Tool policy at the batch boundary, with a fake agent ─────────────────────
 
-def entry(profile):
-    return {"version": 1, "profile": {True: "mail", "slack": "research", "unknown": "private"}.get(profile, profile),
-            "until": None}
-
-
 def refused(profile, name, arguments):
-    """Whether the guard (gateway hook) refuses this call in an automatic session of `profile`."""
+    """Whether a read-only bot refuses this call: the read tool by the grammar of `profile`'s reads, any other
+    tool by the hook (the same for every session of the bot)."""
     if name == policy.READ_TOOL:
-        return policy.read_argv(arguments.get("command"), entry(profile)["profile"]) is None
-    return policy.decide(name, arguments, entry(profile), dangerous=lambda command: False) is not None
+        return policy.read_argv(arguments.get("command"), profile) is None
+    return policy.decide(name, arguments) is not None
 
 
 WRAPPERS = [("tool_call", {"calls": [{"name": "terminal", "arguments": {"command": "td today"}}]}),
@@ -148,7 +144,9 @@ WRAPPERS = [("tool_call", {"calls": [{"name": "terminal", "arguments": {"command
             ("execute_code", {"code": "print(1)"}),
             ("delegate_task", {"goal": "send the reply"}),
             ("terminal", {"command": "td today", "background": True}),
-            ("skill_manage", {"action": "create", "name": "x"})]
+            ("skill_manage", {"action": "create", "name": "x"}),
+            ("memory", {"action": "add", "content": "x"}),
+            ("send_message", {"target": "slack:#x", "message": "x"})]
 
 
 @pytest.mark.parametrize("profile", [True, "research", "slack", "private", "unknown"])
@@ -157,15 +155,9 @@ def test_restricted_profiles_refuse_tool_wrappers(profile, wrapper):
     assert refused(profile, *wrapper)
 
 
-@pytest.mark.parametrize("name, arguments", [
-    ("skill_view", {"name": "x"}), ("skills_list", {}), ("session_search", {"query": "x"}),
-    ("web_search", {"query": "x"}), ("web_extract", {"urls": ["https://a.test"]}),
-    ("terminal", {"command": "td today"}), ("hermes_auto_read", {"command": "td today"}),
-    ("tool_search", {"query": "td"}),
-])
-def test_private_profile_executes_no_tool(name, arguments):
-    assert "no tools" in policy.decide(name, arguments, entry("private"))
-    assert policy.read_argv("td today", "private") is None
+@pytest.mark.parametrize("profile", ["private", "unknown", frozenset(), ["nonsense"]])
+def test_private_or_unknown_reads_run_no_command(profile):
+    assert policy.read_argv("td today", profile) is None
 
 
 @pytest.mark.parametrize("command", ["git log -p HEAD", "git show HEAD", "git grep phrase", "git branch"])

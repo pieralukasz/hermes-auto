@@ -43,7 +43,7 @@ class Hermes:
     def find_session(self, **query):
         return self.found
 
-    def inspect(self, session_id):
+    def inspect(self, session_id, profile=None):
         info = self.sessions.get(session_id)
         return {"exists": info is not None, "last_active": (info or {}).get("last_active")}
 

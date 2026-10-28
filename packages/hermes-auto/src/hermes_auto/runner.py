@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+from .bots import choose as choose_bot
 from .finish import mark_open
 
 
@@ -170,7 +171,11 @@ def process_jobs(store, config, hermes, blocked_sources=()):
         continuation = retry  # a retry prompt continues an existing turn; it shows as typed
         try:
             if job["status"] == "pending":
-                # ID was persisted at enqueue time, before any Hermes process starts.
+                # ID was persisted at enqueue time, before any Hermes process starts. The bot is chosen once,
+                # before the session exists, and stays with the job (its session lives in that profile).
+                if not job.get("profile"):
+                    job = {**job, "profile": choose_bot(job, config)}
+                    store.update(job["id"], profile=job["profile"])
                 store.update(job["id"], status="creating")
                 job = create_session(store, hermes, job, prompt)
                 store.update(job["id"], status="created")

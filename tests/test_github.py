@@ -310,7 +310,7 @@ def test_followup_title_keeps_one_arrow(store):
                                                                         "account": "me", "kind": "github"})))
     store.db.commit()
     fake = Fake(sessions={"s1": {}})
-    fake.session_excerpts = lambda ids: {"s1": {"title": "↩ ↩ ↩ GitHub: feat: cart"}}
+    fake.session_excerpts = lambda ids, profile=None: {"s1": {"title": "↩ ↩ ↩ GitHub: feat: cart"}}
     row = dict(store.db.execute("SELECT * FROM followups").fetchone())
     triage.redirect_followup(store, row, json.loads(row["payload"]), "r", fake)
     assert store.rows()[0]["title"] == "↩ GitHub: feat: cart"

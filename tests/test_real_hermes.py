@@ -20,7 +20,6 @@ import pytest
 
 from hermes_auto import guard
 from hermes_auto.config import defaults
-from hermes_auto.guard_plugin import policy
 from hermes_auto.hermes import Hermes
 from hermes_auto.store import Store
 
@@ -131,53 +130,92 @@ def fake_anthropic(turns, seen):
     return server
 
 
-class World:
-    """A temporary Hermes root with a fake model, optionally the guard plugin, and one gateway (idle-exit)."""
+READ_ONLY_DISABLED = ["browser", "code_execution", "computer_use", "connections", "cronjob", "debugging", "delegation",
+                      "file", "image_gen", "kanban", "memory", "project", "catalog", "onboarding", "skills", "terminal",
+                      "tts", "video", "video_gen", "vision", "web", "search", "x_search", "bot_room", "todo", "clarify"]
 
-    def __init__(self, root, turns, *, guard_enabled=True, approvals_off=False):
+
+def provider_yaml(port):
+    return ("model:\n  default: test-model\n  provider: work-test\n"
+            "providers:\n  work-test:\n    name: Work (test)\n"
+            f"    api: http://127.0.0.1:{port}\n    transport: anthropic_messages\n"
+            "    key_env: HERMES_AUTO_TEST_WORK_KEY\n    default_model: test-model\n    models: [test-model]\n")
+
+
+class World:
+    """A temporary multiplexed Hermes root (Dolores' default profile with approvals off, like the user's) with a
+    fake model, one gateway (idle-exit) and, with `bots`, a read-only `inbox` bot (the guard plugin, reads:
+    Todoist and GitHub) and a working bot `work` (approvals manual) that Todoist tasks go to."""
+
+    def __init__(self, root, turns, *, bots=True, inbox_plugin=True, work_approvals="manual"):
         self.root, self.seen = root, []
         self.server = fake_anthropic(turns, self.seen)
         self.home = root / "hermes"
         self.home.mkdir(parents=True)
         # Dependency state is per Hermes root: borrow the installed one, as every Hermes process reads it.
         (self.home / "installs").symlink_to(Path.home() / ".hermes" / "installs")
-        (self.home / "config.yaml").write_text(
-            "model:\n  default: test-model\n  provider: work-test\n"
-            "providers:\n  work-test:\n    name: Work (test)\n"
-            f"    api: http://127.0.0.1:{self.server.server_port}\n    transport: anthropic_messages\n"
-            "    key_env: HERMES_AUTO_TEST_WORK_KEY\n    default_model: test-model\n    models: [test-model]\n"
-            + ("plugins:\n  enabled: [hermes-auto-guard]\n" if guard_enabled else "")
-            + ("approvals:\n  mode: 'off'\n" if approvals_off else ""))
+        port = self.server.server_port
+        (self.home / "config.yaml").write_text(provider_yaml(port) + "approvals:\n  mode: 'off'\n"
+                                               "gateway:\n  multiplex_profiles: true\n")
         (self.home / ".env").write_text("HERMES_AUTO_TEST_WORK_KEY=synthetic-work-key\n")
-        guard.install(self.home)
+        self.config = {**defaults(), "hermes_home": str(self.home),
+                       "hermes_python": os.environ["HERMES_AUTO_TEST_PYTHON"],
+                       "hermes_source": os.environ["HERMES_AUTO_TEST_SOURCE"],
+                       "routes": [{"match": {"source": "example"}, "provider": "work-test", "model": "test-model"}]}
+        if bots:
+            inbox = self.profile("inbox", "platform_toolsets:\n  cli: [hermes-auto, session_search]\n"
+                                 f"agent:\n  disabled_toolsets: {json.dumps(READ_ONLY_DISABLED)}\n"
+                                 + ("plugins:\n  enabled: [hermes-auto-guard]\n" if inbox_plugin else "")
+                                 + "approvals:\n  mode: manual\n")
+            guard.install(inbox, ["todoist", "github"])
+            self.profile("work", f"approvals:\n  mode: '{work_approvals}'\n")
+            self.config["bots"] = {"default": "default", "inbox": "inbox",
+                                   "read_only": {"inbox": {"reads": ["github", "todoist"]}},
+                                   "rules": [{"match": {"source": "todoist"}, "profile": "work"}]}
         bin_dir = root / "bin"
         bin_dir.mkdir()
         (bin_dir / "td").write_text("#!/bin/sh\necho \"synthetic td: $*\"\n")
         (bin_dir / "td").chmod(0o755)
         self.path = f"{bin_dir}:{os.environ['PATH']}"
-        self.config = {**defaults(), "hermes_home": str(self.home),
-                       "hermes_python": os.environ["HERMES_AUTO_TEST_PYTHON"],
-                       "hermes_source": os.environ["HERMES_AUTO_TEST_SOURCE"],
-                       "routes": [{"match": {"source": "example"}, "provider": "work-test", "model": "test-model"}]}
         self.store = Store(root, initialize=True)
         self.hermes = Hermes(self.config, root)
+
+    def profile(self, name, extra):
+        home = self.home / "profiles" / name
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text(provider_yaml(self.server.server_port) + extra)
+        (home / ".env").write_text("HERMES_AUTO_TEST_WORK_KEY=synthetic-work-key\n")
+        return home
 
     def job(self, key, title="Synthetic: review", mode="draft", source="example", **payload):
         self.store.enqueue(key, source, key, title, mode, payload)
         self.store.db.commit()
-        return next(job for job in self.store.rows() if job["event_key"] == key)
+        job = next(job for job in self.store.rows() if job["event_key"] == key)
+        from hermes_auto.bots import choose
+        return {**job, "profile": choose(job, self.config)}
 
-    def db(self):
-        db = sqlite3.connect(self.home / "state.db")
+    def db(self, profile="default"):
+        db = sqlite3.connect(self.home / "state.db" if profile == "default" else
+                             self.home / "profiles" / profile / "state.db")
         db.row_factory = sqlite3.Row
         return db
 
-    def tool_results(self, sid):
-        db = self.db()
+    def tool_results(self, sid, profile="default"):
+        db = self.db(profile)
         try:
             return {row["tool_call_id"]: json.loads(row["content"]) if row["content"].startswith("{") else row["content"]
                     for row in db.execute("SELECT tool_call_id, content FROM messages WHERE session_id=? AND role='tool'",
                                           (sid,))}
+        finally:
+            db.close()
+
+    def count(self, profile):
+        path = self.home / "state.db" if profile == "default" else self.home / "profiles" / profile / "state.db"
+        if not path.exists():
+            return 0
+        db = self.db(profile)
+        try:
+            return db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
         finally:
             db.close()
 
@@ -224,50 +262,64 @@ def bridged(call_id, name, arguments):
 @CONTRACT
 def test_open_sessions_are_imported_by_the_gateway_under_their_reserved_id(make_world):
     world = make_world()
-    brief = world.job("brief", title="Brief", mode="open")
-    routed = world.job("routed", title="Routed", mode="open", owner="acme")
-    assert world.hermes.invoke("doctor")["ok"]
+    brief = world.job("brief", title="Brief", mode="open", source="brief")
+    routed = world.job("routed", title="Routed", mode="open", source="brief", owner="acme")
+    routed_example = world.job("routed2", title="Routed example", mode="open", source="example")
+    assert brief["profile"] == "default" and routed_example["profile"] == "inbox"
     for _ in range(2):  # idempotent
         assert world.hermes.create(brief, "Synthetic test context") == brief["session_id"]
     world.hermes.create(routed, "Synthetic test context")
+    world.hermes.create(routed_example, "Synthetic test context")
     info = world.hermes.invoke("inspect", brief)
     assert (info["exists"], info["messages"], info["archived"]) == (True, 2, False)
     assert world.hermes.invoke("inspect", brief, needles=["Synthetic test context"])["delivered"] is True
     assert world.hermes.invoke("inspect", brief, needles=["not delivered"])["delivered"] is False
-    assert world.hermes.archive_states([brief["session_id"], "missing"]) == {brief["session_id"]: False, "missing": None}
+    assert world.hermes.archive_states([(brief["session_id"], "default"), ("missing", "default"),
+                                        (routed_example["session_id"], "inbox")]) == {
+        brief["session_id"]: False, "missing": None, routed_example["session_id"]: False}
+    assert world.hermes.inspect(routed_example["session_id"], profile="inbox")["exists"] is True
+    assert world.hermes.inspect(routed_example["session_id"])["exists"] is False  # not in Dolores' profile
     assert world.hermes.find_session(subject="Synthetic subject", sent=[{"ts": 1.0, "to": []}]) is None
-    db = world.db()
+    db = world.db("inbox")
     try:
         rows = {row["id"]: row for row in db.execute("SELECT id, title, model, json_extract(model_config, "
                                                       "'$.provider') AS provider FROM sessions")}
     finally:
         db.close()
-    assert rows[brief["session_id"]]["title"] == "Brief" and rows[routed["session_id"]]["provider"] == "work-test"
-    assert rows[routed["session_id"]]["model"] == "test-model"  # the route's model, not only its account
+    assert rows[routed_example["session_id"]]["provider"] == "work-test"
+    assert rows[routed_example["session_id"]]["model"] == "test-model"  # the route's model, not only its account
 
 
 @CONTRACT
-def test_sorted_run_reads_through_the_guard_and_shows_the_card(make_world):
-    """Real gateway, fake model: the transcript shows the card while the full prompt is the api_content; the
-    session's tools are the guard's reads only; reads run, a refused command gets a neutral result."""
+def test_the_inbox_bot_reads_through_the_guard_and_shows_the_card(make_world):
+    """Real multiplexed gateway, fake model: the session lives in the read-only bot's profile, the transcript
+    shows the card while the full prompt is the api_content; its tools are the guard's reads only; reads in the
+    profile's scope run, anything else gets a neutral result."""
     world = make_world([([bridged("toolu_list", "hermes_auto_skills_list", {}),
                           bridged("toolu_skill", "hermes_auto_skill_view", {"name": "no-such-skill"}),
-                          bridged("toolu_other", "session_search", {"query": "x", "profile": "work"}),
+                          bridged("toolu_other", "session_search", {"query": "x", "profile": "default"}),
                           bridged("toolu_td", "hermes_auto_read", {"command": "td today --json"}),
+                          bridged("toolu_google", "hermes_auto_read", {
+                              "command": "python3 ~/.hermes/skills/productivity/google-workspace/scripts/"
+                                         "google_api.py gmail search x"}),
                           bridged("toolu_git", "hermes_auto_read", {"command": "git log -3"}),
                           {"type": "tool_use", "id": "toolu_term", "name": "terminal", "input": {"command": "echo x"}},
                           bridged("toolu_term2", "terminal", {"command": "echo x"})], "tool_use")])
+    doctor = world.hermes.doctor()
+    assert doctor["bots"]["inbox"]["ready"] is True, doctor
+    assert doctor["bots"]["work"]["ready"] is True and doctor["bots"]["default"]["ready"] is False
     job = world.job("one", deny_tools="research", triage={"reason": "test"})
     twin = world.job("two", deny_tools="research", triage={"reason": "test"})
+    assert job["profile"] == "inbox"
     sid = world.hermes.create(job, "unused")
     world.hermes.create(twin, "unused")
     assert sid != job["session_id"]  # the gateway names the session; the reserved id was its creation key
     assert world.hermes.create(job, "unused") == sid  # same creation key, same session
-    assert policy.read_registration(world.home, sid)["profile"] == "research"
+    assert world.count("default") == 0  # nothing in Dolores' profile
     prompt = "FULL SYNTHETIC PROMPT with the third-party text"
     result = world.hermes.run({**job, "session_id": sid}, prompt, display="Synthetic card")
     assert result["type"] == "result" and result["exit_code"] == 0
-    db = world.db()
+    db = world.db("inbox")
     try:
         titles = sorted(row[0] for row in db.execute("SELECT title FROM sessions"))
         user = db.execute("SELECT content, api_content FROM messages WHERE session_id=? AND role='user' "
@@ -276,84 +328,85 @@ def test_sorted_run_reads_through_the_guard_and_shows_the_card(make_world):
         db.close()
     assert titles == ["Synthetic: review", "Synthetic: review (2)"]
     assert user["content"] == "Synthetic card" and prompt in (user["api_content"] or "")
-    assert any(prompt in json.dumps(request) for request in world.seen)  # the model was sent the full prompt
-    # A gui-source session gets the Desktop platform prompt (Markdown renders), not the terminal one.
+    # A gui-source session gets the Desktop platform prompt (Markdown renders), not the terminal one, and the
+    # bot's own SOUL/role, not Dolores'.
     agent_turns = [request for request in world.seen if prompt in json.dumps(request.get("messages"))]
     assert agent_turns and all("inside the Hermes desktop app" in json.dumps(request.get("system"))
                                for request in agent_turns)
     sent = {tool["name"] for request in world.seen for tool in request.get("tools") or []}
     assert "terminal" not in sent and sent <= {"tool_search", "tool_describe", "tool_call", "hermes_auto_read",
                                                 "hermes_auto_skill_view", "hermes_auto_skills_list", "session_search"}
-    tools = world.tool_results(sid)
+    tools = world.tool_results(sid, "inbox")
     assert tools["toolu_td"] == {"output": "synthetic td: today --json\n", "exit_code": 0}
     assert tools["toolu_list"]["success"] is True
     assert tools["toolu_skill"]["skipped"] is True and "no-such-skill" in tools["toolu_skill"]["note"]
-    assert "only this profile" in str(tools["toolu_other"])
+    assert "only its own" in str(tools["toolu_other"])
+    assert tools["toolu_google"]["skipped"] is True  # Google is not in this bot's read scope
     assert tools["toolu_git"]["skipped"] is True and "error" not in tools["toolu_git"]
     assert "does not exist" in str(tools["toolu_term"]) and "Not run" in str(tools["toolu_term2"])
 
 
 @CONTRACT
-def test_without_the_guard_third_party_and_unguarded_full_runs_are_refused(make_world):
-    world = make_world(guard_enabled=False, approvals_off=True)
+def test_the_gateway_refuses_more_tools_than_the_bot_profile_allows(make_world):
+    """The boundary is the profile: a launch asking the inbox bot for web search (bounded research of an
+    unsorted item) is refused by the gateway itself, and a full-tools job never reaches a read-only bot."""
+    world = make_world()
+    research = world.job("web", mode="research")
+    assert research["profile"] == "inbox"
+    with pytest.raises(RuntimeError):
+        world.hermes.create(research, "unused")
+    assert "GatewayRPCError: invalid_params" in (world.root / "last-error.json").read_text()  # the gateway's
+    draft = world.job("draft")  # the same launch without web (no tools at all) is accepted
+    assert world.hermes.create(draft, "unused") and world.count("inbox") == 1
+    with pytest.raises(RuntimeError, match="read-only bot"):
+        world.hermes.create({**world.job("task", source="todoist", mode="agent"), "profile": "inbox"}, "unused")
+    assert world.count("inbox") == 1
+
+
+@CONTRACT
+def test_without_a_ready_bot_third_party_and_unsafe_full_runs_are_refused(make_world):
+    world = make_world(inbox_plugin=False, work_approvals="off")
     research = world.job("one", deny_tools="research", triage={"reason": "test"})
     mail = world.job("mail", deny_tools=True, triage={"reason": "test"})
     task = world.job("task", source="todoist", mode="agent")
-    for job in (research, mail, task):
-        with pytest.raises(RuntimeError, match="hermes-auto-guard"):
+    assert world.hermes.doctor()["bots"]["inbox"]["ready"] is False
+    for job, why in ((research, "hermes-auto-guard"), (mail, "hermes-auto-guard"), (task, "approvals")):
+        with pytest.raises(RuntimeError, match=why):
             world.hermes.create(job, "unused")
-    db = world.db()
-    try:
-        assert db.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0  # nothing was created
-    finally:
-        db.close()
-    # Bounded preparation needs no guard: its frozen toolsets are empty.
-    draft = world.job("draft")
-    sid = world.hermes.create(draft, "unused")
-    assert world.hermes.run({**draft, "session_id": sid}, "Synthetic prompt")["exit_code"] == 0
-    assert not any(request.get("tools") for request in world.seen if "Synthetic prompt" in json.dumps(request))
+    # Dolores' profile (approvals off, no bots involved) gets neither third-party content nor automatic tasks.
+    with pytest.raises(RuntimeError, match="read-only bot"):
+        world.hermes.create({**mail, "profile": "default"}, "unused")
+    with pytest.raises(RuntimeError, match="approvals"):
+        world.hermes.create({**task, "profile": "default"}, "unused")
+    assert (world.count("default"), world.count("inbox"), world.count("work")) == (0, 0, 0)  # nothing created
 
 
 @CONTRACT
-def test_full_run_refuses_approval_gated_calls_only_during_its_turn(make_world):
-    """approvals.mode off would auto-approve them; the guard refuses them while the automatic turn runs."""
+def test_a_task_runs_in_its_bot_where_hermes_denies_approval_gated_calls(make_world):
+    """approvals.mode manual + a finite automatic turn: Hermes itself denies what would need an approval."""
     turns = [([{"type": "tool_use", "id": "toolu_rm", "name": "terminal",
                 "input": {"command": "rm -rf ~/hermes-auto-contract-does-not-exist"}},
-               {"type": "tool_use", "id": "toolu_echo", "name": "terminal", "input": {"command": "echo synthetic-ok"}},
-               {"type": "tool_use", "id": "toolu_code", "name": "execute_code", "input": {"code": "print(1)"}},
-               {"type": "tool_use", "id": "toolu_rules", "name": "write_file",
-                "input": {"path": "{root}/AGENTS.md", "content": "synthetic"}},
-               {"type": "tool_use", "id": "toolu_notes", "name": "write_file",
-                "input": {"path": "{root}/notes.txt", "content": "synthetic"}}],
+               {"type": "tool_use", "id": "toolu_echo", "name": "terminal", "input": {"command": "echo synthetic-ok"}}],
               "tool_use")]
-    world = make_world(turns, approvals_off=True)
-    for block in turns[0][0]:  # the world's temporary root is known only now
-        if block["name"] == "write_file":
-            block["input"]["path"] = block["input"]["path"].format(root=world.root)
+    world = make_world(turns)
     task = world.job("task", source="todoist", mode="agent")
+    assert task["profile"] == "work"
     sid = world.hermes.create(task, "unused")
     assert world.hermes.run({**task, "session_id": sid}, "Synthetic task")["exit_code"] == 0
-    tools = world.tool_results(sid)
-    assert "cannot ask the user" in str(tools["toolu_rm"]) and "cannot ask the user" in str(tools["toolu_code"])
+    tools = world.tool_results(sid, "work")
     assert "synthetic-ok" in str(tools["toolu_echo"])
-    # A protected instruction file needs an approval Hermes would grant itself with approvals off: refused.
-    assert "cannot ask the user" in str(tools["toolu_rules"]) and not (world.root / "AGENTS.md").exists()
-    assert (world.root / "notes.txt").read_text() == "synthetic"
-    assert policy.read_registration(world.home, sid)["until"] == 0  # the user's own later turns are unrestricted
+    assert "synthetic-ok" not in str(tools["toolu_rm"]) and any(
+        word in str(tools["toolu_rm"]).lower() for word in ("block", "denied", "approval")), tools["toolu_rm"]
     sent = {tool["name"] for request in world.seen for tool in request.get("tools") or []}
-    assert "terminal" in sent  # a full run keeps the profile's normal tools
+    assert "terminal" in sent  # a full run keeps the bot's normal tools; the guard is not loaded there
 
 
 @CONTRACT
-def test_a_session_without_the_tool_policy_is_refused_with_a_new_session_hint(make_world):
+def test_a_session_without_the_jobs_launch_is_refused_with_a_new_session_hint(make_world):
     world = make_world()
     old = world.job("old", mode="open")
-    world.hermes.create(old, "Synthetic old session")  # a session created without hermes-auto's policy
+    world.hermes.create(old, "Synthetic old session")  # a session created without hermes-auto's launch
     job = world.job("one", deny_tools="research", triage={"reason": "test"})
     with pytest.raises(RuntimeError, match="new-session"):
         world.hermes.run({**job, "session_id": old["session_id"]}, "Synthetic prompt")
-    with pytest.raises(RuntimeError, match="new-session"):
-        world.hermes.create({**job, "session_id": old["session_id"]}, "Synthetic prompt")
     assert world.hermes.message_count(old) == 2  # nothing was sent
-
-

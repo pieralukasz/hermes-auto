@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from . import bots
 from .config import model_route, private_json
 from .runner import full_tools
 
@@ -96,10 +97,24 @@ class Hermes:
         if not (Path(config["hermes_source"]) / "hermes_state_registry.py").is_file():
             raise RuntimeError("Set hermes_source to a supported Hermes Agent source installation")
 
-    def invoke(self, action, job=None, **extra):
+    def profile_config(self, profile):
+        """This config aimed at one bot: `hermes_home` is the bot's profile home (the gateway serves it through
+        the multiplexer, like `hermes -p <bot>`), `bot` says what the bridge must check before using it."""
+        profile = profile or bots.DEFAULT
+        if profile == bots.DEFAULT and not bots.enabled(self.config):
+            return self.config
+        spec = bots.read_only(self.config).get(profile)
+        return {**self.config, "hermes_home": bots.profile_home(self.config, profile),
+                "bot": {"name": profile, "read_only": spec is not None,
+                        "reads": sorted((spec or {}).get("reads") or [])}}
+
+    def invoke(self, action, job=None, profile=None, **extra):
+        """Run one bridge action. `profile`: the bot whose home it targets (default: the job's bot)."""
+        profile = profile or (bots.of(job) if job else bots.DEFAULT)
         with tempfile.TemporaryDirectory(prefix="request-", dir=self.home) as directory:
             request = Path(directory) / "request.json"
-            private_json(request, {"action": action, "config": self.config, "job": job or {}, **extra})
+            private_json(request, {"action": action, "config": self.profile_config(profile), "job": job or {},
+                                   **extra})
             command = [self.python, "-I", str(Path(__file__).with_name("bridge.py")), str(request)]
             with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
                 process = subprocess.Popen(command, stdout=out, stderr=err, start_new_session=True)
@@ -170,7 +185,8 @@ class Hermes:
         directory = Path(tempfile.mkdtemp(prefix=f"job-{job['id']}-", dir=runs))
         request = directory / "request.json"
         deny = deny_mode(job)
-        private_json(request, {"action": "run", "config": self.config, "job": job, "prompt": prompt,
+        private_json(request, {"action": "run", "config": self.profile_config(bots.of(job)), "job": job,
+                               "prompt": prompt,
                                "display": display, "full_tools": full_tools(job), "deny_tools": deny,
                                "route": job_route(job, self.config)})
         command = [self.python, "-I", str(Path(__file__).with_name("bridge.py")), str(request)]
@@ -226,8 +242,8 @@ class Hermes:
     def exists(self, job):
         return self.invoke("inspect", job)["exists"]
 
-    def inspect(self, session_id):
-        return self.invoke("inspect", {"session_id": session_id})
+    def inspect(self, session_id, profile=None):
+        return self.invoke("inspect", {"session_id": session_id}, profile=profile)
 
     def classify(self, system, user, max_tokens=4000, route=None):
         """One model call through Hermes; `route` (provider/model) overrides the sorter's default model."""
@@ -240,14 +256,33 @@ class Hermes:
         """Recent user conversations (minus `exclude`, the automation's own): [{id, title, date}]. Read-only."""
         return self.invoke("recent_sessions", days=days, limit=limit, exclude=list(exclude))["result"]
 
-    def session_excerpts(self, ids):
+    def session_excerpts(self, ids, profile=None):
         """{session_id: {title, date, last_user, last_assistant}}. Read-only."""
-        return self.invoke("session_excerpts", ids=list(ids))["result"]
+        return self.invoke("session_excerpts", profile=profile, ids=list(ids))["result"]
 
+    def archive_states(self, sessions):
+        """{session_id: True archived / False open / None missing}: one bridge process per bot profile.
+        `sessions`: session ids (default profile) or (session_id, profile) pairs."""
+        groups = {}
+        for item in sessions:
+            sid, profile = item if isinstance(item, tuple) else (item, bots.DEFAULT)
+            groups.setdefault(profile or bots.DEFAULT, []).append(sid)
+        states = {}
+        for profile, ids in groups.items():
+            states.update(self.invoke("archive_states", profile=profile, session_ids=ids)["states"])
+        return states
 
-    def archive_states(self, session_ids):
-        """{session_id: True archived / False open / None missing}, one bridge process for all."""
-        return self.invoke("archive_states", session_ids=list(session_ids))["states"]
+    def doctor(self):
+        """The bridge's checks against every bot profile the config names (just `default` without bots)."""
+        names = bots.profiles(self.config) if bots.enabled(self.config) else [bots.DEFAULT]
+        report = {}
+        for name in names:
+            try:
+                report[name] = self.invoke("doctor", profile=name)
+            except Exception as exc:  # noqa: BLE001 - one broken bot must not hide the others
+                report[name] = {"ok": False, "error": str(exc)}
+        return {"ok": all(entry.get("ok") and entry.get("ready", True) for entry in report.values()),
+                "bots": report}
 
     def message_count(self, job):
         return self.invoke("inspect", job)["messages"]

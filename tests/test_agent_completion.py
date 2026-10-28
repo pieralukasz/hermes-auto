@@ -50,8 +50,8 @@ class Archive:
     def __init__(self):
         self.archived = {}
 
-    def archive_states(self, session_ids):
-        return {sid: self.archived.get(sid) for sid in session_ids}
+    def archive_states(self, sessions):  # (session id, bot profile) pairs
+        return {sid: self.archived.get(sid) for sid, _profile in sessions}
 
 
 @pytest.fixture

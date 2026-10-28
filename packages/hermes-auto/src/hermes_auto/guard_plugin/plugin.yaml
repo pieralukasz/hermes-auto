@@ -1,6 +1,6 @@
 name: hermes-auto-guard
-version: "1.1.0"
-description: "hermes-auto's automatic sessions: the hermes-auto read toolset (one grammar-checked read command, skill reads) and a pre_tool_call guard keyed by the session ids hermes-auto registers. Other sessions are untouched."
+version: "2.0.0"
+description: "Read-only inbox bots of hermes-auto: the hermes-auto read toolset (one grammar-checked read command, raw skill reads) and a pre_tool_call guard that refuses every other tool in every session of the profile that enables it. Enable only in those bots' profiles."
 author: Lukasz Piera
 hooks:
   - pre_tool_call

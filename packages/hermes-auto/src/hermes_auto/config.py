@@ -50,6 +50,8 @@ def read_config(home: Path) -> dict:
             and isinstance(rule.get("provider", ""), str) and isinstance(rule.get("model", ""), str)
             and (rule.get("provider") or rule.get("model")) for rule in routes):
         raise ValueError("routes must be a list of {match: {...}, provider and/or model}")
+    from .bots import validate
+    validate(config)
     return config
 
 

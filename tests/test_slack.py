@@ -233,7 +233,10 @@ def test_sorter_opens_research_session_that_never_sends(store, config):
     job = store.rows()[0]
     assert job["source"] == "slack" and deny_mode(job) == "research"
     prompt = prompt_for(job, config)
-    assert "NIGDY sam nie odpowiadaj" in prompt and "research" in prompt and "SLACK-" in prompt
+    # A DM may be a private chat with a friend (the TapIn workspace is also used privately): notice only, no draft.
+    assert "Bez szkicu" in prompt and "nie wysyłaj" in prompt and "SLACK-" in prompt
+    assert "NIGDY sam nie odpowiadaj" in triage.slack_session_prompt(
+        {**slack_item(), "dm": False, "why": "mention", "place": "#dev"}, "", config)
     row = store.db.execute("SELECT kind FROM triage_items").fetchone()
     assert row["kind"] == "slack"
     # The next burst in the same DM goes to a new "↩" session with the old one's context.

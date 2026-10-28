@@ -14,14 +14,11 @@ from hermes_auto.store import Store
 
 # ── Per-call policy in the gateway (guard plugin) ────────────────────────────
 
-RESEARCH = {"version": 1, "profile": "research", "until": None}
-
-
 def test_reads_in_a_mixed_batch_still_run_and_only_the_refused_call_is_skipped(monkeypatch):
     """Hermes asks the guard per call: reads in a batch run, the refused one alone gets a neutral result."""
     monkeypatch.setattr(policy.subprocess, "run", lambda argv, **kw: SimpleNamespace(
         returncode=0, stdout="PR 12", stderr=""))
-    assert policy.decide("hermes_auto_skill_view", {"name": "tapin-github"}, RESEARCH) is None
+    assert policy.decide("hermes_auto_skill_view", {"name": "tapin-github"}) is None
     assert json.loads(policy.run_read("gh pr view 12 --repo acme/app", "research")) == {"output": "PR 12",
                                                                                        "exit_code": 0}
     result = json.loads(policy.run_read("git log -5", "research"))
@@ -32,8 +29,7 @@ def test_reads_in_a_mixed_batch_still_run_and_only_the_refused_call_is_skipped(m
 
 def test_a_read_session_has_no_web_or_write_tools():
     for name in ("web_search", "terminal", "write_file", "read_file", "skill_manage", "send_message"):
-        assert policy.decide(name, {}, RESEARCH) is not None
-        assert policy.decide(name, {}, {**RESEARCH, "profile": "mail"}) is not None
+        assert policy.decide(name, {}) is not None
 
 
 def test_read_output_is_bounded_and_run_without_a_shell(monkeypatch):

@@ -185,7 +185,8 @@ def retry_followup(store, hermes, followup_id):
     if not all(needles):
         raise ValueError("Hermes Auto cannot tell whether this reply already reached its session; "
                          f"open session {row['session_id']} and continue there by hand")
-    info = hermes.invoke("inspect", {"session_id": row["session_id"]}, needles=needles)
+    info = hermes.invoke("inspect", {"session_id": row["session_id"],
+                                     "profile": store.session_profile(row["session_id"])}, needles=needles)
 
     def mark(status, error):
         store.db.execute("UPDATE followups SET status=?,error=?,updated=CURRENT_TIMESTAMP WHERE id=?",
@@ -325,10 +326,12 @@ def parser():
     commands = root.add_subparsers(dest="command", required=True)
     commands.add_parser("init", help="Create configuration and durable state once")
     commands.add_parser("doctor", help="Check the Hermes API bridge without an LLM call")
-    commands.add_parser("install-guard", help="Copy the hermes-auto-guard plugin into the Hermes home "
-                        "(does not enable or load it)")
-    commands.add_parser("guard-reload", help="Ask the running Hermes gateway to reload its plugins "
-                        "(loads hermes-auto-guard without a restart), then show the guard's state")
+    install = commands.add_parser("install-guard", help="Copy the hermes-auto-guard plugin and its read scope into "
+                                  "each read-only bot's profile (does not enable or load it)")
+    install.add_argument("profile", nargs="?", help="Read-only bot profile (default: every one in config.json)")
+    reload = commands.add_parser("guard-reload", help="Ask the running Hermes gateway to reload one read-only "
+                                 "bot's plugins (only that profile; loads hermes-auto-guard without a restart)")
+    reload.add_argument("profile", nargs="?", help="Read-only bot profile (default: every one in config.json)")
     commands.add_parser("status", help="Show jobs, source errors and pause state")
     events = commands.add_parser("events", help="Read-only: the sorter's latest decisions, newest first (JSON)")
     events.add_argument("--limit", type=int, default=200)
@@ -407,17 +410,29 @@ def dispatch(args, home, config, store):
         private_json(home / "config.json", config)
         print(f"{args.name}: {args.action}d")
     elif command == "install-guard":
-        from . import guard
-        guard.install(config["hermes_home"])
-        print(guard.activation_steps(config["hermes_home"]))
+        from . import bots, guard
+        targets = bots.read_only(config)
+        if not targets:
+            raise ValueError("No read-only bots in config.json `bots.read_only`; the guard belongs only there")
+        for name in [args.profile] if args.profile else sorted(targets):
+            if name not in targets:
+                raise ValueError(f"{name!r} is not a read-only bot in config.json")
+            profile_home = bots.profile_home(config, name)
+            if not (Path(profile_home) / "config.yaml").is_file():
+                raise ValueError(f"Profile {name!r} does not exist; create it first (hermes profile create {name})")
+            guard.install(profile_home, targets[name].get("reads") or [])
+            print(guard.activation_steps(name, profile_home))
     elif command == "guard-reload":
-        print(json.dumps(Hermes(config, home).invoke("reload_plugins"), indent=2))
+        from . import bots
+        names = [args.profile] if args.profile else sorted(bots.read_only(config))
+        print(json.dumps({name: Hermes(config, home).invoke("reload_plugins", profile=name) for name in names},
+                         indent=2))
     elif command == "doctor":
-        print(json.dumps(Hermes(config, home).invoke("doctor"), indent=2))
+        print(json.dumps(Hermes(config, home).doctor(), indent=2))
         print("Installed adapters:", ", ".join(sorted(sources())) or "none")
     elif command == "status":
-        jobs = [{key: job[key] for key in ("id", "source", "title", "mode", "status", "session_id", "error",
-                                           "created", "updated")}
+        jobs = [{**{key: job[key] for key in ("id", "source", "title", "mode", "status", "session_id", "error",
+                                              "created", "updated")}, "profile": job.get("profile") or "default"}
                 for job in store.rows()]
         # Replies routed into existing sessions; payloads (mail bodies) stay out of CLI output.
         followups = [dict(row) for row in store.db.execute(

@@ -104,7 +104,8 @@ def launch_mismatch(launch, params):
 
 def approvals_unattended_unsafe():
     """True when this profile's approval settings would let an automatic turn run a dangerous command
-    (`approvals.mode: off`, or `single_query_mode: approve`); then even a full-tools run needs the guard."""
+    (`approvals.mode: off`, or `single_query_mode: approve`). An automatic turn is finite, so with any other
+    mode Hermes resolves an approval-gated action from `approvals.single_query_mode` (deny) at once."""
     try:
         from tools.approval_context import _binary_approval_mode, _get_approval_mode
         return _get_approval_mode() == "off" or _binary_approval_mode("single_query_mode") == "approve"
@@ -112,9 +113,13 @@ def approvals_unattended_unsafe():
         return True
 
 
-def guard_required(profile):
-    policy = guard_policy()
-    return profile in policy.DENY_PROFILES or (profile == policy.FULL and approvals_unattended_unsafe())
+# What a read-only bot's profile must switch off and may switch on (its `platform_toolsets.cli`).
+READ_ONLY_DISABLED = frozenset({"terminal", "file", "browser", "web", "code_execution", "computer_use", "delegation",
+                                "cronjob", "memory", "skills", "image_gen", "tts", "kanban", "connections"})
+
+
+def read_only_toolsets():
+    return frozenset({guard_policy().TOOLSET, "session_search"})
 
 
 def plugin_version():
@@ -122,8 +127,40 @@ def plugin_version():
     return match.group(1).strip() if match else ""
 
 
+def bot_of(config):
+    return config.get("bot") or {"name": "default", "read_only": False, "reads": []}
+
+
+def profile_problems(config):
+    """Why this home is not a ready read-only bot, read from its config.yaml as Hermes reads it (empty: ready).
+    The boundary is the profile's own configuration: only the hermes-auto read toolset and session_search,
+    everything that runs code, touches files, browses or sends switched off, the guard plugin enabled."""
+    from agent.skill_utils import parse_config_string_list
+    from hermes_cli.config import load_config
+    home = Path(config["hermes_home"])
+    if not (home / "config.yaml").is_file():
+        return [f"profile {bot_of(config)['name']!r} does not exist ({home})"]
+    settings = load_config() or {}
+    problems = []
+    platform = set(parse_config_string_list((settings.get("platform_toolsets") or {}).get("cli")))
+    if not platform or not platform <= read_only_toolsets():
+        problems.append(f"platform_toolsets.cli must be a subset of {sorted(read_only_toolsets())}, "
+                        f"is {sorted(platform) or 'unset (all tools)'}")
+    disabled = set(parse_config_string_list((settings.get("agent") or {}).get("disabled_toolsets")))
+    if READ_ONLY_DISABLED - disabled:
+        problems.append(f"agent.disabled_toolsets lacks {sorted(READ_ONLY_DISABLED - disabled)}")
+    if guard_policy().GUARD_NAME not in parse_config_string_list((settings.get("plugins") or {}).get("enabled")):
+        problems.append("plugins.enabled lacks hermes-auto-guard")
+    scope = guard_policy().read_scope(home / "plugins" / guard_policy().GUARD_NAME)
+    if scope != frozenset(bot_of(config).get("reads") or []):
+        problems.append(f"installed read scope {sorted(scope)} differs from config {bot_of(config).get('reads')}; "
+                        "run `hermes-auto install-guard`")
+    return problems
+
+
 async def guard_status(client):
-    """What the RUNNING gateway loaded of the guard plugin (`plugins.list` answers from its own manager)."""
+    """What the RUNNING gateway loaded of the guard plugin for this profile (`plugins.list` answers from the
+    profile's own plugin manager)."""
     policy = guard_policy()
     listing = await client.rpc("plugins.list")
     for plugin in listing.get("plugins") or []:
@@ -139,23 +176,37 @@ async def guard_status(client):
 
 def guard_message(status):
     if not status.get("loaded"):
-        why = "the running Hermes gateway has not loaded the hermes-auto-guard plugin"
-    elif status.get("version") != status.get("expected_version"):
-        why = (f"the running gateway has hermes-auto-guard {status.get('version')!r}, this hermes-auto needs "
-               f"{status.get('expected_version')!r}")
-    else:
-        why = f"hermes-auto-guard is loaded but not active ({status.get('error') or 'disabled or incomplete'})"
-    return (f"Refused: {why}. Sessions with third-party content (and full-tools runs while approvals are off) "
-            "run only behind it. Run `hermes-auto install-guard` and enable it as it prints, load it with "
-            "`hermes-auto guard-reload` (or restart Hermes.app), then `hermes-auto retry` the job; nothing was "
-            "sent to the session.")
+        return "the running Hermes gateway has not loaded the hermes-auto-guard plugin for this bot"
+    if status.get("version") != status.get("expected_version"):
+        return (f"the running gateway has hermes-auto-guard {status.get('version')!r} for this bot, this hermes-auto "
+                f"needs {status.get('expected_version')!r}")
+    return f"hermes-auto-guard is loaded but not active ({status.get('error') or 'disabled or incomplete'})"
 
 
-async def require_guard(client, profile):
-    if guard_required(profile):
-        status = await guard_status(client)
-        if not status["ok"]:
-            raise Refusal(guard_message(status))
+async def require_bot(client, config, profile, job):
+    """Fail closed before anything reaches a session: third-party content only in a ready read-only bot; a
+    full-tools automatic turn only in a working bot whose approvals deny what nobody can approve."""
+    bot = bot_of(config)
+    retry = f"Nothing was sent. Fix it, then `hermes-auto new-session {job.get('id', 'JOB_ID')}`."
+    if profile in guard_policy().DENY_PROFILES:
+        if not bot.get("read_only"):
+            raise Refusal(f"Refused: third-party content goes only to a read-only bot, not to profile "
+                          f"{bot['name']!r} (configure `bots` in hermes-auto's config.json). {retry}")
+        problems = profile_problems(config)
+        if profile != guard_policy().PRIVATE:
+            status = await guard_status(client)
+            if not status["ok"]:
+                problems.append(guard_message(status) + f" (`hermes-auto guard-reload {bot['name']}`)")
+        if problems:
+            raise Refusal(f"Refused: bot {bot['name']!r} is not a ready read-only bot: {'; '.join(problems)}. {retry}")
+    elif profile == guard_policy().FULL:
+        if bot.get("read_only"):
+            raise Refusal(f"Refused: a full-tools job cannot run in the read-only bot {bot['name']!r}. {retry}")
+        if approvals_unattended_unsafe():
+            raise Refusal(f"Refused: bot {bot['name']!r} has approvals.mode off (or single_query_mode approve), so "
+                          "an automatic turn would run approval-gated commands without anyone. Set `hermes "
+                          f"-p {bot['name']} config set approvals.mode manual` (single_query_mode stays deny) "
+                          f"or route these tasks to another bot. {retry}")
 
 
 def run_gateway(work):
@@ -213,9 +264,8 @@ async def rename(client, hermes_home, sid, title):
 
 
 def create_agent_session(request, config, job, db):
-    """A gateway session for an automatic run: frozen toolsets, turn limit, budget and model route; the
-    guard registration and the title follow. Idempotent: the creation key is the job's reserved id."""
-    policy = guard_policy()
+    """A gateway session for an automatic run in the job's bot profile (this home): frozen toolsets, turn limit,
+    budget and model route, then the title. Idempotent: the creation key is the job's reserved id."""
     profile, params = launch_plan(request, config)
     home = config["hermes_home"]
 
@@ -225,16 +275,11 @@ def create_agent_session(request, config, job, db):
         if "gui" not in (contract.get("sources") or []) or missing:
             raise Refusal("Refused: this Hermes gateway cannot create automatic sessions with "
                           f"{', '.join(missing) or 'source gui'}; update Hermes.")
-        await require_guard(client, profile)
+        await require_bot(client, config, profile, job)
         snapshot = await client.rpc("session.create", request_id=f"hermes-auto:{job['session_id']}",
                                     source="gui", cwd=str(Path.home()), **params,
                                     **({"hidden": True} if request.get("hidden") else {}))
         sid = snapshot["stored_session_id"]
-        if profile is not None:
-            # Before any turn: the plugin reads this to apply the profile (read profiles for good, a full
-            # run only while its automatic turn is running).
-            policy.write_registration(home, sid, profile, until=None if profile != policy.FULL else 0,
-                                      job=job.get("id"))
         row = db.get_session(sid) or {}
         if not row.get("title"):
             await rename(client, home, sid, request["title"])
@@ -275,22 +320,14 @@ def create_open_session(request, config, job, db):
 def run_session(request, config, job):
     """Submit the job's prompt to its gateway session as one finite turn and print the stream-json result.
 
-    Refused (nothing submitted) when the session has no hermes-auto registration (created by an older
-    hermes-auto, by hand, or before the guard), when its frozen launch differs from what this job needs, or
-    when the guard plugin this job needs is not active in the running gateway."""
-    policy = guard_policy()
+    Refused (nothing submitted) when the session's frozen launch differs from what this job needs (an older
+    session, created by hand or before Hermes v0.22.5), or when its bot is not ready for it (`require_bot`)."""
     sid = job["session_id"]
     profile, params = launch_plan(request, config)
-    home = config["hermes_home"]
-    entry = policy.read_registration(home, sid) if profile is not None else None
-    if profile is not None and (entry is None or entry["profile"] != profile):
-        raise Refusal("Refused: this session was not created by this hermes-auto with the job's tool policy "
-                      "(an older session, or created before Hermes v0.22.5). Nothing was sent. Use "
-                      f"`hermes-auto new-session {job.get('id', 'JOB_ID')}` for a fresh conversation.")
     prompt, display = request["prompt"], request.get("display")
 
     async def work(client):
-        await require_guard(client, profile)
+        await require_bot(client, config, profile, job)
         snapshot = await client.rpc("session.resume", session_id=sid)
         different = launch_mismatch((snapshot.get("info") or {}).get("launch_request"), params)
         if different:
@@ -312,28 +349,13 @@ def run_session(request, config, job):
         view.unattended = False  # finite, never auto-approving: no one can answer, so approvals resolve to deny
         return await view.run(prompt, oneshot=True)
 
-    if profile == policy.FULL:
-        # The guard refuses approval-gated calls only while this automatic turn runs; the user's own
-        # later turns in the session keep their normal approvals.
-        policy.write_registration(home, sid, profile, until=time.time() + params["run_budget"] + 300,
-                                  job=job.get("id"))
-    try:
-        result = run_gateway(work)
-    except Refusal:
-        if profile == policy.FULL:  # refused before anything was submitted: nothing runs
-            policy.write_registration(home, sid, profile, until=0, job=job.get("id"))
-        raise
-    if profile == policy.FULL and result == 0:
-        # Lifted only when the turn finished. A lost connection, a detach (exit 3: input required, a queued
-        # input) or an unknown outcome may leave the turn running in the gateway, so the restriction then
-        # stays until its deadline.
-        policy.write_registration(home, sid, profile, until=0, job=job.get("id"))
-    return result
+    return run_gateway(work)
 
 
 def doctor(config, db):
-    """Import and contract checks without a model call: the gateway client, its creation contract, the
-    guard plugin in the running gateway, and the read-only state.db API the sorter uses."""
+    """Import and contract checks without a model call for this home's bot: the gateway client, its creation
+    contract, and for a read-only bot its profile configuration and the guard plugin in the running gateway;
+    for a working bot whether automatic turns would auto-approve."""
     from hermes_cli.gateway_chat_view import GatewayChatView
     from hermes_cli.stream_json import StreamJsonEmitter
     from hermes_state import SessionDB
@@ -341,6 +363,9 @@ def doctor(config, db):
     assert callable(call_llm) and callable(GatewayChatView.run) and callable(StreamJsonEmitter.emit_result)
     assert callable(SessionDB.get_compression_lineage) and callable(SessionDB.resolve_resume_session_id)
     assert "read_only" in SessionDB.__init__.__code__.co_varnames
+    bot = bot_of(config)
+    if not (Path(config["hermes_home"]) / "config.yaml").is_file() and bot["name"] != "default":
+        return {"ok": False, "ready": False, "bot": bot["name"], "problems": [f"profile {bot['name']!r} does not exist"]}
 
     async def work(client):
         contract = (await client.rpc("runtime.describe")).get("session_create") or {}
@@ -348,10 +373,18 @@ def doctor(config, db):
         missing = sorted(needed - set(contract.get("parameters") or []))
         if "gui" not in (contract.get("sources") or []) or missing:
             raise Refusal(f"Hermes gateway lacks the creation contract hermes-auto needs: {missing or 'source gui'}")
-        return await guard_status(client)
+        return await guard_status(client) if bot.get("read_only") else None
     guard = run_gateway(work)
-    return {"ok": True, "python": sys.executable, "source": config["hermes_source"], "guard": guard,
-            "approvals_off": approvals_unattended_unsafe()}
+    report = {"ok": True, "bot": bot["name"], "home": config["hermes_home"], "read_only": bool(bot.get("read_only")),
+              "python": sys.executable, "source": config["hermes_source"]}
+    if bot.get("read_only"):
+        problems = profile_problems(config) + ([] if guard["ok"] else [guard_message(guard)])
+        report.update(guard=guard, reads=bot.get("reads"), problems=problems, ready=not problems)
+    else:
+        unsafe = approvals_unattended_unsafe()
+        report.update(approvals_off=unsafe, ready=not unsafe,
+                      problems=["approvals.mode off: automatic Todoist runs here are refused"] if unsafe else [])
+    return report
 
 
 def parse_json_block(text):
@@ -676,8 +709,10 @@ def main():
             # The gateway's own `reload-plugins` control verb (what `hermes plugins enable` sends): plugins
             # are re-discovered in the running gateway, open conversations keep running.
             from gateway.control_socket import reload_gateway_plugins
-            answer = reload_gateway_plugins(Path(config["hermes_home"])) or {"reloaded": False,
-                                                                               "error": "no gateway answered"}
+            home = Path(config["hermes_home"])
+            root = home.parent.parent if bot_of(config)["name"] != "default" else home
+            answer = reload_gateway_plugins(root, profile_home=home) or {"reloaded": False,
+                                                                         "error": "no gateway answered"}
             answer = {key: answer.get(key) for key in ("reloaded", "error", "plugins")}
             answer["guard"] = run_gateway(guard_status) if answer.get("reloaded") else None
             print(json.dumps(answer))
@@ -723,11 +758,8 @@ def main():
                 print(json.dumps({"session_id": create_open_session(request, config, job, db)}))
                 return
             if session is not None:
-                # A retry before anything was sent: the gateway session already exists under this id.
-                if guard_policy().profile_for(request.get("deny_tools"), request.get("full_tools")) is not None \
-                        and guard_policy().read_registration(config["hermes_home"], sid) is None:
-                    raise Refusal("Refused: this session was created by an older hermes-auto without the tool "
-                                  f"policy; use `hermes-auto new-session {job.get('id', 'JOB_ID')}`.")
+                # A retry before anything was sent: the gateway session already exists under this id; the run
+                # compares its frozen launch with this job's before submitting anything.
                 print(json.dumps({"session_id": sid}))
                 return
             print(json.dumps({"session_id": create_agent_session(request, config, job, db)}))

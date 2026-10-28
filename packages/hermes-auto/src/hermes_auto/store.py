@@ -80,6 +80,10 @@ class Store:
                 updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        # The bot (Hermes profile) a job's session lives in; '' = created before bots (the default profile).
+        if "profile" not in {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}:
+            self.db.execute("ALTER TABLE jobs ADD COLUMN profile TEXT NOT NULL DEFAULT ''")
+            self.db.commit()
         if self.db.execute("PRAGMA quick_check").fetchone()[0] != "ok":
             raise RuntimeError("Automation database is damaged; restore a backup")
         marker.touch(mode=0o600)
@@ -115,7 +119,7 @@ class Store:
         return dict(row)
 
     def update(self, job_id, **fields):
-        allowed = {"status", "error", "attempts", "session_id"}
+        allowed = {"status", "error", "attempts", "session_id", "profile"}
         if not fields or not set(fields) <= allowed:
             raise ValueError("Invalid state fields")
         assignments = ",".join(f"{key}=?" for key in fields)
@@ -133,6 +137,13 @@ class Store:
                             (new, old))
             self.db.execute("UPDATE meta SET value=? WHERE value=? AND (key GLOB 'thread_session:*' OR key GLOB "
                             "'create:*')", (json.dumps(new), json.dumps(old)))
+
+    def session_profile(self, session_id):
+        """The bot profile of a session hermes-auto created ('default' for any other session, e.g. one a reply
+        was traced to by its send receipt in the default profile)."""
+        row = self.db.execute("SELECT profile FROM jobs WHERE session_id=? ORDER BY id DESC LIMIT 1",
+                              (session_id,)).fetchone()
+        return (row[0] if row else "") or "default"
 
     def background_runs(self):
         """IDs of `running` jobs that have a background run handle; `collect` settles them, not recovery."""

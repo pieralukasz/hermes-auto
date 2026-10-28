@@ -1,58 +1,84 @@
-"""Hermes Auto guard: the read rules of automatic sessions that carry third-party content.
+"""Hermes Auto guard: the read rules of the read-only inbox bots (Hermes profiles such as `inbox`).
 
-Shared by the Hermes plugin (``__init__.py``, loaded by the gateway) and by hermes-auto's bridge and tests.
-Pure Python, no Hermes imports at module level: the bridge loads this file by path and the tests import it.
+Shared by the Hermes plugin (``__init__.py``, loaded by the gateway for the profiles that enable it) and by
+hermes-auto's bridge and tests. Pure Python, no Hermes imports at module level: the bridge loads this file by path
+and the tests import it.
 
-The boundary has two layers. The gateway freezes each automatic session's toolsets when hermes-auto creates
-it, so a session with someone else's mail or Slack never gets terminal, file, skill_manage or any send tool
-(fail-closed even without this plugin: without it, the ``hermes-auto`` toolset does not exist and the
-gateway refuses the session). This module is the second layer: the one read tool runs only commands its
-grammar proves to be reads, and the ``pre_tool_call`` hook refuses every other tool in such a session.
+The boundary lives in the bot profile's own configuration: its `platform_toolsets` name only the `hermes-auto`
+toolset and `session_search`, `agent.disabled_toolsets` removes terminal, files, browser, web, delegation and the
+rest, and the gateway refuses a session that asks for more. Hermes Auto also freezes those toolsets when it
+creates a session. This plugin is enabled only in those profiles and applies to every session there (no
+per-session registry): the one read tool runs only commands its grammar proves to be reads, limited to the read
+families the profile was installed with (``scope.json``), and the ``pre_tool_call`` hook refuses any other tool.
 """
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
 import shlex
 import subprocess
 import sys
-import time
 
 GUARD_NAME = "hermes-auto-guard"
-GUARD_VERSION = "1.1.0"
+GUARD_VERSION = "2.0.0"
 TOOLSET = "hermes-auto"
 READ_TOOL = "hermes_auto_read"
 SKILL_VIEW_TOOL = "hermes_auto_skill_view"
 SKILLS_LIST_TOOL = "hermes_auto_skills_list"
 PLUGIN_TOOLS = (READ_TOOL, SKILL_VIEW_TOOL, SKILLS_LIST_TOOL)
+# Tools a session of a read-only bot may call (the hook refuses everything else).
+ALLOWED_TOOLS = frozenset(PLUGIN_TOOLS) | {"session_search"}
 
-# Session profiles hermes-auto registers. "mail" and "research" read through READ_TOOL; "private" has no
-# tools at all; "full" is a Todoist task (or a mail the user gave the agent label) with normal tools, where
-# only commands that would need an approval are refused while the automatic turn runs.
+# How a job's automatic session is launched. "mail" and "research" read through READ_TOOL in a read-only bot;
+# "private" (link-only Slack channels) has no tools at all; "full" is a Todoist task (or a mail the user gave
+# the agent label) with the target bot's normal tools.
 MAIL, RESEARCH, PRIVATE, FULL = "mail", "research", "private", "full"
 DENY_PROFILES = (MAIL, RESEARCH, PRIVATE)
 PROFILES = DENY_PROFILES + (FULL,)
-ALLOWED_TOOLS = {MAIL: frozenset(PLUGIN_TOOLS) | {"session_search"},
-                 RESEARCH: frozenset(PLUGIN_TOOLS) | {"session_search"},
-                 PRIVATE: frozenset()}
-# Tools a "full" automatic turn may not run without a human: arbitrary local code outside the terminal's
-# command approval (Hermes asks before execute_code in an attended session) and desktop control (each
-# computer_use action goes through Hermes' approval gate, which `approvals.mode: off` approves).
-FULL_REFUSED_TOOLS = frozenset({"execute_code", "computer_use"})
+# Read families: which programs a profile's read tool may run.
+GOOGLE, TODOIST, GITHUB, LINEAR, SLACK = "google", "todoist", "github", "linear", "slack"
+FAMILIES = (GOOGLE, TODOIST, GITHUB, LINEAR, SLACK)
+PROFILE_FAMILIES = {MAIL: frozenset({GOOGLE, TODOIST}), RESEARCH: frozenset(FAMILIES)}
 OUTPUT_LIMIT = 30000
 COMMAND_TIMEOUT = 120
-SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+SCOPE_FILE = "scope.json"
 
 
 def profile_for(deny_tools, full_tools=False):
-    """The guard profile of a job: its `deny_tools` value (True, "research"/"slack", other) or "full"."""
+    """The launch profile of a job: its `deny_tools` value (True, "research"/"slack", other) or "full"."""
     if deny_tools:
         if deny_tools is True:
             return MAIL
         return RESEARCH if deny_tools in ("research", "slack") else PRIVATE
     return FULL if full_tools else None
+
+
+def families_for(profile):
+    """Read families for `profile`: a launch profile name/True (legacy callers) or an iterable of families."""
+    if profile is True or profile == MAIL:
+        return PROFILE_FAMILIES[MAIL]
+    if profile in ("research", "slack"):
+        return PROFILE_FAMILIES[RESEARCH]
+    if isinstance(profile, (set, frozenset, list, tuple)):
+        return frozenset(item for item in profile if item in FAMILIES)
+    return frozenset()
+
+
+def valid_scope(data):
+    return (isinstance(data, dict) and data.get("version") == 1 and isinstance(data.get("reads"), list)
+            and all(item in FAMILIES for item in data["reads"]))
+
+
+def read_scope(plugin_dir):
+    """The read families a profile's plugin was installed with; none (every read refused) when the file is
+    missing or malformed."""
+    try:
+        with open(os.path.join(str(plugin_dir), SCOPE_FILE), encoding="utf-8") as stream:
+            data = json.load(stream)
+    except (OSError, ValueError):
+        return frozenset()
+    return frozenset(data["reads"]) if valid_scope(data) else frozenset()
 
 
 SHELL_META = set(";|&<>`$\n\r\\(){}")
@@ -64,6 +90,8 @@ TODOIST_READS = {("today",), ("upcoming",), ("inbox",), ("completed",), ("activi
 # Research read profiles (Slack, GitHub); "slack" is kept for sessions queued before the rename.
 RESEARCH_PROFILES = ("research", "slack")
 SLACK_MCP = "skills/tap-in/tapin-slack/scripts/slack_mcp.py"
+# The TapIn skills moved into the TapIn bot's profile; both locations are trusted.
+SLACK_MCP_PATHS = (SLACK_MCP, "profiles/tapin/" + SLACK_MCP)
 SLACK_MCP_READS = {"slack_search_public", "slack_search_public_and_private", "slack_search_users",
                    "slack_search_channels", "slack_read_channel", "slack_read_thread", "slack_read_canvas",
                    "slack_read_user_profile", "slack_read_file", "slack_list_channel_members",
@@ -185,10 +213,12 @@ def trusted_python(token, words):
 
 
 def skill_script(tokens, words, relative):
-    """`python <hermes home>/<relative> ...` with a trusted interpreter and the exact skill script."""
+    """`python <hermes home>/<relative> ...` with a trusted interpreter and the exact skill script (one relative
+    path or a tuple of them)."""
     if len(tokens) < 4 or not trusted_python(tokens[0], words):
         return False
-    return literal_path(tokens[1], words) in {os.path.join(home, relative) for home in hermes_homes()}
+    paths = (relative,) if isinstance(relative, str) else relative
+    return literal_path(tokens[1], words) in {os.path.join(home, item) for home in hermes_homes() for item in paths}
 
 
 GH_REPO = re.compile(r"[\w.-]+/[\w.-]+")
@@ -287,30 +317,31 @@ def linear_read(tokens):
     return spec is not None and split_options(args[2:], spec) is not None
 
 
-def slack_read_command(tokens, words=None):
-    """Reads of the Slack session's research: trusted Slack, GitHub and Linear commands."""
+def slack_read_command(tokens, words=None, families=None):
+    """Reads of the research families: trusted Slack, GitHub and Linear commands."""
     words = set(tokens) if words is None else words
-    if skill_script(tokens, words, SLACK_MCP):
+    families = PROFILE_FAMILIES[RESEARCH] if families is None else families
+    if SLACK in families and skill_script(tokens, words, SLACK_MCP_PATHS):
         return tokens[2] == "call" and tokens[3] in SLACK_MCP_READS and len(tokens) <= 5
-    if trusted_program(tokens[0], words, "gh"):
+    if GITHUB in families and trusted_program(tokens[0], words, "gh"):
         return gh_read(tokens)
-    if trusted_program(tokens[0], words, "linear"):
+    if LINEAR in families and trusted_program(tokens[0], words, "linear"):
         return linear_read(tokens)
     return False
 
 
 def read_only_command(command, profile=True):
-    """True only for a single plain read command: calendar/Gmail reads via the Google script, Todoist reads.
-    With a research profile also the Slack session's research reads (`slack_read_command`). Profile
-    "private" and unknown profiles allow no command.
+    """True only for a single plain read command of the allowed families: calendar/Gmail reads via the Google
+    script, Todoist reads, and the research reads (`slack_read_command`). `profile` is a set of families or a
+    launch profile ("mail"/True: Google and Todoist; "research": all). "private" and unknown profiles allow
+    no command.
 
     No shell syntax at all (pipes, redirects, substitutions, chaining), so the allowed program is the
     only thing that runs. Programs and scripts must be the trusted ones, and their options must be in an
     explicit read grammar. Anything else is refused, however harmless it looks.
     """
-    if profile == MAIL:
-        profile = True
-    if profile is not True and profile not in RESEARCH_PROFILES:
+    families = families_for(profile)
+    if not families:
         return False
     text = str(command or "").strip()
     # Single-quoted text is literal in sh (Todoist filters use `|` and `&`); everything else may not
@@ -326,124 +357,19 @@ def read_only_command(command, profile=True):
         return False
     words = set(text.split())
     if trusted_program(tokens[0], words, "td"):
-        return todoist_read(tokens)
+        return TODOIST in families and todoist_read(tokens)
     if skill_script(tokens, words, GOOGLE_API):
-        return (tokens[2], tokens[3]) in GOOGLE_READS
-    if profile in RESEARCH_PROFILES:
-        return slack_read_command(tokens, words)
-    return False
-
-
-
-# --- Registry: which sessions are automatic, written by hermes-auto's bridge, read by the plugin ---------
-
-def registry_dir(hermes_home):
-    return os.path.join(str(hermes_home), "hermes-auto-guard", "sessions")
-
-
-def registration_path(hermes_home, session_id):
-    if not isinstance(session_id, str) or not SESSION_ID.fullmatch(session_id):
-        return None
-    return os.path.join(registry_dir(hermes_home), session_id + ".json")
-
-
-def write_registration(hermes_home, session_id, profile, until=None, job=None):
-    """Mark `session_id` as an automatic session with `profile` (0600 file, atomic replace).
-
-    `until` (epoch seconds) bounds a "full" session's restrictions to its automatic turn; None for the
-    read profiles, whose restrictions hold for the whole session like its frozen toolsets."""
-    if profile not in PROFILES:
-        raise ValueError(f"unknown guard profile: {profile!r}")
-    path = registration_path(hermes_home, session_id)
-    if path is None:
-        raise ValueError("invalid session id")
-    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-    data = {"version": 1, "profile": profile, "until": until, "job": job}
-    temporary = f"{path}.{os.getpid()}.tmp"
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as stream:
-        json.dump(data, stream)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(temporary, path)
-    return data
-
-
-def read_registration(hermes_home, session_id):
-    """The registration of `session_id`, or None when it is not an automatic session.
-
-    An unreadable or malformed file of an automatic session reads as "private" (no tools): the file
-    exists, so the session is one of ours, and the safe answer is the strictest profile."""
-    path = registration_path(hermes_home, session_id)
-    if path is None or not os.path.exists(path):
-        return None
-    try:
-        with open(path, encoding="utf-8") as stream:
-            data = json.load(stream)
-        if not valid_registration(data):
-            raise ValueError("bad registration")
-        return data
-    except (OSError, ValueError):
-        return {"version": 1, "profile": PRIVATE, "until": None, "job": None}
-
-
-def valid_registration(data):
-    """The exact shape write_registration writes: version 1, a known profile, `until` None or a finite
-    number (not a bool). Anything else (a hand-edited or truncated file) is not trusted."""
-    if not isinstance(data, dict) or data.get("version") != 1 or data.get("profile") not in PROFILES:
-        return False
-    until = data.get("until", "missing")
-    if until is None:
-        return True
-    return isinstance(until, (int, float)) and not isinstance(until, bool) and math.isfinite(until)
-
-
-def active(entry, now=None):
-    """Whether a registration restricts tools now: always for read profiles, within `until` for "full"."""
-    if entry is None:
-        return False
-    if entry["profile"] in DENY_PROFILES:
-        return True
-    until = entry.get("until")
-    return isinstance(until, (int, float)) and not isinstance(until, bool) and (now or time.time()) < until
-
-
-def active_full_registration(hermes_home, now=None):
-    """Whether some "full" automatic turn is running now (its registration's `until` is in the future)."""
-    try:
-        with os.scandir(registry_dir(hermes_home)) as entries:
-            names = [item.name[:-5] for item in entries if item.name.endswith(".json")]
-    except OSError:
-        return False
-    for name in names:
-        entry = read_registration(hermes_home, name)
-        if entry is not None and entry["profile"] == FULL and active(entry, now):
-            return True
-    return False
-
-
-def has_registrations(hermes_home):
-    """Whether hermes-auto registered any session (one directory listing; False when there is none)."""
-    try:
-        with os.scandir(registry_dir(hermes_home)) as entries:
-            return any(item.name.endswith(".json") for item in entries)
-    except OSError:
-        return False
+        return GOOGLE in families and (tokens[2], tokens[3]) in GOOGLE_READS
+    return slack_read_command(tokens, words, families)
 
 
 # --- Hook decision -------------------------------------------------------------------------------------
 
-REFUSED_READ = ("Not run: this automatic step only reads (third-party content). Use hermes_auto_read for "
-                "one plain read command, hermes_auto_skill_view/hermes_auto_skills_list for skills and "
-                "session_search for earlier conversations. Sending and writing wait for the user's OK.")
-REFUSED_PRIVATE = "Not run: no tools in this automatic step (private third-party content). Answer from the conversation only."
-REFUSED_FULL = ("Not run: this automatic run cannot ask the user to approve {what}. Find another way, or "
-                "prepare it and leave it for the user's approval.")
-
-
-REFUSED_PROFILE = ("Not run: this automatic step may search only this profile's conversations (no `profile`, "
-                   "no `profile/id` session links).")
-REFUSED_GUARD_FILES = "Not run: an automatic run may not change hermes-auto's guard or its session registry."
+REFUSED_READ = ("Not run: this bot only reads (third-party content). Use hermes_auto_read for one plain read "
+                "command, hermes_auto_skill_view/hermes_auto_skills_list for skills and session_search for earlier "
+                "conversations. Sending and writing happen in Dolores (\"Kontynuuj w Dolores\").")
+REFUSED_PROFILE = ("Not run: this bot may search only its own conversations (no `profile`, no `profile/id` "
+                   "session links).")
 
 
 def own_profile_search(args):
@@ -481,80 +407,18 @@ def bridged_names(args):
     return frozenset(str(call.get("name") or "") if isinstance(call, dict) else "" for call in calls)
 
 
-WRITE_TOOLS = frozenset({"write_file", "patch"})
-PATCH_FILE = re.compile(r"^\*\*\* (?:Update File|Add File|Delete File|Move to):\s*(.+?)\s*$", re.M)
-GUARD_MARK = GUARD_NAME  # both the plugin directory and the registry directory carry this name
-
-
-def write_paths(tool_name, args):
-    """Every path a write_file/patch call would touch (`path`, and the files a V4A patch names)."""
-    if tool_name not in WRITE_TOOLS or not isinstance(args, dict):
-        return []
-    paths = [str(args["path"])] if args.get("path") else []
-    if isinstance(args.get("patch"), str):
-        paths += PATCH_FILE.findall(args["patch"])
-    return paths
-
-
-def touches_guard(paths, homes=None):
-    """A path inside the guard plugin or its registry (after `~` expansion and realpath), in any Hermes home."""
-    roots = []
-    for home in homes or hermes_homes():
-        roots += [os.path.join(home, GUARD_MARK), os.path.join(home, "plugins", GUARD_MARK)]
-    roots = [os.path.realpath(root) for root in roots]
-    for path in paths:
-        expanded = os.path.expanduser(str(path))
-        if not os.path.isabs(expanded):
-            expanded = os.path.join(os.path.expanduser("~"), expanded)  # automatic sessions run in ~
-        for candidate in (os.path.normpath(expanded), os.path.realpath(expanded)):
-            if any(candidate == root or candidate.startswith(root + os.sep) for root in roots):
-                return True
-    return False
-
-
-def decide(tool_name, args, entry, dangerous=None, now=None, gated_write=None, resolve=None):
-    """The block message for one tool call of a registered session, or None to let it run.
-
-    `dangerous(command) -> bool` is Hermes' own approval detector (tools.approval) and
-    `gated_write(paths) -> bool` its approval-gated write paths (SSH config, protected instruction
-    files), injected so this stays pure; when one is missing the call is refused. Read profiles allow
-    only their tool list; "full" refuses, while its automatic turn runs, what an attended session would
-    have to approve (with `approvals.mode: off` Hermes would approve it on its own) and any change to
-    the guard itself. `resolve(path) -> path` makes a relative path absolute against the session's working
-    directory (Hermes keeps a `cd` across terminal calls); without it relative paths count from ~."""
-    if not active(entry, now):
+def decide(tool_name, args):
+    """The block message for one tool call in a read-only bot's session, or None to let it run: only the
+    plugin's tools, session_search in this profile and the Tool Search bridge to them."""
+    if tool_name == "session_search":
+        return None if own_profile_search(args) else REFUSED_PROFILE
+    if tool_name in ALLOWED_TOOLS or tool_name in CATALOG_TOOLS:
         return None
-    profile = entry["profile"]
-    if profile in DENY_PROFILES:
-        allowed = ALLOWED_TOOLS.get(profile, frozenset())
-        if tool_name == "session_search" and "session_search" in allowed and not own_profile_search(args):
-            return REFUSED_PROFILE
-        if tool_name in allowed or (allowed and tool_name in CATALOG_TOOLS):
-            return None
-        if allowed and tool_name == "tool_call" and bridged_names(args) <= allowed and bridged_names(args):
+    if tool_name == "tool_call":
+        names = bridged_names(args)
+        if names and names <= ALLOWED_TOOLS:
             return None  # Hermes unwraps the bridge and checks the real tool again before it runs
-        return REFUSED_PRIVATE if profile == PRIVATE else REFUSED_READ
-    if tool_name in FULL_REFUSED_TOOLS:
-        return REFUSED_FULL.format(what=f"running {tool_name}")
-    if tool_name == "terminal":
-        command = (args or {}).get("command") if isinstance(args, dict) else None
-        if not isinstance(command, str) or dangerous is None:
-            return REFUSED_FULL.format(what="this command")
-        workdir = args.get("workdir")
-        if GUARD_MARK in command or (isinstance(workdir, str) and (GUARD_MARK in workdir
-                                                                     or touches_guard([workdir]))):
-            return REFUSED_GUARD_FILES
-        if dangerous(command):
-            return REFUSED_FULL.format(what="this command")
-    if tool_name in WRITE_TOOLS:
-        paths = write_paths(tool_name, args)
-        if resolve is not None:
-            paths = [resolve(path) for path in paths]
-        if touches_guard(paths):
-            return REFUSED_GUARD_FILES
-        if gated_write is None or gated_write(paths):
-            return REFUSED_FULL.format(what="this write")
-    return None
+    return REFUSED_READ
 
 
 # --- Skill reads (raw text: no template rendering, inline shell or dependency install) ---------------
@@ -605,12 +469,13 @@ def neutral(note):
 
 
 def read_argv(command, profile):
-    """The argv to run for one read `command` under `profile`, or None when it is not a read.
+    """The argv to run for one read `command` under `profile` (families or a launch profile), or None when it is
+    not a read.
 
     No shell runs it: the grammar's own checks still refuse shell syntax, and the program and script
     tokens are replaced by the exact trusted paths the grammar accepted (a `~` is expanded here, as the
     shell would have)."""
-    if profile not in (MAIL, RESEARCH) or not read_only_command(command, profile):
+    if not read_only_command(command, profile):
         return None
     tokens = shlex.split(str(command).strip())
     words = set(str(command).split())
@@ -621,6 +486,12 @@ def read_argv(command, profile):
     return tokens
 
 
+def read_env():
+    """The read's environment: the gateway's, with HERMES_HOME on the root home, where the Google token lives
+    (a bot profile's home has none of the user's credentials files)."""
+    return {**os.environ, "HERMES_HOME": os.path.expanduser("~/.hermes")}
+
+
 def run_read(command, profile, *, timeout=COMMAND_TIMEOUT, cwd=None):
     """Run one read command (no shell) and return the tool result JSON."""
     argv = read_argv(command, profile)
@@ -629,7 +500,8 @@ def run_read(command, profile, *, timeout=COMMAND_TIMEOUT, cwd=None):
                        "no pipes or redirects; see the session's first message for the commands).")
     try:
         done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
-                              cwd=cwd or os.path.expanduser("~"), errors="replace")
+                              cwd=cwd or os.path.expanduser("~"), errors="replace",
+                              env=read_env())
     except FileNotFoundError:
         return neutral(f"Not run: {argv[0]} is not installed here.")
     except subprocess.TimeoutExpired:

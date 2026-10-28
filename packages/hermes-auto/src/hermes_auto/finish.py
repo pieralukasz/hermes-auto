@@ -35,7 +35,9 @@ def sync_finished(store, config, hermes_factory, installed, blocked=()):
                   and finishable(job, config, installed, blocked)]
     if not candidates:
         return []
-    states = hermes_factory().archive_states(job["session_id"] for job in candidates)
+    # Sessions live in their bot's profile (`jobs.profile`); each profile's state.db is read for its own.
+    states = hermes_factory().archive_states([(job["session_id"], job.get("profile") or "default")
+                                              for job in candidates])
     errors = []
     for job in candidates:
         state = states.get(job["session_id"])

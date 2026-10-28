@@ -52,14 +52,14 @@ class BackgroundHermes:
     def message_count(self, job):
         return self.messages
 
-    def inspect(self, session_id):
+    def inspect(self, session_id, profile=None):
         return {"exists": True, "last_active": None}
 
     def unarchive(self, session_id):
         pass
 
-    def archive_states(self, session_ids):
-        return {sid: False for sid in session_ids}
+    def archive_states(self, sessions):  # (session id, bot profile) pairs
+        return {sid: False for sid, _profile in sessions}
 
     def run(self, job, prompt):  # synchronous followup runs
         self.runs.append(job["id"])
