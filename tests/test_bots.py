@@ -10,7 +10,7 @@ from hermes_auto.hermes import Hermes
 from hermes_auto.runner import process_jobs
 from hermes_auto.store import Store
 
-TAPIN_PROJECT, ECMR_PROJECT = "6gRXxxmWCvfGjx7q", "6hRQcfPv9R8PqMgx"
+TAPIN_PROJECT, ECMR_PROJECT = "tapinProject0001", "ecmrProject00001"
 BOTS = {
     "default": "default", "inbox": "inbox",
     "read_only": {"inbox": {"reads": ["google", "todoist", "github", "linear", "slack"]}},
