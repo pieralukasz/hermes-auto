@@ -170,12 +170,14 @@ def process_jobs(store, config, hermes, blocked_sources=()):
         prompt = prompt_for(job, config, retry)
         continuation = retry  # a retry prompt continues an existing turn; it shows as typed
         try:
+            # The bot is chosen once, before the session exists, and stays with the job (its session lives in
+            # that profile). A job from before bots whose session was never created (a refused create being
+            # retried) gets its bot now; one with a real session in the default profile keeps it.
+            if not job.get("profile") and (job["status"] == "pending" or not hermes.exists(job)):
+                job = {**job, "profile": choose_bot(job, config)}
+                store.update(job["id"], profile=job["profile"])
             if job["status"] == "pending":
-                # ID was persisted at enqueue time, before any Hermes process starts. The bot is chosen once,
-                # before the session exists, and stays with the job (its session lives in that profile).
-                if not job.get("profile"):
-                    job = {**job, "profile": choose_bot(job, config)}
-                    store.update(job["id"], profile=job["profile"])
+                # ID was persisted at enqueue time, before any Hermes process starts.
                 store.update(job["id"], status="creating")
                 job = create_session(store, hermes, job, prompt)
                 store.update(job["id"], status="created")
