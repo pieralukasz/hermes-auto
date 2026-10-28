@@ -269,10 +269,11 @@ def bridged(call_id, name, arguments):
 @CONTRACT
 def test_open_sessions_are_imported_by_the_gateway_under_their_reserved_id(make_world):
     world = make_world()
-    brief = world.job("brief", title="Brief", mode="open", source="brief")
-    routed = world.job("routed", title="Routed", mode="open", source="brief", owner="acme")
+    brief = world.job("brief", title="Plans", mode="open", source="questions")
+    routed = world.job("routed", title="Routed", mode="open", source="questions", owner="acme")
     routed_example = world.job("routed2", title="Routed example", mode="open", source="example")
-    assert brief["profile"] == "default" and routed_example["profile"] == "inbox"
+    digest = world.job("digest", title="Brief", mode="open", source="brief")  # quotes other people: inbox
+    assert brief["profile"] == "default" and routed_example["profile"] == "inbox" and digest["profile"] == "inbox"
     for _ in range(2):  # idempotent
         assert world.hermes.create(brief, "Synthetic test context") == brief["session_id"]
     world.hermes.create(routed, "Synthetic test context")
@@ -381,20 +382,16 @@ def test_a_broken_bot_config_or_an_unready_bot_refuses_imports_too(make_world):
 
 
 @CONTRACT
-def test_the_gateway_refuses_more_tools_than_the_bot_profile_allows(make_world):
-    """The boundary is the profile: a launch asking the inbox bot for web search (bounded research of an
-    unsorted item) is refused by the gateway itself, and a full-tools job never reaches a read-only bot."""
+def test_a_read_only_bot_gets_read_only_launches_and_never_a_full_tools_job(make_world):
+    """A launch in the inbox bot is always read-only (research of an unsorted item included), and a full-tools job
+    never reaches a read-only bot."""
     world = make_world()
-    research = world.job("web", mode="research")
+    research = world.job("web", mode="research")  # an unsorted item asking for web research: read-only in inbox
     assert research["profile"] == "inbox"
-    with pytest.raises(RuntimeError):
-        world.hermes.create(research, "unused")
-    assert "GatewayRPCError: invalid_params" in (world.root / "last-error.json").read_text()  # the gateway's
-    draft = world.job("draft")  # the same launch without web (no tools at all) is accepted
-    assert world.hermes.create(draft, "unused") and world.count("inbox") == 1
-    with pytest.raises(RuntimeError, match="read-only bot"):
-        world.hermes.create({**world.job("task", source="todoist", mode="agent"), "profile": "inbox"}, "unused")
-    assert world.count("inbox") == 1
+    assert world.hermes.create(research, "unused") and world.count("inbox") == 1
+    # A task that somehow lands in the read-only bot gets the read-only launch there, never full tools.
+    world.hermes.create({**world.job("task", source="todoist", mode="agent"), "profile": "inbox"}, "unused")
+    assert world.count("inbox") == 2
 
 
 @CONTRACT
