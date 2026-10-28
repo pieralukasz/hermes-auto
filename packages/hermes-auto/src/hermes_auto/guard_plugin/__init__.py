@@ -1,6 +1,6 @@
 """hermes-auto-guard: Hermes plugin of the read-only inbox bots (install: `hermes-auto install-guard`).
 
-Enabled only in the profiles of those bots (e.g. `inbox`, `tapin-inbox`), never in Dolores' or a working bot's
+Enabled only in the profiles of those bots (e.g. `inbox`), never in Dolores' or a working bot's
 profile. Registers the `hermes-auto` toolset (one grammar-checked read command, raw skill reads) and a
 `pre_tool_call` hook that refuses every other tool in every session of that profile; the profile's own
 toolset configuration is the first layer. The read families come from `scope.json` beside the plugin in the
