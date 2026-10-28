@@ -125,12 +125,14 @@ class Store:
 
     def rebind_session(self, old, new):
         """Move every reference to session `old` (a job's reserved id) to `new` (the id Hermes gave it):
-        the job, routed replies and meta values such as a thread's session, in one transaction."""
+        the job, routed replies and the meta keys that hold a session id (a thread's session, the pending
+        create), in one transaction. Other meta values are left alone even when equal to `old`."""
         with self.db:
             self.db.execute("UPDATE jobs SET session_id=?,updated=CURRENT_TIMESTAMP WHERE session_id=?", (new, old))
             self.db.execute("UPDATE followups SET session_id=?,updated=CURRENT_TIMESTAMP WHERE session_id=?",
                             (new, old))
-            self.db.execute("UPDATE meta SET value=? WHERE value=?", (json.dumps(new), json.dumps(old)))
+            self.db.execute("UPDATE meta SET value=? WHERE value=? AND (key LIKE 'thread_session:%' OR key LIKE "
+                            "'create:%')", (json.dumps(new), json.dumps(old)))
 
     def background_runs(self):
         """IDs of `running` jobs that have a background run handle; `collect` settles them, not recovery."""

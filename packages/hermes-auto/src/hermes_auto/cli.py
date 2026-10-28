@@ -466,9 +466,11 @@ def dispatch(args, home, config, store):
         else:
             if job["status"] != "needs_attention":
                 raise ValueError("Only needs_attention jobs can be retried; use new-session for a fresh conversation")
-            if not Hermes(config, home).exists(job):
+            if not Hermes(config, home).exists(job) and not store.get_meta(f"create:{job['id']}"):
                 store.update(job["id"], status="deleted", error="Session is missing; use new-session explicitly")
                 raise ValueError("The session was deleted; it will not be recreated by retry")
+            # A create the bridge refused (or interrupted) left `create:<job>`: the retry finishes that
+            # create with the same creation key instead of calling the session deleted.
             store.update(job["id"], status="retry_pending", error="")
         print("Queued. Run 'hermes-auto run' or wait for the next scheduled check.")
     elif command == "retry-followup":

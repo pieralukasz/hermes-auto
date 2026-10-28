@@ -12,6 +12,7 @@ grammar proves to be reads, and the ``pre_tool_call`` hook refuses every other t
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shlex
@@ -20,7 +21,7 @@ import sys
 import time
 
 GUARD_NAME = "hermes-auto-guard"
-GUARD_VERSION = "1.0.0"
+GUARD_VERSION = "1.1.0"
 TOOLSET = "hermes-auto"
 READ_TOOL = "hermes_auto_read"
 SKILL_VIEW_TOOL = "hermes_auto_skill_view"
@@ -37,8 +38,9 @@ ALLOWED_TOOLS = {MAIL: frozenset(PLUGIN_TOOLS) | {"session_search"},
                  RESEARCH: frozenset(PLUGIN_TOOLS) | {"session_search"},
                  PRIVATE: frozenset()}
 # Tools a "full" automatic turn may not run without a human: arbitrary local code outside the terminal's
-# command approval (Hermes asks before execute_code in an attended session).
-FULL_REFUSED_TOOLS = frozenset({"execute_code"})
+# command approval (Hermes asks before execute_code in an attended session) and desktop control (each
+# computer_use action goes through Hermes' approval gate, which `approvals.mode: off` approves).
+FULL_REFUSED_TOOLS = frozenset({"execute_code", "computer_use"})
 OUTPUT_LIMIT = 30000
 COMMAND_TIMEOUT = 120
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
@@ -378,11 +380,22 @@ def read_registration(hermes_home, session_id):
     try:
         with open(path, encoding="utf-8") as stream:
             data = json.load(stream)
-        if not isinstance(data, dict) or data.get("profile") not in PROFILES:
+        if not valid_registration(data):
             raise ValueError("bad registration")
         return data
     except (OSError, ValueError):
         return {"version": 1, "profile": PRIVATE, "until": None, "job": None}
+
+
+def valid_registration(data):
+    """The exact shape write_registration writes: version 1, a known profile, `until` None or a finite
+    number (not a bool). Anything else (a hand-edited or truncated file) is not trusted."""
+    if not isinstance(data, dict) or data.get("version") != 1 or data.get("profile") not in PROFILES:
+        return False
+    until = data.get("until", "missing")
+    if until is None:
+        return True
+    return isinstance(until, (int, float)) and not isinstance(until, bool) and math.isfinite(until)
 
 
 def active(entry, now=None):
@@ -393,6 +406,20 @@ def active(entry, now=None):
         return True
     until = entry.get("until")
     return isinstance(until, (int, float)) and not isinstance(until, bool) and (now or time.time()) < until
+
+
+def active_full_registration(hermes_home, now=None):
+    """Whether some "full" automatic turn is running now (its registration's `until` is in the future)."""
+    try:
+        with os.scandir(registry_dir(hermes_home)) as entries:
+            names = [item.name[:-5] for item in entries if item.name.endswith(".json")]
+    except OSError:
+        return False
+    for name in names:
+        entry = read_registration(hermes_home, name)
+        if entry is not None and entry["profile"] == FULL and active(entry, now):
+            return True
+    return False
 
 
 def has_registrations(hermes_home):
@@ -412,6 +439,22 @@ REFUSED_READ = ("Not run: this automatic step only reads (third-party content). 
 REFUSED_PRIVATE = "Not run: no tools in this automatic step (private third-party content). Answer from the conversation only."
 REFUSED_FULL = ("Not run: this automatic run cannot ask the user to approve {what}. Find another way, or "
                 "prepare it and leave it for the user's approval.")
+
+
+REFUSED_PROFILE = ("Not run: this automatic step may search only this profile's conversations (no `profile`, "
+                   "no `profile/id` session links).")
+REFUSED_GUARD_FILES = "Not run: an automatic run may not change hermes-auto's guard or its session registry."
+
+
+def own_profile_search(args):
+    """session_search arguments that stay in the current profile: no `profile` (Hermes opens another
+    profile's state.db for it) and no `<profile>/<id>` session link (it adopts the embedded profile)."""
+    if not isinstance(args, dict):
+        return False
+    if str(args.get("profile") or "").strip():
+        return False
+    session_id = args.get("session_id")
+    return session_id is None or (isinstance(session_id, str) and "/" not in session_id)
 
 
 # Hermes' Tool Search bridge: plugin tools and session_search are deferred behind it, so a read session
@@ -438,17 +481,53 @@ def bridged_names(args):
     return frozenset(str(call.get("name") or "") if isinstance(call, dict) else "" for call in calls)
 
 
-def decide(tool_name, args, entry, dangerous=None, now=None):
+WRITE_TOOLS = frozenset({"write_file", "patch"})
+PATCH_FILE = re.compile(r"^\*\*\* (?:Update File|Add File|Delete File|Move to):\s*(.+?)\s*$", re.M)
+GUARD_MARK = GUARD_NAME  # both the plugin directory and the registry directory carry this name
+
+
+def write_paths(tool_name, args):
+    """Every path a write_file/patch call would touch (`path`, and the files a V4A patch names)."""
+    if tool_name not in WRITE_TOOLS or not isinstance(args, dict):
+        return []
+    paths = [str(args["path"])] if args.get("path") else []
+    if isinstance(args.get("patch"), str):
+        paths += PATCH_FILE.findall(args["patch"])
+    return paths
+
+
+def touches_guard(paths, homes=None):
+    """A path inside the guard plugin or its registry (after `~` expansion and realpath), in any Hermes home."""
+    roots = []
+    for home in homes or hermes_homes():
+        roots += [os.path.join(home, GUARD_MARK), os.path.join(home, "plugins", GUARD_MARK)]
+    roots = [os.path.realpath(root) for root in roots]
+    for path in paths:
+        expanded = os.path.expanduser(str(path))
+        if not os.path.isabs(expanded):
+            expanded = os.path.join(os.path.expanduser("~"), expanded)  # automatic sessions run in ~
+        for candidate in (os.path.normpath(expanded), os.path.realpath(expanded)):
+            if any(candidate == root or candidate.startswith(root + os.sep) for root in roots):
+                return True
+    return False
+
+
+def decide(tool_name, args, entry, dangerous=None, now=None, gated_write=None):
     """The block message for one tool call of a registered session, or None to let it run.
 
-    `dangerous(command) -> bool` is Hermes' own approval detector (tools.approval), injected so this stays
-    pure. Read profiles allow only their tool list; "full" refuses, while its automatic turn runs, what
-    an attended session would have to approve."""
+    `dangerous(command) -> bool` is Hermes' own approval detector (tools.approval) and
+    `gated_write(paths) -> bool` its approval-gated write paths (SSH config, protected instruction
+    files), injected so this stays pure; when one is missing the call is refused. Read profiles allow
+    only their tool list; "full" refuses, while its automatic turn runs, what an attended session would
+    have to approve (with `approvals.mode: off` Hermes would approve it on its own) and any change to
+    the guard itself."""
     if not active(entry, now):
         return None
     profile = entry["profile"]
     if profile in DENY_PROFILES:
         allowed = ALLOWED_TOOLS.get(profile, frozenset())
+        if tool_name == "session_search" and "session_search" in allowed and not own_profile_search(args):
+            return REFUSED_PROFILE
         if tool_name in allowed or (allowed and tool_name in CATALOG_TOOLS):
             return None
         if allowed and tool_name == "tool_call" and bridged_names(args) <= allowed and bridged_names(args):
@@ -460,9 +539,56 @@ def decide(tool_name, args, entry, dangerous=None, now=None):
         command = (args or {}).get("command") if isinstance(args, dict) else None
         if not isinstance(command, str) or dangerous is None:
             return REFUSED_FULL.format(what="this command")
+        if GUARD_MARK in command:
+            return REFUSED_GUARD_FILES
         if dangerous(command):
             return REFUSED_FULL.format(what="this command")
+    if tool_name in WRITE_TOOLS:
+        paths = write_paths(tool_name, args)
+        if touches_guard(paths):
+            return REFUSED_GUARD_FILES
+        if gated_write is None or gated_write(paths):
+            return REFUSED_FULL.format(what="this write")
     return None
+
+
+# --- Skill reads (raw text: no template rendering, inline shell or dependency install) ---------------
+
+SKILL_TEXT_LIMIT = 60000
+SKILL_SUBDIRS = ("references", "templates", "scripts", "assets")
+
+
+def read_skill_text(skill_md, file_path=None):
+    """The raw text of a skill's SKILL.md, or of one file inside its directory, as a tool result.
+
+    Hermes' own skill_view renders SKILL.md (template variables, `!`command`` inline shell when enabled)
+    and installs declared `deps`; a third-party-steered session gets only the bytes on disk."""
+    skill_md = os.path.realpath(str(skill_md))
+    skill_dir = os.path.dirname(skill_md)
+    target = skill_md
+    if file_path:
+        relative = str(file_path)
+        if os.path.isabs(relative) or ".." in relative.replace("\\", "/").split("/"):
+            return neutral("Not run: give a relative path inside the skill, e.g. references/x.md.")
+        target = os.path.realpath(os.path.join(skill_dir, relative))
+        if not target.startswith(skill_dir + os.sep) or not os.path.isfile(target):
+            return neutral(f"Not found in this skill: {relative}.")
+    try:
+        with open(target, encoding="utf-8", errors="replace") as stream:
+            text = stream.read(SKILL_TEXT_LIMIT + 1)
+    except OSError as exc:
+        return neutral(f"Could not read the skill file ({exc.__class__.__name__}).")
+    if len(text) > SKILL_TEXT_LIMIT:
+        text = text[:SKILL_TEXT_LIMIT] + f"\n[... truncated at {SKILL_TEXT_LIMIT} characters]"
+    result = {"success": True, "path": target, "content": text}
+    if not file_path:
+        linked = []
+        for sub in SKILL_SUBDIRS:
+            base = os.path.join(skill_dir, sub)
+            for root, _dirs, files in os.walk(base):
+                linked += [os.path.relpath(os.path.join(root, name), skill_dir) for name in sorted(files)]
+        result["linked_files"] = sorted(linked)[:200]
+    return json.dumps(result, ensure_ascii=False)
 
 
 # --- The read tool -------------------------------------------------------------------------------------

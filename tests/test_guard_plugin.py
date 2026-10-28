@@ -19,6 +19,7 @@ def home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(plugin, "_dangerous", lambda command: command.startswith("rm -rf"))
+    monkeypatch.setattr(plugin, "_gated_write", lambda paths: any(path.endswith(".ssh/config") for path in paths))
     plugin._parents.clear()
     return home
 
@@ -115,6 +116,88 @@ def test_a_delegated_child_or_compression_continuation_keeps_the_restrictions(ho
     policy.write_registration(home, "r1", "research")
     sqlite3.connect(home / "state.db").execute("INSERT INTO sessions VALUES ('r1-next', 'r1')").connection.commit()
     assert hook("terminal", {}, session_id="r1-next")["action"] == "block"
+
+
+def test_a_full_run_refuses_gated_writes_desktop_control_and_changes_to_the_guard(home):
+    policy.write_registration(home, "s1", "full", until=time.time() + 600)
+    assert hook("write_file", {"path": "~/.ssh/config"})["action"] == "block"
+    assert hook("patch", {"mode": "patch", "patch": "*** Begin Patch\n*** Update File: notes.md\n*** Update File: "
+                          "~/.ssh/config\n*** End Patch"})["action"] == "block"
+    assert hook("computer_use", {"action": "click"})["action"] == "block"
+    registry = policy.registration_path(home, "s1")
+    for args in ({"path": registry}, {"path": str(home / "plugins" / "hermes-auto-guard" / "policy.py")}):
+        assert "guard" in hook("write_file", args)["message"]
+    assert "guard" in hook("terminal", {"command": f"echo x > {registry}"})["message"]
+    assert hook("patch", {"path": "notes.md", "old_string": "a", "new_string": "b"}) is None
+
+
+def test_gated_write_detector_failure_refuses_the_write(home, monkeypatch):
+    policy.write_registration(home, "s1", "full", until=time.time() + 600)
+    monkeypatch.setattr(plugin, "_gated_write", lambda paths: (_ for _ in ()).throw(ImportError("moved")))
+    with pytest.raises(ImportError):  # Hermes turns a raising pre_tool_call into a refusal
+        hook("write_file", {"path": "notes.md"})
+
+
+@pytest.mark.parametrize("data", [{"profile": "full"}, {"version": 1, "profile": "full", "until": "broken"},
+                                  {"version": 1, "profile": "full", "until": float("nan")},
+                                  {"version": 1, "profile": "full", "until": True},
+                                  {"version": 2, "profile": "full", "until": 0}, ["full"]])
+def test_a_registration_not_in_the_written_shape_is_the_strictest_profile(home, data):
+    path = policy.registration_path(home, "s1")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as stream:
+        stream.write(json.dumps(data))
+    assert policy.read_registration(home, "s1")["profile"] == "private"
+    assert hook("execute_code")["action"] == "block"
+
+
+@pytest.mark.parametrize("profile", ["mail", "research"])
+def test_session_search_stays_in_this_profile(home, profile):
+    policy.write_registration(home, "s1", profile)
+    assert hook("session_search", {"query": "invoice"}) is None
+    assert hook("session_search", {"session_id": "20261028_x", "around_message_id": 3}) is None
+    assert hook("session_search", {"query": "secret", "profile": "work"})["action"] == "block"
+    assert hook("session_search", {"session_id": "work/20261028_x"})["action"] == "block"
+
+
+def make_lineage(home, chain):
+    db = sqlite3.connect(home / "state.db")
+    db.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, parent_session_id TEXT)")
+    db.executemany("INSERT INTO sessions VALUES (?,?)", list(zip(chain, [None] + chain[:-1])))
+    db.commit()
+    db.close()
+
+
+def test_a_long_lineage_keeps_the_restrictions(home):
+    chain = [f"c{index}" for index in range(12)]
+    make_lineage(home, chain)
+    policy.write_registration(home, "c0", "research")
+    assert hook("terminal", {}, session_id="c11")["action"] == "block"
+
+
+def test_an_unreadable_lineage_blocks_only_while_a_full_turn_may_be_ours(home):
+    (home / "state.db").write_text("not a database")
+    policy.write_registration(home, "r1", "research")
+    assert hook("terminal", {"command": "ls"}, session_id="user-session") is None  # no full turn running
+    policy.write_registration(home, "f1", "full", until=time.time() + 600)
+    with pytest.raises(sqlite3.Error):  # a raising hook is a refusal in Hermes
+        hook("terminal", {"command": "ls"}, session_id="maybe-a-child")
+
+
+def test_skills_are_read_as_raw_text_inside_their_directory(tmp_path):
+    skill = tmp_path / "skills" / "demo"
+    (skill / "references").mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: demo\ndeps: [ffmpeg]\n---\nRun !`date` now ${HERMES_SKILL_DIR}\n")
+    (skill / "references" / "a.md").write_text("ref")
+    (tmp_path / "secret.txt").write_text("secret")
+    shown = json.loads(policy.read_skill_text(skill / "SKILL.md"))
+    assert "!`date`" in shown["content"] and "${HERMES_SKILL_DIR}" in shown["content"]  # nothing rendered
+    assert shown["linked_files"] == ["references/a.md"]
+    assert json.loads(policy.read_skill_text(skill / "SKILL.md", "references/a.md"))["content"] == "ref"
+    for bad in ("../secret.txt", str(tmp_path / "secret.txt"), "references/../../secret.txt", "missing.md"):
+        assert json.loads(policy.read_skill_text(skill / "SKILL.md", bad))["skipped"] is True
+    os.symlink(tmp_path / "secret.txt", skill / "references" / "link.md")
+    assert json.loads(policy.read_skill_text(skill / "SKILL.md", "references/link.md"))["skipped"] is True
 
 
 # ── The read tool and the skill tools ────────────────────────────────────────

@@ -114,7 +114,7 @@ def approvals_unattended_unsafe():
 
 def guard_required(profile):
     policy = guard_policy()
-    return profile in (policy.MAIL, policy.RESEARCH) or (profile == policy.FULL and approvals_unattended_unsafe())
+    return profile in policy.DENY_PROFILES or (profile == policy.FULL and approvals_unattended_unsafe())
 
 
 def plugin_version():
@@ -146,8 +146,9 @@ def guard_message(status):
     else:
         why = f"hermes-auto-guard is loaded but not active ({status.get('error') or 'disabled or incomplete'})"
     return (f"Refused: {why}. Sessions with third-party content (and full-tools runs while approvals are off) "
-            "run only behind it. Run `hermes-auto install-guard`, then reload the gateway's plugins "
-            "(`hermes-auto install-guard` prints how); nothing was sent to the session.")
+            "run only behind it. Run `hermes-auto install-guard` and enable it as it prints, load it with "
+            "`hermes-auto guard-reload` (or restart Hermes.app), then `hermes-auto retry` the job; nothing was "
+            "sent to the session.")
 
 
 async def require_guard(client, profile):
@@ -170,7 +171,10 @@ def run_gateway(work):
 def title_owner(hermes_home, title):
     """Read-only: the session holding `title`, or None (Hermes keeps titles unique)."""
     import sqlite3
-    conn = sqlite3.connect(Path(hermes_home, "state.db").as_uri() + "?mode=ro", uri=True, timeout=10)
+    path = Path(hermes_home, "state.db")
+    if not path.exists():
+        return None  # a fresh home: the gateway creates state.db with its first session
+    conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=10)
     try:
         row = conn.execute("SELECT id FROM sessions WHERE title=? LIMIT 1", (title,)).fetchone()
     finally:
@@ -252,10 +256,12 @@ def create_open_session(request, config, job, db):
     session = {"id": sid, "source": "cli", "title": title, "started_at": now, "hidden": int(bool(request.get("hidden"))),
                "messages": [{"role": "user", "content": request["prompt"], "timestamp": now},
                             {"role": "assistant", "content": request["open_message"], "timestamp": now + 0.001}]}
-    provider = route_kwargs(request).get("provider")
-    if provider:
-        # Desktop resumes a session on model_config.provider: a routed brief keeps its account.
-        session["model_config"] = {"provider": provider}
+    route = route_kwargs(request)
+    if route:
+        # Desktop resumes a session on model / model_config: a routed brief keeps its account and model.
+        session["model_config"] = dict(route)
+        if route.get("model"):
+            session["model"] = route["model"]
 
     async def work(client):
         return await client.rpc("session.mutate", session_id=sid, request_id=f"hermes-auto-import:{sid}",
@@ -312,10 +318,17 @@ def run_session(request, config, job):
         policy.write_registration(home, sid, profile, until=time.time() + params["run_budget"] + 300,
                                   job=job.get("id"))
     try:
-        return run_gateway(work)
-    finally:
-        if profile == policy.FULL:
+        result = run_gateway(work)
+    except Refusal:
+        if profile == policy.FULL:  # refused before anything was submitted: nothing runs
             policy.write_registration(home, sid, profile, until=0, job=job.get("id"))
+        raise
+    if profile == policy.FULL:
+        # Lifted only once the turn's result arrived. A lost connection leaves the turn possibly still
+        # running in the gateway, so the restriction then stays until its deadline (the gateway stops the
+        # turn at run_budget).
+        policy.write_registration(home, sid, profile, until=0, job=job.get("id"))
+    return result
 
 
 def doctor(config, db):
@@ -323,9 +336,11 @@ def doctor(config, db):
     guard plugin in the running gateway, and the read-only state.db API the sorter uses."""
     from hermes_cli.gateway_chat_view import GatewayChatView
     from hermes_cli.stream_json import StreamJsonEmitter
+    from hermes_state import SessionDB
     from agent.auxiliary_client import call_llm
     assert callable(call_llm) and callable(GatewayChatView.run) and callable(StreamJsonEmitter.emit_result)
-    assert callable(db.get_compression_lineage) and callable(db.resolve_resume_session_id)
+    assert callable(SessionDB.get_compression_lineage) and callable(SessionDB.resolve_resume_session_id)
+    assert "read_only" in SessionDB.__init__.__code__.co_varnames
 
     async def work(client):
         contract = (await client.rpc("runtime.describe")).get("session_create") or {}
@@ -605,6 +620,36 @@ def reply_delivered(db_path, session_ids, needles):
         conn.close()
 
 
+class ReadOnlySessions:
+    """Hermes' SessionDB opened read-only, on first use (a fresh home has no state.db until the gateway
+    creates its first session). The gateway is the only writer; nothing here can migrate or checkpoint."""
+
+    def __init__(self, path):
+        self.path, self.db = Path(path), None
+
+    def _open(self):
+        if self.db is None and self.path.exists():
+            from hermes_state import SessionDB
+            self.db = SessionDB(db_path=self.path, read_only=True)
+        return self.db
+
+    def get_session(self, session_id):
+        db = self._open()
+        return db.get_session(session_id) if db is not None and session_id else None
+
+    def get_compression_lineage(self, session_id):
+        return self._open().get_compression_lineage(session_id)
+
+    def resolve_resume_session_id(self, session_id):
+        db = self._open()
+        return db.resolve_resume_session_id(session_id) if db is not None else None
+
+    def close(self):
+        if self.db is not None:
+            self.db.close()
+            self.db = None
+
+
 def main():
     request = json.loads(Path(sys.argv[1]).read_text())
     config = request["config"]
@@ -619,9 +664,7 @@ def main():
     # so a routed provider's key_env (e.g. a work account) resolved to the no-key placeholder → 401.
     from hermes_cli.env_loader import load_hermes_dotenv
     load_hermes_dotenv(hermes_home=config["hermes_home"])
-    from hermes_state_registry import acquire
-
-    db = acquire(Path(config["hermes_home"]) / "state.db")
+    db = ReadOnlySessions(Path(config["hermes_home"]) / "state.db")
     action = request["action"]
     job = request.get("job", {})
     sid = job.get("session_id")

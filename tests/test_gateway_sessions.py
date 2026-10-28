@@ -102,3 +102,57 @@ def test_a_bridge_refusal_reaches_the_job_as_written(tmp_path):
     with pytest.raises(RuntimeError, match=r"^Refused: use `hermes-auto new-session 7`\.$"):
         hermes.parse("run", 3, "", stderr)
     assert "hermes-auto-refusal" in json.loads((tmp_path / "last-error.json").read_text())["error"]
+
+
+def test_a_create_refused_until_the_guard_is_active_can_be_retried(store, config, tmp_path, monkeypatch):
+    """The bridge refused the create (guard not loaded yet): nothing exists in Hermes, `create:<job>` stays,
+    and `hermes-auto retry` after activation finishes that create instead of marking the job deleted."""
+    import argparse
+
+    from hermes_auto import cli
+
+    class Refusing(FakeHermes):
+        refuse = True
+
+        def create(self, job, prompt):
+            if self.refuse:
+                raise RuntimeError("Refused: the running Hermes gateway has not loaded the hermes-auto-guard plugin")
+            return super().create(job, prompt)
+    hermes = Refusing()
+    store.enqueue("e1", "example", "1", "Title", "draft", {})
+    store.db.commit()
+    reserved = store.rows()[0]["session_id"]
+    process_jobs(store, config, hermes)
+    job = store.rows()[0]
+    assert job["status"] == "needs_attention" and "hermes-auto-guard" in job["error"]
+    assert hermes.sessions == set() and store.get_meta(f"create:{job['id']}") == reserved
+    monkeypatch.setattr(cli, "Hermes", lambda *args: hermes)
+    cli.dispatch(argparse.Namespace(command="retry", job_id=job["id"]), tmp_path, config, store)
+    assert store.rows()[0]["status"] == "retry_pending"
+    hermes.refuse = False
+    process_jobs(store, config, hermes)
+    job = store.rows()[0]
+    assert job["status"] == "running" and job["session_id"] == "local-" + reserved
+
+
+def test_retry_of_a_session_deleted_by_the_user_still_refuses(store, config, tmp_path, monkeypatch):
+    import argparse
+
+    from hermes_auto import cli
+    store.enqueue("e1", "example", "1", "Title", "draft", {})
+    store.db.commit()
+    job = store.rows()[0]
+    store.update(job["id"], status="needs_attention")
+    monkeypatch.setattr(cli, "Hermes", lambda *args: FakeHermes())
+    with pytest.raises(ValueError, match="will not be recreated"):
+        cli.dispatch(argparse.Namespace(command="retry", job_id=job["id"]), tmp_path, config, store)
+    assert store.rows()[0]["status"] == "deleted"
+
+
+def test_rebinding_moves_only_session_references(store):
+    store.set_meta("thread_session:gmail:a:t1", "old-id")
+    store.set_meta("create:7", "old-id")
+    store.set_meta("cursor:example", "old-id")  # an unrelated value that happens to be equal
+    store.rebind_session("old-id", "new-id")
+    assert store.get_meta("thread_session:gmail:a:t1") == "new-id" and store.get_meta("create:7") == "new-id"
+    assert store.get_meta("cursor:example") == "old-id"

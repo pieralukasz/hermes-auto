@@ -51,6 +51,8 @@ def activation_steps(hermes_home):
             "  hermes config set plugins.enabled '[<existing names>, hermes-auto-guard]'\n"
             "Keep its toolset out of your own sessions (only hermes-auto's sessions name it):\n"
             "  hermes config set known_plugin_toolsets.cli '[<existing names>, hermes-auto]'\n"
-            "Then load it into the running gateway: `hermes plugins reload` if your Hermes has it, otherwise "
-            "restart the gateway (Hermes.app). `hermes-auto doctor` shows guard.ok = true once it is active; "
-            "until then sessions with third-party content are refused.")
+            "Then load it into the running gateway: `hermes-auto guard-reload` (the gateway's reload-plugins, "
+            "what `hermes plugins enable` sends; open conversations keep running) or restart Hermes.app. "
+            "`hermes-auto doctor` shows guard.ok = true once it is active; until then sessions with third-party "
+            "content (and full-tools runs while approvals are off) are refused, and `hermes-auto retry <job>` "
+            "finishes a refused job afterwards.")

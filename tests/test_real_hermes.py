@@ -158,7 +158,7 @@ class World:
         self.config = {**defaults(), "hermes_home": str(self.home),
                        "hermes_python": os.environ["HERMES_AUTO_TEST_PYTHON"],
                        "hermes_source": os.environ["HERMES_AUTO_TEST_SOURCE"],
-                       "routes": [{"match": {"source": "example"}, "provider": "work-test"}]}
+                       "routes": [{"match": {"source": "example"}, "provider": "work-test", "model": "test-model"}]}
         self.store = Store(root, initialize=True)
         self.hermes = Hermes(self.config, root)
 
@@ -238,11 +238,12 @@ def test_open_sessions_are_imported_by_the_gateway_under_their_reserved_id(make_
     assert world.hermes.find_session(subject="Synthetic subject", sent=[{"ts": 1.0, "to": []}]) is None
     db = world.db()
     try:
-        rows = {row["id"]: row for row in db.execute("SELECT id, title, json_extract(model_config, '$.provider') "
-                                                      "AS provider FROM sessions")}
+        rows = {row["id"]: row for row in db.execute("SELECT id, title, model, json_extract(model_config, "
+                                                      "'$.provider') AS provider FROM sessions")}
     finally:
         db.close()
     assert rows[brief["session_id"]]["title"] == "Brief" and rows[routed["session_id"]]["provider"] == "work-test"
+    assert rows[routed["session_id"]]["model"] == "test-model"  # the route's model, not only its account
 
 
 @CONTRACT
@@ -250,6 +251,8 @@ def test_sorted_run_reads_through_the_guard_and_shows_the_card(make_world):
     """Real gateway, fake model: the transcript shows the card while the full prompt is the api_content; the
     session's tools are the guard's reads only; reads run, a refused command gets a neutral result."""
     world = make_world([([bridged("toolu_list", "hermes_auto_skills_list", {}),
+                          bridged("toolu_skill", "hermes_auto_skill_view", {"name": "no-such-skill"}),
+                          bridged("toolu_other", "session_search", {"query": "x", "profile": "work"}),
                           bridged("toolu_td", "hermes_auto_read", {"command": "td today --json"}),
                           bridged("toolu_git", "hermes_auto_read", {"command": "git log -3"}),
                           {"type": "tool_use", "id": "toolu_term", "name": "terminal", "input": {"command": "echo x"}},
@@ -284,6 +287,8 @@ def test_sorted_run_reads_through_the_guard_and_shows_the_card(make_world):
     tools = world.tool_results(sid)
     assert tools["toolu_td"] == {"output": "synthetic td: today --json\n", "exit_code": 0}
     assert tools["toolu_list"]["success"] is True
+    assert tools["toolu_skill"]["skipped"] is True and "no-such-skill" in tools["toolu_skill"]["note"]
+    assert "only this profile" in str(tools["toolu_other"])
     assert tools["toolu_git"]["skipped"] is True and "error" not in tools["toolu_git"]
     assert "does not exist" in str(tools["toolu_term"]) and "Not run" in str(tools["toolu_term2"])
 

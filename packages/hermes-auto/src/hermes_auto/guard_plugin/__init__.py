@@ -26,20 +26,21 @@ def _home():
         return os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
 
 
+MAX_ANCESTORS = 64
+
+
 def _parent(home, session_id):
     """The parent row of `session_id` (a delegated child's parent, or the session a compression continued),
-    read-only and cached; None when it has none or state.db cannot be read."""
+    read-only and cached; None when it has none. Raises sqlite3.Error when state.db cannot be read: "no
+    parent" and "could not tell" are different answers."""
     cached = _parents.get(session_id)
     if cached is not None and (cached[0] is not None or time.monotonic() - cached[1] < PARENT_TTL):
         return cached[0]
+    conn = sqlite3.connect(f"file:{os.path.join(home, 'state.db')}?mode=ro", uri=True, timeout=5)
     try:
-        conn = sqlite3.connect(f"file:{os.path.join(home, 'state.db')}?mode=ro", uri=True, timeout=2)
-        try:
-            row = conn.execute("SELECT parent_session_id FROM sessions WHERE id=?", (session_id,)).fetchone()
-        finally:
-            conn.close()
-    except sqlite3.Error:
-        return None
+        row = conn.execute("SELECT parent_session_id FROM sessions WHERE id=?", (session_id,)).fetchone()
+    finally:
+        conn.close()
     parent = row[0] if row and row[0] else None
     _parents[session_id] = (parent, time.monotonic())
     return parent
@@ -53,15 +54,16 @@ def _entry(session_id):
     entry = policy.read_registration(home, session_id)
     if entry is not None or not policy.has_registrations(home):
         return entry
-    current = session_id
-    for _ in range(4):
+    current, seen = session_id, {session_id}
+    for _ in range(MAX_ANCESTORS):
         current = _parent(home, current)
-        if not current:
+        if not current or current in seen:
             return None
+        seen.add(current)
         entry = policy.read_registration(home, current)
         if entry is not None:
             return entry
-    return None
+    return None  # a lineage this deep is a long-lived conversation of the user's, not an automatic run
 
 
 def _dangerous(command):
@@ -69,20 +71,33 @@ def _dangerous(command):
     return bool(detect_dangerous_command(command)[0])
 
 
+def _gated_write(paths):
+    """Whether Hermes would ask before this write (SSH client config, protected instruction files)."""
+    from agent.file_safety import is_write_approval_required
+    from tools.file_tools_write_guards import _protected_instruction_config, _protected_instruction_reason
+    enabled, extra = _protected_instruction_config()
+    resolved = [os.path.join(os.path.expanduser("~"), os.path.expanduser(path)) for path in paths]  # cwd is ~
+    return any(is_write_approval_required(path)
+               or (enabled and _protected_instruction_reason(path, enabled=enabled, extra_patterns=extra))
+               for path in resolved)
+
+
 def pre_tool_call(tool_name=None, args=None, session_id="", task_id="", **_):
     """Refuse what an automatic session may not run. An exception here is a refusal (Hermes fails a raising
-    pre_tool_call closed), so only the cheap "not ours" path is guarded against errors."""
+    pre_tool_call closed). When the session's lineage cannot be read, the call is refused only if it may
+    be ours: the session itself is registered, or a "full" automatic turn is running right now."""
     sid = session_id or task_id or ""
+    home = _home()
     try:
         entry = _entry(sid)
-    except Exception:  # noqa: BLE001 - never break the user's own sessions
-        logger.debug("hermes-auto-guard: registry read failed for %s", sid, exc_info=True)
-        if sid and os.path.exists(policy.registration_path(_home(), sid) or ""):
+    except Exception:  # noqa: BLE001 - never break the user's own sessions without cause
+        logger.warning("hermes-auto-guard: could not resolve session %s", sid, exc_info=True)
+        if (sid and os.path.exists(policy.registration_path(home, sid) or "")) or policy.active_full_registration(home):
             raise
         return None
     if entry is None:
         return None
-    message = policy.decide(tool_name, args, entry, dangerous=_dangerous)
+    message = policy.decide(tool_name, args, entry, dangerous=_dangerous, gated_write=_gated_write)
     return {"action": "block", "message": message} if message else None
 
 
@@ -99,12 +114,18 @@ def read_tool(args, **kwargs):
 
 
 def skill_view_tool(args, **kwargs):
+    """The raw text of an enabled skill (policy.read_skill_text): Hermes' skill_view would render inline
+    shell and install the skill's declared dependencies, which a read-only session must not trigger."""
     if _registered(kwargs) is None:
         return policy.neutral("Not run: this tool works only in hermes-auto's automatic sessions.")
-    from tools.skills_tool import skill_view
+    from tools.skills_tool import _skill_catalog
     args = args or {}
-    return skill_view(str(args.get("name") or ""), file_path=args.get("file_path") or None,
-                      task_id=kwargs.get("task_id"))
+    name = str(args.get("name") or "").strip()
+    matches = [item for item in _skill_catalog()
+               if name and name in (item.get("load_name"), item.get("name"), item.get("relative_path"))]
+    if len({str(item.get("path")) for item in matches}) != 1:
+        return policy.neutral(f"No single enabled skill named {name!r}; use hermes_auto_skills_list.")
+    return policy.read_skill_text(matches[0]["path"], args.get("file_path") or None)
 
 
 def skills_list_tool(args, **kwargs):

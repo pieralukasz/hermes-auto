@@ -298,20 +298,21 @@ def test_bridge_inspect_reports_owner_and_delivery(tmp_path, monkeypatch, capsys
     (source / "hermes_cli" / "active_sessions.py").write_text(
         "def active_session_registry_snapshot():\n    return [{'session_id': 'S1', 'surface': 'desktop'}]\n")
     (source / "hermes_cli" / "env_loader.py").write_text("def load_hermes_dotenv(**kwargs):\n    return []\n")
-    (source / "hermes_state_registry.py").write_text(
-        "class DB:\n"
+    (source / "hermes_state.py").write_text(
+        "class SessionDB:\n"
+        "    def __init__(self, db_path=None, read_only=False):\n        assert read_only\n"
         "    def get_session(self, sid):\n        return {'message_count': 3, 'archived': 0, 'last_activity_at': 1.0}\n"
         "    def get_compression_lineage(self, sid):\n        return [sid]\n"
         "    def resolve_resume_session_id(self, sid):\n        return sid\n"
-        "    def close(self):\n        pass\n"
-        "def acquire(path):\n    return DB()\n")
+        "    def close(self):\n        pass\n")
+    (tmp_path / "state.db").write_bytes(b"")
     request = tmp_path / "request.json"
     request.write_text(json.dumps({"action": "inspect", "job": {"session_id": "S1"}, "needles": ["a", "b"],
                                    "config": {"hermes_home": str(tmp_path), "hermes_source": str(source)}}))
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(sys, "argv", ["bridge", str(request)])
     monkeypatch.setattr(sys, "path", list(sys.path))
-    for name in ("hermes_bootstrap", "hermes_state_registry", "hermes_cli", "hermes_cli.active_sessions",
+    for name in ("hermes_bootstrap", "hermes_state", "hermes_cli", "hermes_cli.active_sessions",
                  "hermes_cli.env_loader"):
         monkeypatch.delitem(sys.modules, name, raising=False)
     monkeypatch.setattr(bridge, "reply_delivered", lambda path, ids, needles: False)
