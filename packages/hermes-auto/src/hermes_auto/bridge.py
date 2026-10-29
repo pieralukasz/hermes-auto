@@ -79,7 +79,7 @@ def launch_plan(request, config):
 
     The toolsets are the first boundary and the gateway freezes them: third-party mail and Slack/GitHub
     research get only the guard plugin's read toolset and past-session search (no terminal, files,
-    skill_manage or anything that sends), private content no tools, bounded preparation web only (research
+    skill_manage or anything that sends), private content no tools (without bots), bounded preparation web only (research
     and agent modes) or nothing. Full-tools jobs keep the profile's normal Desktop toolsets, and so does a
     third-party session in Dolores (DELEGATE): there the guard's first_turn mode is the boundary until the user
     writes, and the read-only subagent reads."""
@@ -220,7 +220,8 @@ def delegator_problems(config):
     """Why this home (Dolores) cannot take third-party sessions, read from its config.yaml (empty: ready): the guard
     enabled with the first_turn scope, her subagent reachable through delegate_task (the delegation toolset and the
     profile_routes backend listing it), the hermes-auto toolset on (the subagent inherits her toolsets, and the
-    read tool is in it), and approvals that deny what nobody can approve."""
+    read tool is in it), approvals that deny what nobody can approve, and the advanced-delegation plugin (the
+    profile_routes backend) enabled with its source files on disk; `delegator_report` adds the running gateway."""
     policy = guard_policy()
     home = Path(config["hermes_home"])
     name = bot_of(config)["subagent"]["name"]
@@ -248,7 +249,41 @@ def delegator_problems(config):
         problems.append(f"delegation.backends.profile_routes.profiles lacks {name!r}")
     if approvals_unattended_unsafe(config):
         problems.append("approvals.mode off (or single_query_mode approve)")
+    if DELEGATION_PLUGIN not in string_list((settings.get("plugins") or {}).get("enabled")):
+        problems.append(f"plugins.enabled lacks {DELEGATION_PLUGIN} (the profile_routes backend of delegate_task)")
+    source = home / "plugins" / DELEGATION_PLUGIN
+    missing = [name for name in DELEGATION_FILES if not (source / name).is_file()]
+    if missing:
+        problems.append(f"{DELEGATION_PLUGIN} is not installed in {source} (missing {', '.join(missing)}); reinstall "
+                        "the plugin")
     return problems
+
+
+# The plugin that provides delegate_task's profile_routes backend, and the files it cannot load without.
+DELEGATION_PLUGIN = "advanced-delegation"
+DELEGATION_FILES = ("plugin.yaml", "__init__.py", "profile_routes.py")
+
+
+async def delegation_status(client):
+    """What the RUNNING gateway loaded of the delegation plugin for this profile (`plugins.list`): enabled, no load
+    error, and its /delegation command registered (its register() returns early, registering nothing, on a Hermes
+    core without pluggable delegation providers)."""
+    listing = await client.rpc("plugins.list")
+    for plugin in listing.get("plugins") or []:
+        if DELEGATION_PLUGIN in (plugin.get("name"), str(plugin.get("key") or "").rsplit("/", 1)[-1]):
+            ok = plugin.get("enabled") is True and not plugin.get("error") and int(plugin.get("commands") or 0) >= 1
+            return {"loaded": True, "ok": ok, **{key: plugin.get(key) for key in
+                                                 ("version", "enabled", "commands", "error")}}
+    return {"loaded": False, "ok": False}
+
+
+def delegation_message(status):
+    if not status.get("loaded"):
+        return (f"the running Hermes gateway has not loaded the {DELEGATION_PLUGIN} plugin (delegate_task with a "
+                "profile needs its profile_routes backend; `hermes-auto guard-reload default` after enabling it)")
+    why = status.get("error") or ("disabled" if status.get("enabled") is not True else
+                                  "it registered nothing: a Hermes core without pluggable delegation providers?")
+    return f"{DELEGATION_PLUGIN} is loaded but not active ({why})"
 
 
 async def subagent_guard_status(sub_config):
@@ -264,18 +299,22 @@ async def subagent_guard_status(sub_config):
 
 
 async def delegator_report(client, config):
-    """(problems, guard status, subagent guard status) of Dolores and her subagent, without a model call."""
+    """(problems, guard status, subagent guard status, delegation plugin status) of Dolores and her subagent,
+    without a model call."""
     problems = delegator_problems(config)
     status = await guard_status(client)
     if not status["ok"]:
         problems.append(guard_message(status) + " (`hermes-auto guard-reload default`)")
+    delegation = await delegation_status(client)
+    if not delegation["ok"]:
+        problems.append(delegation_message(delegation))
     sub = subagent_config(config)
     name = sub["bot"]["name"]
     problems += [f"subagent {name!r}: {problem}" for problem in profile_problems(sub)]
     sub_status = await subagent_guard_status(sub)
     if not sub_status.get("ok"):
         problems.append(f"subagent {name!r}: {guard_message(sub_status)} (`hermes-auto guard-reload {name}`)")
-    return problems, status, sub_status
+    return problems, status, sub_status, delegation
 
 
 def profile_problems(config):
@@ -569,10 +608,10 @@ def doctor(config, db):
         report.update(guard=guard, reads=bot.get("reads"), problems=problems, ready=not problems)
     elif bot.get("subagent"):
         # Dolores: her own sessions run as before; third-party ones need the first_turn guard and the subagent.
-        problems, status, sub_status = guard
+        problems, status, sub_status, delegation = guard
         unsafe = approvals_unattended_unsafe(config)
         report.update(approvals_off=unsafe, guard=status, mode="first_turn", subagent=bot["subagent"]["name"],
-                      subagent_guard=sub_status, problems=problems, ready=not problems)
+                      subagent_guard=sub_status, delegation=delegation, problems=problems, ready=not problems)
     else:
         unsafe = approvals_unattended_unsafe(config)
         report.update(approvals_off=unsafe, ready=not unsafe,

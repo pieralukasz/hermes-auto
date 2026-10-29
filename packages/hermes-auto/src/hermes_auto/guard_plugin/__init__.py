@@ -75,8 +75,11 @@ def pre_tool_call(tool_name=None, args=None, session_id="", task_id="", **_):
     data = _installed()
     sid = session_id or task_id
     if data and data.get("mode") == policy.FIRST_TURN_MODE:
-        if not policy.first_turn_locked(_home(), sid):
+        state, why = policy.first_turn_state(_home(), sid)
+        if state == policy.OPEN:
             return None
+        if state == policy.UNKNOWN:  # cannot be told: every tool refused (fail-closed)
+            return {"action": "block", "message": policy.REFUSED_UNKNOWN.format(why=why)}
         message = policy.decide_first_turn(tool_name, args, data["subagent"])
         return {"action": "block", "message": message} if message else None
     search = True

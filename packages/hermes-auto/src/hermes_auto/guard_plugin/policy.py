@@ -18,7 +18,9 @@ Two modes, chosen by ``scope.json`` in the profile's plugin directory:
   such a session, its turns (and the background review fork, which shares the session id) may only hand the
   matter to the read-only subagent profile (``delegate_task``, every task with that ``profile``), search this
   profile's conversations and read skills. Every other session of the profile is untouched. Fail-closed: a
-  registered session whose messages cannot be read stays locked.
+  registered session whose messages cannot be read stays locked, and a session that cannot be told (registry or
+  state.db unreadable, lineage query failing, a compression lineage over COMPRESSION_HOPS or with a cycle) gets no
+  tool at all. ``tool_search`` is refused in both modes (Hermes may send its queries to remote connectors).
 """
 from __future__ import annotations
 
@@ -31,7 +33,7 @@ import subprocess
 import sys
 
 GUARD_NAME = "hermes-auto-guard"
-GUARD_VERSION = "2.1.0"
+GUARD_VERSION = "2.2.0"
 READ_ONLY_MODE, FIRST_TURN_MODE = "read_only", "first_turn"
 MODES = (READ_ONLY_MODE, FIRST_TURN_MODE)
 PROFILE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")  # bots.NAME
@@ -44,8 +46,8 @@ PLUGIN_TOOLS = (READ_TOOL, SKILL_VIEW_TOOL, SKILLS_LIST_TOOL)
 ALLOWED_TOOLS = frozenset(PLUGIN_TOOLS) | {"session_search"}
 
 # How a job's automatic session is launched. "mail" and "research" read through READ_TOOL in a read-only bot;
-# "private" (link-only Slack channels) has no tools at all; "full" is a Todoist task (or a mail the user gave
-# the agent label) with the target bot's normal tools.
+# "private" (private Slack channels) has no tools at all without bots (in Dolores it is DELEGATE like the rest);
+# "full" is a Todoist task (or a mail the user gave the agent label) with the target bot's normal tools.
 MAIL, RESEARCH, PRIVATE, FULL = "mail", "research", "private", "full"
 DENY_PROFILES = (MAIL, RESEARCH, PRIVATE)
 PROFILES = DENY_PROFILES + (FULL,)
@@ -440,9 +442,32 @@ def own_profile_search(args):
     return session_id is None or (isinstance(session_id, str) and "/" not in session_id)
 
 
-# Hermes' Tool Search bridge: plugin tools and session_search are deferred behind it, so a read session
-# reaches its tools through these. tool_search/tool_describe only read the session's own catalog.
-CATALOG_TOOLS = frozenset({"tool_search", "tool_describe"})
+# Hermes' Tool Search bridge. Plugin tools are deferred behind it: a session calls them by their exact name through
+# `tool_call` (or directly when the request lists them). `tool_search` is no local catalog read: with
+# manage_connections among the session's tools Hermes sends every query to the connector service
+# (tools/tool_search.py, `connections_in_scope`), so it is refused in both modes. `tool_describe` reaches the
+# connector service only for `connectors__` names (tools/connectors/search.py, `remote_schemas_for`): it may load
+# only the mode's own tools.
+SEARCH_TOOL, DESCRIBE_TOOL = "tool_search", "tool_describe"
+REFUSED_TOOL_SEARCH = (
+    "Not run: tool_search is off here (it can send its queries to remote connectors). Call a tool by its exact "
+    "name, directly or through tool_call. (Nie uruchomiono: wyszukiwarka narzędzi jest tu wyłączona; wywołaj "
+    "narzędzie po dokładnej nazwie, bezpośrednio albo przez tool_call.)")
+
+
+def described_names(args):
+    """The tool names a `tool_describe` call asks for (as Hermes reads them: a list or one string, each stripped), or
+    None when the shape cannot be read."""
+    names = args.get("names") if isinstance(args, dict) else None
+    names = [names] if isinstance(names, str) else names
+    if not isinstance(names, list) or not names or not all(isinstance(name, str) for name in names):
+        return None
+    return frozenset(name.strip() for name in names)
+
+
+def describe_allowed(args, allowed):
+    names = described_names(args)
+    return bool(names) and names <= allowed
 
 
 def bridged_names(args):
@@ -471,13 +496,17 @@ REFUSED_SEARCH = ("Not run: earlier conversations are not searchable from a sess
 def decide(tool_name, args, search=True):
     """The block message for one tool call in a read-only bot's session, or None to let it run: only the
     plugin's tools, session_search in this profile (when the session's account may search) and the Tool Search
-    bridge to them."""
+    bridge to them (tool_call, tool_describe of these tools; never tool_search)."""
     if tool_name == "session_search":
         if not search:
             return REFUSED_SEARCH
         return None if own_profile_search(args) else REFUSED_PROFILE
-    if tool_name in ALLOWED_TOOLS or tool_name in CATALOG_TOOLS:
+    if tool_name in ALLOWED_TOOLS:
         return None
+    if tool_name == SEARCH_TOOL:
+        return REFUSED_TOOL_SEARCH
+    if tool_name == DESCRIBE_TOOL:
+        return None if describe_allowed(args, ALLOWED_TOOLS) else REFUSED_READ
     if tool_name == "tool_call":
         names = bridged_names(args)
         if names and names <= ALLOWED_TOOLS:
@@ -497,13 +526,23 @@ SYSTEM_PREFIXES = ("[IMPORTANT:", "[System", "[ASYNC", "[INTERNAL", "[CONTEXT CO
                    "[PRIOR CONTEXT", "[STILL IN PROGRESS")
 # Display kinds of rows a person typed: a normal message (NULL), a steer, a hidden composer send.
 HUMAN_KINDS = ("steer", "hidden")
-FIRST_TURN_TOOLS = frozenset({SKILL_VIEW_TOOL, SKILLS_LIST_TOOL}) | CATALOG_TOOLS
+FIRST_TURN_TOOLS = frozenset({SKILL_VIEW_TOOL, SKILLS_LIST_TOOL})
+# What tool_describe may load in a locked session (no connector name: those are described remotely).
+FIRST_TURN_DESCRIBE = frozenset({"delegate_task", "session_search"}) | FIRST_TURN_TOOLS
 REFUSED_FIRST_TURN = (
     "Nie uruchomiono: to pierwsza, automatyczna tura sesji z treścią od osoby trzeciej. Teraz działa tylko "
     "delegate_task z zadaniami `profile: \"{subagent}\"` (agent {subagent} czyta i przygotowuje sprawę), "
     "session_search w tym profilu i odczyt skilli. Pełne narzędzia ruszą po pierwszej wiadomości Łukasza w tej "
     "sesji. (Not run: automatic first turn; full tools after the user's first message.)")
+REFUSED_UNKNOWN = (
+    "Nie uruchomiono: nie da się ustalić, czy ta sesja jest automatyczną sesją z treścią od osoby trzeciej "
+    "({why}), więc hermes-auto-guard wstrzymuje wszystkie narzędzia, dopóki odczyt się nie uda. Spróbuj ponownie "
+    "za chwilę; jeśli to się powtarza, sprawdź katalog hermes-auto-guard/sessions i state.db tego profilu. "
+    "(Not run: cannot tell whether this is an automatic third-party session; every tool is refused until it can.)")
 COMPRESSION_HOPS = 64
+# first_turn_state: an ordinary session (nothing refused), an automatic one without the user (first-turn rules),
+# or one that cannot be told (every tool refused, with the reason).
+OPEN, LOCKED, UNKNOWN = "open", "locked", "unknown"
 
 
 def registry_dir(home):
@@ -533,16 +572,21 @@ def is_registered(home, session_id):
 
 
 def _ancestors(conn, session_id):
-    """The compression ancestors of a session (a continuation keeps its conversation's lock), oldest last."""
+    """(compression ancestors oldest last, complete). Complete when the walk reached a session that is no
+    compression continuation within COMPRESSION_HOPS ancestors; a cycle or a longer lineage is incomplete."""
     found, current = [], session_id
-    for _ in range(COMPRESSION_HOPS):
+    for _ in range(COMPRESSION_HOPS + 1):
         row = conn.execute("SELECT p.id, p.end_reason FROM sessions c JOIN sessions p ON p.id = c.parent_session_id "
                            "WHERE c.id = ?", (current,)).fetchone()
-        if row is None or row[1] != "compression" or row[0] in found:
-            break
+        if row is None or row[1] != "compression":
+            return found, True
+        if row[0] == session_id or row[0] in found:
+            return found, False  # a cycle
+        if len(found) == COMPRESSION_HOPS:
+            return found, False  # more ancestors than the walk reads
         found.append(row[0])
         current = row[0]
-    return found
+    return found, False
 
 
 def human_row(content, api_content, kind, metadata, summary):
@@ -557,33 +601,46 @@ def human_row(content, api_content, kind, metadata, summary):
     return not str(content or "").lstrip().startswith(SYSTEM_PREFIXES)
 
 
-def first_turn_locked(home, session_id):
-    """True while `session_id` is an automatic session (registered, or a compression continuation of one) in
-    which no person has written yet. Unregistered sessions are never locked; a registered one whose messages
-    cannot be read stays locked."""
+def first_turn_state(home, session_id):
+    """(state, reason) of `session_id` in Dolores' profile.
+
+    OPEN: certainly not an automatic session without the user (nothing registered, neither the session nor any
+    compression ancestor registered, or a person has written in its lineage). LOCKED: registered (itself or an
+    ancestor) and no person has written yet; also a registered session whose messages cannot be read. UNKNOWN: it
+    cannot be told (the registry cannot be listed, state.db or the lineage cannot be read, or the lineage is
+    incomplete: over COMPRESSION_HOPS ancestors or a cycle), so every tool is refused (fail-closed)."""
     if not valid_session_id(session_id):
-        return False
+        return OPEN, ""
     try:
-        if not os.listdir(registry_dir(home)):
-            return False
-    except OSError:
-        return False
-    registered = is_registered(home, session_id)
+        names = {name for name in os.listdir(registry_dir(home)) if not name.startswith(".")}
+    except FileNotFoundError:
+        return OPEN, ""  # nothing was ever registered in this profile
+    except OSError as exc:
+        return UNKNOWN, f"rejestr sesji nie daje się odczytać: {exc.__class__.__name__}"
+    if not names:
+        return OPEN, ""
+    registered = session_id in names
     try:
         conn = sqlite3.connect(f"file:{os.path.join(str(home), 'state.db')}?mode=ro", uri=True, timeout=5)
-    except sqlite3.Error:
-        return registered
+    except sqlite3.Error as exc:
+        return (LOCKED, "") if registered else (UNKNOWN, f"state.db nie daje się otworzyć: {exc.__class__.__name__}")
     try:
         try:
-            lineage = [session_id, *_ancestors(conn, session_id)]
-        except sqlite3.Error:
-            return registered
-        if not any(is_registered(home, sid) for sid in lineage):
-            return False
+            ancestors, complete = _ancestors(conn, session_id)
+        except sqlite3.Error as exc:
+            if registered:
+                return LOCKED, ""
+            return UNKNOWN, f"historii kompresji w state.db nie da się odczytać: {exc.__class__.__name__}"
+        lineage = [session_id, *ancestors]
+        if not any(sid in names for sid in lineage):
+            if complete:
+                return OPEN, ""
+            return UNKNOWN, (f"historia kompresji ma ponad {COMPRESSION_HOPS} poprzednich sesji albo cykl, a w "
+                             "odczytanej części nie ma sesji automatu")
         try:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
             if not {"session_id", "role", "content", "display_kind"} <= columns:
-                return True
+                return LOCKED, ""
             optional = [name if name in columns else "NULL" for name in
                         ("api_content", "display_metadata", "_compressed_summary")]
             marks = ",".join("?" for _ in lineage)
@@ -591,10 +648,15 @@ def first_turn_locked(home, session_id):
                 f"SELECT content, {optional[0]}, display_kind, {optional[1]}, {optional[2]} FROM messages "
                 f"WHERE session_id IN ({marks}) AND role = 'user'", lineage).fetchall()
         except sqlite3.Error:
-            return True
-        return not any(human_row(*row) for row in rows)
+            return LOCKED, ""
+        return (OPEN, "") if any(human_row(*row) for row in rows) else (LOCKED, "")
     finally:
         conn.close()
+
+
+def first_turn_locked(home, session_id):
+    """True unless `session_id` is certainly open (first_turn_state): locked and undeterminable sessions alike."""
+    return first_turn_state(home, session_id)[0] != OPEN
 
 
 def bridged_calls(args):
@@ -657,6 +719,10 @@ def decide_first_turn(tool_name, args, subagent):
         allowed = own_profile_search(args)
     elif tool_name in FIRST_TURN_TOOLS:
         allowed = True
+    elif tool_name == SEARCH_TOOL:
+        return REFUSED_TOOL_SEARCH
+    elif tool_name == DESCRIBE_TOOL:
+        allowed = describe_allowed(args, FIRST_TURN_DESCRIBE)
     elif tool_name == "tool_call":
         calls = bridged_calls(args)
         allowed = bool(calls) and all(name != "tool_call" and decide_first_turn(name, arguments, subagent) is None
