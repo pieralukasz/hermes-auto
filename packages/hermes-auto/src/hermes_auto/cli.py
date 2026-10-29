@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import plistlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -208,6 +209,18 @@ def retry_followup(store, hermes, followup_id):
 
 
 RETRY_FIRST_SECONDS, RETRY_MAX_SECONDS = 60, 1800
+# A source that failed because the network was gone retries sooner: the error says nothing about the service.
+RETRY_NETWORK_MAX_SECONDS = 300
+NETWORK_ERROR = re.compile(
+    r"lookup address|nodename nor servname|name or service not known|temporary failure in name resolution"
+    r"|NameResolution|Failed to resolve|Network is unreachable|No route to host|URLError|ConnectionError"
+    r"|Connection (?:refused|reset|aborted)|Max retries exceeded|timed out|os error (?:50|51|60|61|64|65)",
+    re.IGNORECASE)
+
+
+def network_error(error):
+    """The read failed for lack of network (DNS, no route, connection refused), not because of the service."""
+    return bool(NETWORK_ERROR.search(error))
 
 
 def source_failed(error):
@@ -226,18 +239,38 @@ def source_failed(error):
 def settle_checked(store, checked, read_errors, started):
     """After a check: sources read without error move their cursor to the check's *start*, so an event
     that arrived while it ran stays newer than the cursor. A failed source keeps its cursor (the nudge,
-    backlog or wake still stands) and waits a growing delay before the next attempt."""
-    failed = {source_failed(error) for error in read_errors} - {None}
+    backlog or wake still stands) and waits a growing delay before the next attempt.
+
+    A network failure waits at most `RETRY_NETWORK_MAX_SECONDS`. When another source then reads fine, the
+    network is back: sources waiting after a network failure become due at once, once per failure streak,
+    so a single host that stays down (ZimaBlade) falls back to its own delay instead of retrying every check."""
+    failed = {}
+    for error in read_errors:
+        name = source_failed(error)
+        if name:
+            failed[name] = failed.get(name, False) or network_error(error)
+    recovered = False
     for name in checked:
         if name in failed:
             retry = store.get_meta(f"source_retry:{name}", None) or {}
             attempts = int(retry.get("attempts", 0)) + 1
-            delay = min(RETRY_FIRST_SECONDS * 2 ** (attempts - 1), RETRY_MAX_SECONDS)
-            store.set_meta(f"source_retry:{name}", {"attempts": attempts, "next_at": time.time() + delay})
+            network = failed[name]
+            ceiling = RETRY_NETWORK_MAX_SECONDS if network else RETRY_MAX_SECONDS
+            delay = min(RETRY_FIRST_SECONDS * 2 ** (attempts - 1), ceiling)
+            store.set_meta(f"source_retry:{name}", {
+                "attempts": attempts, "next_at": time.time() + delay, "network": network,
+                "recovery_used": bool(retry.get("recovery_used")) and network})
             continue
+        recovered = True
         store.set_meta(f"last_poll:{name}", started)
         store.db.execute("DELETE FROM meta WHERE key=?", (f"source_retry:{name}",))
         store.db.commit()
+    if recovered:
+        rows = store.db.execute("SELECT key FROM meta WHERE key LIKE 'source_retry:%'").fetchall()
+        for (key,) in rows:
+            retry = store.get_meta(key, None) or {}
+            if retry.get("network") and not retry.get("recovery_used") and key.split(":", 1)[1] not in failed:
+                store.set_meta(key, {**retry, "next_at": 0, "recovery_used": True})
 
 
 def fast_sources(config, store, now=None):
