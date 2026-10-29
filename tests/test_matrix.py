@@ -227,6 +227,77 @@ def test_errors_never_carry_the_token(tmp_path):
     assert "syt_secret_value" not in str(error.value)
 
 
+def test_sync_never_marks_the_user_online(store, server):
+    # /sync without set_presence marks the account online (a write the bridges and other users can see).
+    baseline(store, server)
+    server.say(DM, ANNA, "Czy możesz jutro?", NOW + 10)
+    check(store, server, NOW + 10 + QUIET)
+    syncs = [params for path, params in server.calls if path.endswith("/sync")]
+    assert len(syncs) == 2 and all(params.get("set_presence") == "offline" for params in syncs)
+
+
+def test_a_late_bridged_message_with_an_earlier_timestamp_still_counts(store, server):
+    # A bridge delivering a backlog (the phone was offline) keeps each message's own time, so a message can
+    # arrive after a later one was handed over: its event id is new, its timestamp is not.
+    baseline(store, server)
+    server.say(GROUP, BARTEK, "Kto jutro przyjdzie?", NOW + 100)
+    assert [c["from"] for c in check(store, server, NOW + 100 + QUIET)] == ["Bartek"]
+    server.say(GROUP, ANNA, "Łukasz, oddasz mi klucze?", NOW + 50)
+    later = check(store, server, NOW + 200 + QUIET)
+    assert [(c["from"], c["snippet"]) for c in later] == [("Anna Nowak", "Łukasz, oddasz mi klucze?")]
+    assert check(store, server, NOW + 400 + QUIET) == []  # handed once
+
+
+def test_http_follows_no_redirect_and_errors_carry_no_server_text():
+    # A redirect would carry the Authorization header to another origin; an error's errcode is the server's text.
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from hermes_auto_matrix import Http
+    seen = []
+
+    class Other(BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen.append(self.headers.get("Authorization"))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"user_id": "@x:example.test"}')
+
+        def log_message(self, *args):
+            pass
+
+    other = HTTPServer(("127.0.0.1", 0), Other)
+
+    class Home(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.startswith("/redirect"):
+                self.send_response(302)
+                self.send_header("Location", f"http://127.0.0.1:{other.server_port}/steal")
+                self.end_headers()
+                return
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"errcode": "echo syt_secret_value"}).encode())
+
+        def log_message(self, *args):
+            pass
+
+    home = HTTPServer(("127.0.0.1", 0), Home)
+    for server_ in (home, other):
+        threading.Thread(target=server_.serve_forever, daemon=True).start()
+    try:
+        http = Http(f"http://127.0.0.1:{home.server_port}", "syt_secret_value")
+        with pytest.raises(MatrixError, match="HTTP 302"):
+            http.get("/redirect")
+        assert seen == []
+        with pytest.raises(MatrixError) as error:
+            http.get("/_matrix/client/v3/account/whoami")
+        assert "HTTP 401" in str(error.value) and "syt_secret_value" not in str(error.value)
+    finally:
+        home.shutdown()
+        other.shutdown()
+
+
 def test_history_lines_show_the_chat_for_the_first_turn(server):
     server.say(DM, ANNA, "Czy możesz jutro?", NOW)
     server.say(DM, ME, "Mogę", NOW + 60)

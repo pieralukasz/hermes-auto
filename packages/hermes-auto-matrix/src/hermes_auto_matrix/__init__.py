@@ -44,6 +44,9 @@ SYNC_FILTER = {"presence": {"not_types": ["*"]}, "account_data": {"not_types": [
                         "account_data": {"not_types": ["*"]}, "include_leave": False}}
 # The baseline only needs a position: no message, no state.
 BASELINE_FILTER = {**SYNC_FILTER, "room": {**SYNC_FILTER["room"], "timeline": {"limit": 0}}}
+# Without it every /sync marks the account online, a change other users and the bridges see.
+PRESENCE = {"set_presence": "offline"}
+ERRCODE = re.compile(r"M_[A-Z0-9_]{1,64}")
 
 
 class MatrixError(RuntimeError):
@@ -72,24 +75,34 @@ def read_token(settings):
     return token
 
 
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A redirect is an error: urllib would carry the Authorization header to whatever origin it names."""
+
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
 class Http:
-    """GET-only JSON client for the client-server API; the token never appears in an error."""
+    """GET-only JSON client for the client-server API; the token never appears in an error and never follows a
+    redirect."""
 
     def __init__(self, homeserver, token):
         self.base = str(homeserver).rstrip("/")
         self._token = token
+        self._opener = urllib.request.build_opener(NoRedirect)
 
     def get(self, path, params=None):
         url = self.base + path + ("?" + urllib.parse.urlencode(params) if params else "")
         request = urllib.request.Request(url, headers={"Authorization": f"Bearer {self._token}"}, method="GET")
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
+            with self._opener.open(request, timeout=60) as response:
                 return json.load(response)
         except urllib.error.HTTPError as exc:
             try:
-                code = json.load(exc).get("errcode", "")
-            except ValueError:
+                code = str(json.load(exc).get("errcode", ""))
+            except (ValueError, AttributeError):
                 code = ""
+            code = code if ERRCODE.fullmatch(code) else ""  # server text: shown only as a Matrix code
             raise MatrixError(f"Matrix GET {path.split('?')[0]} failed: HTTP {exc.code} {code}".strip()) from None
         except (urllib.error.URLError, OSError, ValueError) as exc:
             raise MatrixError(f"Matrix GET {path.split('?')[0]} failed: {exc.__class__.__name__}") from None
@@ -214,21 +227,26 @@ class Matrix:
         cursor = store.get_meta(key)
         if cursor is None:
             # First check: the baseline. Nothing older than this ever reaches the sorter.
-            data = self.http.get(f"{API}/sync", {"filter": json.dumps(BASELINE_FILTER), "timeout": 0})
+            data = self.http.get(f"{API}/sync", {"filter": json.dumps(BASELINE_FILTER), "timeout": 0, **PRESENCE})
             store.set_meta(BACKLOG, False)
-            return [], key, {"since": data["next_batch"], "start": now, "handed": {}, "waiting": {}}
+            return [], key, {"since": data["next_batch"], "start": now, "seen": {}, "waiting": {}}
         start = float(cursor.get("start", 0))
-        handed = {room: float(at) for room, at in (cursor.get("handed") or {}).items()}
+        # Handed-over event ids per room, with their times. Identity, not time, says what is new: a bridge
+        # delivering a backlog keeps each message's own time, so a message can arrive after a later one.
+        seen = {room: dict(ids) for room, ids in (cursor.get("seen") or {}).items()}
         waiting = {room: dict(span) for room, span in (cursor.get("waiting") or {}).items()}
         skip = set(self.settings.get("skip_rooms") or [])
+
+        def new(room_id, event):
+            return (self.relevant(event, now) and int(event["origin_server_ts"]) / 1000 > start
+                    and event.get("event_id") not in seen.get(room_id, {}))
         data = self.http.get(f"{API}/sync", {"filter": json.dumps(SYNC_FILTER), "since": cursor["since"],
-                                              "timeout": 0})
+                                              "timeout": 0, **PRESENCE})
         for room_id, room in ((data.get("rooms") or {}).get("join") or {}).items():
             if room_id in skip:
                 continue
-            floor = max(handed.get(room_id, 0), start)
             stamps = [int(event["origin_server_ts"]) / 1000 for event in (room.get("timeline") or {}).get("events", [])
-                      if self.relevant(event, now) and int(event["origin_server_ts"]) / 1000 > floor]
+                      if new(room_id, event)]
             if stamps or (room.get("timeline") or {}).get("limited"):
                 span = waiting.setdefault(room_id, {"first": min(stamps or [now]), "last": max(stamps or [now])})
                 span["last"] = max([span["last"], *stamps])
@@ -242,13 +260,11 @@ class Matrix:
                 waiting.pop(room_id)
                 continue
             events = self.history(room_id, int(self.settings["context_messages"]) + int(self.settings["max_burst"]))
-            floor = max(handed.get(room_id, 0), start)
-            fresh = [event for event in events
-                     if self.relevant(event, now) and int(event["origin_server_ts"]) / 1000 > floor]
+            fresh = [event for event in events if new(room_id, event)]
             if not fresh:
                 waiting.pop(room_id)
                 continue
-            last_at = int(fresh[-1]["origin_server_ts"]) / 1000
+            last_at = max(int(event["origin_server_ts"]) / 1000 for event in fresh)
             if now - last_at < quiet:
                 span.update(last=last_at)  # a message the sync had not shown yet
                 continue
@@ -257,12 +273,15 @@ class Matrix:
         candidates = []
         for last_at, room_id, info, events, fresh in ready[:limit]:
             candidates.append(self.candidate(room_id, info, events, fresh))
-            handed[room_id] = last_at
+            seen.setdefault(room_id, {}).update({event["event_id"]: int(event["origin_server_ts"]) / 1000
+                                                 for event in fresh})
             waiting.pop(room_id, None)
-        horizon = now - 86400 * 30
-        handed = {room: at for room, at in handed.items() if at >= horizon}
+        # A message older than max_age_hours is never new again, so its id need not be kept.
+        horizon = now - float(self.settings["max_age_hours"]) * 3600 - 3600
+        seen = {room: kept for room, ids in seen.items()
+                if (kept := {event_id: at for event_id, at in ids.items() if at >= horizon})}
         store.set_meta(BACKLOG, bool(waiting))
-        return candidates, key, {"since": data["next_batch"], "start": start, "handed": handed, "waiting": waiting}
+        return candidates, key, {"since": data["next_batch"], "start": start, "seen": seen, "waiting": waiting}
 
     def candidate(self, room_id, info, events, fresh):
         last = fresh[-1]
