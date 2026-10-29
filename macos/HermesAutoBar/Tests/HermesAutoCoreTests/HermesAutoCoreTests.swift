@@ -8,6 +8,13 @@ final class HermesAutoCoreTests: XCTestCase {
         return try Data(contentsOf: url)
     }
 
+    func testChatSourcesHaveTheirOwnLabelsAndSymbols() {
+        XCTAssertEqual(sourceLabel("imessage"), "iMessage")
+        XCTAssertEqual(sourceLabel("matrix"), "Komunikatory")
+        XCTAssertEqual(sourceSymbol("imessage"), "message")
+        XCTAssertEqual(sourceSymbol("matrix"), "bubble.left.and.bubble.right")
+    }
+
     func testStatusDecodesAndListsEveryProblem() throws {
         let status = try Decode.status(fixture("status"))
         XCTAssertEqual(status.jobs.count, 4)
