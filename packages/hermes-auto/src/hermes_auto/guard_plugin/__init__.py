@@ -79,11 +79,13 @@ def pre_tool_call(tool_name=None, args=None, session_id="", task_id="", **_):
 
 
 def read_tool(args, **kwargs):
-    families, _search = _scope(kwargs.get("session_id") or kwargs.get("task_id") or "")
-    if not families:
+    sid = kwargs.get("session_id") or kwargs.get("task_id") or ""
+    families, _search = _scope(sid)
+    chat = policy.session_chat(_home(), sid)  # a chat session also reads its own chat's history
+    if not families and chat is None:
         return policy.neutral("Not run: no reads for this session (no read scope installed, or none for this "
                               "account); reinstall it with `hermes-auto install-guard` if that is wrong.")
-    return policy.run_read((args or {}).get("command"), families)
+    return policy.run_read((args or {}).get("command"), families, chat=chat)
 
 
 def skill_view_tool(args, **kwargs):
@@ -112,7 +114,9 @@ READ_SCHEMA = {
         "--json`, `td task view id:ID --json`, `td project list`), calendar and Gmail reads via the Google "
         "Workspace skill script (`python3 ~/.hermes/skills/productivity/google-workspace/scripts/google_api.py "
         "calendar list --start ... --end ...`, `... gmail search \"query\"`, `... gmail get ID`), Slack MCP reads, "
-        "`gh` reads (pr/issue view/list, `gh api` GET) and `linear` reads. Anything else is refused with a note. "
+        "`gh` reads (pr/issue view/list, `gh api` GET), `linear` reads, and in a chat session that chat's history "
+        "(`imsg history --chat-id N --json`, `hermes-auto-matrix history ROOM`). Anything else is refused with a "
+        "note. "
         "In an automatic first turn this is how you read; sending and writing wait for the user."),
     "parameters": {"type": "object", "properties": {
         "command": {"type": "string", "description": "One plain read command."}}, "required": ["command"]},

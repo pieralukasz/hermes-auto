@@ -144,7 +144,8 @@ def marked(prompt, display):
 def register(config, sid, job):
     """Record `sid` as an automatic session with third-party content in the guard's registry, before anything is
     sent to it (the first_turn guard locks it to reads until the user writes)."""
-    guard_policy().register_session(config["hermes_home"], sid, job.get("id"))
+    policy = guard_policy()
+    policy.register_session(config["hermes_home"], sid, job.get("id"), chat=policy.chat_of(job))
 
 
 def string_list(value):

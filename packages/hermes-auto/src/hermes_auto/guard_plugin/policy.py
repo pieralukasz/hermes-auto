@@ -16,6 +16,11 @@ conversations. Fail-closed: a registered session whose messages cannot be read s
 be told (registry or state.db unreadable, lineage query failing, a compression lineage with a cycle, a dangling
 parent or over COMPRESSION_HOPS) gets no tool at all; without a valid scope a locked session reads nothing and
 cannot search. ``tool_search`` is refused while locked (Hermes may send its queries to remote connectors).
+
+A chat session (iMessage, a Matrix room bridged from WhatsApp, Messenger, Instagram or LinkedIn) may also read that
+one chat's history (``imsg history --chat-id N``, ``hermes-auto-matrix history ROOM``): the chat is recorded in the
+session's registry entry by the bridge (``chat_of``), not in scope.json, so the scope format is unchanged and a
+guard without chat reads ignores the entry. No other chat is readable, and nothing can be sent.
 """
 from __future__ import annotations
 
@@ -28,7 +33,7 @@ import subprocess
 import sys
 
 GUARD_NAME = "hermes-auto-guard"
-GUARD_VERSION = "3.0.1"
+GUARD_VERSION = "3.0.2"
 FIRST_TURN_MODE = "first_turn"
 SCOPE_VERSION = 2
 TOOLSET = "hermes-auto"
@@ -370,6 +375,83 @@ def linear_read(tokens):
     return True
 
 
+# --- Chat history: only the session's own chat -------------------------------------------------------
+
+IMESSAGE, MATRIX = "imessage", "matrix"
+CHAT_SOURCES = (IMESSAGE, MATRIX)
+CHAT_ID = re.compile(r"[0-9]{1,12}")
+# A Matrix room id: room versions up to 11 carry ":server", version 12 is opaque.
+ROOM_ID = re.compile(r"![A-Za-z0-9._~=+/-]{1,255}(?::[A-Za-z0-9.-]{1,255}(?::[0-9]{1,5})?)?")
+HISTORY_LIMIT = 200
+MATRIX_HISTORY_LIMIT = 100
+ISO_TIME = r"[0-9]{4}-[0-9]{2}-[0-9]{2}(T[0-9:.]+(Z|[+-][0-9:]+)?)?"
+# No --db (another database), --participants (a handle filter spanning chats), --convert-attachments (writes
+# converted copies), log options; the chat id is checked against the session's chat.
+IMSG_HISTORY = grammar(("--json", "-j", "--json-output", "--jsonOutput", "--attachments"),
+                       ("--chat-id", "--limit", "--start", "--end"))
+MATRIX_HISTORY = grammar((), ("--limit",))
+MATRIX_HELPER = "hermes-auto-matrix"
+
+
+def valid_chat(chat):
+    return (isinstance(chat, dict) and set(chat) == {"source", "id"} and isinstance(chat.get("id"), str)
+            and ((chat["source"] == IMESSAGE and bool(CHAT_ID.fullmatch(chat["id"])))
+                 or (chat["source"] == MATRIX and bool(ROOM_ID.fullmatch(chat["id"])))))
+
+
+def chat_of(job):
+    """{"source", "id"} of the one chat a job's session may read (an iMessage chat rowid, a Matrix room id), or
+    None for every other job and for a malformed id."""
+    source = (job or {}).get("source")
+    if source not in CHAT_SOURCES:
+        return None
+    try:
+        payload = json.loads((job or {}).get("payload") or "{}")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("chat_id") if source == IMESSAGE else payload.get("room_id")
+    if source == IMESSAGE and (isinstance(value, bool) or not isinstance(value, int)):
+        return None
+    chat = {"source": source, "id": str(value)}
+    return chat if valid_chat(chat) else None
+
+
+def bounded_int(value, top):
+    return bool(re.fullmatch(r"[0-9]{1,4}", value)) and 1 <= int(value) <= top
+
+
+def chat_read(tokens, words, chat):
+    """`imsg history` or `hermes-auto-matrix history` of exactly the session's chat, with read options only."""
+    if not valid_chat(chat):
+        return False
+    if chat["source"] == IMESSAGE and trusted_program(tokens[0], words, "imsg"):
+        if tokens[1:2] != ["history"]:
+            return False
+        seen = []
+
+        def value_ok(option, value):
+            seen.append((option, value))
+            if option == "--chat-id":
+                return value == chat["id"]
+            if option == "--limit":
+                return bounded_int(value, HISTORY_LIMIT)
+            return bool(re.fullmatch(ISO_TIME, value))
+        positionals = split_options(tokens[2:], IMSG_HISTORY, value_ok)
+        chats = [value for option, value in seen if option == "--chat-id"]
+        return positionals == [] and chats == [chat["id"]] and len(seen) == len({option for option, _ in seen})
+    if chat["source"] == MATRIX and trusted_program(tokens[0], words, MATRIX_HELPER):
+        if tokens[1:2] != ["history"]:
+            return False
+        limits = []
+        positionals = split_options(tokens[2:], MATRIX_HISTORY,
+                                    lambda option, value: limits.append(value) is None
+                                    and bounded_int(value, MATRIX_HISTORY_LIMIT))
+        return positionals == [chat["id"]] and len(limits) <= 1
+    return False
+
+
 def slack_read_command(tokens, words=None, families=None):
     """Reads of the research families: trusted Slack, GitHub and Linear commands."""
     words = set(tokens) if words is None else words
@@ -383,18 +465,18 @@ def slack_read_command(tokens, words=None, families=None):
     return False
 
 
-def read_only_command(command, profile=True):
+def read_only_command(command, profile=True, chat=None):
     """True only for a single plain read command of the allowed families: calendar/Gmail reads via the Google
     script, Todoist reads, and the research reads (`slack_read_command`). `profile` is a set of families or a
     launch profile ("mail"/True: Google and Todoist; "research": all). "private" and unknown profiles allow
-    no command.
+    no command. `chat` (the session's own chat, `session_chat`) also allows that chat's history (`chat_read`).
 
     No shell syntax at all (pipes, redirects, substitutions, chaining), so the allowed program is the
     only thing that runs. Programs and scripts must be the trusted ones, and their options must be in an
     explicit read grammar. Anything else is refused, however harmless it looks.
     """
     families = families_for(profile)
-    if not families:
+    if not families and not valid_chat(chat):
         return False
     text = str(command or "").strip()
     # Single-quoted text is literal in sh (Todoist filters use `|` and `&`); everything else may not
@@ -409,6 +491,8 @@ def read_only_command(command, profile=True):
     if not tokens:
         return False
     words = set(text.split())
+    if trusted_program(tokens[0], words, "imsg") or trusted_program(tokens[0], words, MATRIX_HELPER):
+        return chat_read(tokens, words, chat)
     if trusted_program(tokens[0], words, "td"):
         return TODOIST in families and todoist_read(tokens)
     if skill_script(tokens, words, GOOGLE_API):
@@ -532,16 +616,20 @@ def valid_session_id(session_id):
     return isinstance(session_id, str) and bool(SESSION_ID.fullmatch(session_id))
 
 
-def register_session(home, session_id, job_id=None):
-    """Mark a session of this profile as an automatic one with third-party content (before its first prompt)."""
+def register_session(home, session_id, job_id=None, chat=None):
+    """Mark a session of this profile as an automatic one with third-party content (before its first prompt).
+    `chat` (`chat_of`): the one chat whose history its first turn may read."""
     from pathlib import Path
     if not valid_session_id(session_id):
         raise ValueError(f"invalid session id {session_id!r}")
+    if chat is not None and not valid_chat(chat):
+        raise ValueError(f"invalid chat {chat!r}")
     directory = Path(registry_dir(home))
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = directory / session_id
     temporary = directory / f".{session_id}.{os.getpid()}"
-    temporary.write_text(json.dumps({"job": job_id, "version": 1}) + "\n", encoding="utf-8")
+    entry = {"job": job_id, "version": 1, **({"chat": chat} if chat else {})}
+    temporary.write_text(json.dumps(entry) + "\n", encoding="utf-8")
     os.replace(temporary, path)
     return path
 
@@ -703,6 +791,34 @@ def first_turn_state(home, session_id):
         conn.close()
 
 
+def session_chat(home, session_id):
+    """The chat recorded for `session_id`'s registered session (itself or the compression ancestor that was
+    registered), or None: not registered, an entry without a chat (older guards), or anything unreadable (no chat
+    read then; the first-turn lock itself is `first_turn_state`)."""
+    if not valid_session_id(session_id):
+        return None
+    lineage = [session_id]
+    if not os.path.isfile(os.path.join(registry_dir(home), session_id)):
+        try:
+            conn = sqlite3.connect(f"file:{os.path.join(str(home), 'state.db')}?mode=ro", uri=True, timeout=5)
+            try:
+                lineage += _ancestors(conn, session_id)[0]
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return None
+    for sid in lineage:
+        path = os.path.join(registry_dir(home), sid)
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as stream:
+                    chat = json.load(stream).get("chat")
+            except (OSError, ValueError, AttributeError):
+                return None
+            return chat if valid_chat(chat) else None
+    return None
+
+
 def first_turn_locked(home, session_id):
     """True unless `session_id` is certainly open (first_turn_state): locked and undeterminable sessions alike."""
     return first_turn_state(home, session_id)[0] != OPEN
@@ -809,14 +925,14 @@ def neutral(note):
     return json.dumps({"skipped": True, "note": note, "output": "", "exit_code": 1}, ensure_ascii=False)
 
 
-def read_argv(command, profile):
-    """The argv to run for one read `command` under `profile` (families or a launch profile), or None when it is
-    not a read.
+def read_argv(command, profile, chat=None):
+    """The argv to run for one read `command` under `profile` (families or a launch profile) and the session's
+    `chat`, or None when it is not a read.
 
     No shell runs it: the grammar's own checks still refuse shell syntax, and the program and script
     tokens are replaced by the exact trusted paths the grammar accepted (a `~` is expanded here, as the
     shell would have)."""
-    if not read_only_command(command, profile):
+    if not read_only_command(command, profile, chat):
         return None
     tokens = shlex.split(str(command).strip())
     words = set(str(command).split())
@@ -833,9 +949,9 @@ def read_env():
     return {**os.environ, "HERMES_HOME": os.path.expanduser("~/.hermes")}
 
 
-def run_read(command, profile, *, timeout=COMMAND_TIMEOUT, cwd=None):
+def run_read(command, profile, *, timeout=COMMAND_TIMEOUT, cwd=None, chat=None):
     """Run one read command (no shell) and return the tool result JSON."""
-    argv = read_argv(command, profile)
+    argv = read_argv(command, profile, chat)
     if argv is None:
         return neutral(REFUSED_READ + " This command is not one of the allowed reads (one plain command, "
                        "no pipes or redirects; see the session's first message for the commands).")
