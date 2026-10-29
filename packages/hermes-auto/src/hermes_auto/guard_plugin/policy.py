@@ -33,7 +33,7 @@ import subprocess
 import sys
 
 GUARD_NAME = "hermes-auto-guard"
-GUARD_VERSION = "2.2.1"
+GUARD_VERSION = "2.2.2"
 READ_ONLY_MODE, FIRST_TURN_MODE = "read_only", "first_turn"
 MODES = (READ_ONLY_MODE, FIRST_TURN_MODE)
 PROFILE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")  # bots.NAME
@@ -576,19 +576,24 @@ def is_registered(home, session_id):
 
 def _ancestors(conn, session_id):
     """(compression ancestors oldest last, complete). Complete when the walk reached a session that is no
-    compression continuation within COMPRESSION_HOPS ancestors; a cycle or a longer lineage is incomplete."""
+    compression continuation; a cycle, a lineage beyond COMPRESSION_HOPS or a parent pointer to a missing row
+    (it cannot be told whether that parent was a registered session's compression) is incomplete."""
     found, current = [], session_id
     for _ in range(COMPRESSION_HOPS + 1):
-        row = conn.execute("SELECT p.id, p.end_reason FROM sessions c JOIN sessions p ON p.id = c.parent_session_id "
-                           "WHERE c.id = ?", (current,)).fetchone()
-        if row is None or row[1] != "compression":
+        row = conn.execute("SELECT c.parent_session_id, p.id, p.end_reason FROM sessions c "
+                           "LEFT JOIN sessions p ON p.id = c.parent_session_id WHERE c.id = ?", (current,)).fetchone()
+        if row is None or not row[0]:
+            return found, True  # no row (a session not persisted yet) or no parent: the lineage ends here
+        if row[1] is None:
+            return found, False  # dangling parent pointer (Codex review round 2, finding 6)
+        if row[2] != "compression":
             return found, True
-        if row[0] == session_id or row[0] in found:
+        if row[1] == session_id or row[1] in found:
             return found, False  # a cycle
         if len(found) == COMPRESSION_HOPS:
             return found, False  # more ancestors than the walk reads
-        found.append(row[0])
-        current = row[0]
+        found.append(row[1])
+        current = row[1]
     return found, False
 
 

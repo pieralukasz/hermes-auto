@@ -273,6 +273,25 @@ def test_a_lineage_cycle_refuses(dolores):
         assert is_block(hook("write_file", session_id=sid), UNKNOWN), sid
 
 
+def test_a_missing_middle_of_a_registered_lineage_refuses(dolores):
+    # Codex review round 2, finding 6: a dangling parent pointer used to end the walk as a complete lineage.
+    chain(dolores, SID, 3, "cut")
+    assert is_block(hook("write_file", session_id="cut-3"), "Łukasza")
+    db = sqlite3.connect(dolores / "state.db")
+    db.execute("DELETE FROM sessions WHERE id='cut-2'")
+    db.commit()
+    db.close()
+    for tool in ("write_file", "memory", "skill_manage", "tool_search"):
+        assert is_block(hook(tool, session_id="cut-3"), UNKNOWN), tool
+    assert is_block(hook("delegate_task", delegation("work"), session_id="cut-3"), UNKNOWN)
+
+
+def test_a_session_without_a_parent_or_not_yet_persisted_is_open(dolores):
+    add_session(dolores, "solo")
+    assert hook("write_file", session_id="solo") is None
+    assert hook("write_file", session_id="not-in-the-db-yet") is None
+
+
 # ── 5. Readiness needs the delegation backend ───────────────────────────────
 
 def test_readiness_needs_the_advanced_delegation_plugin_on_disk_and_enabled(tmp_path, json_settings):
