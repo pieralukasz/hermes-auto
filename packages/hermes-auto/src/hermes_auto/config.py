@@ -50,9 +50,46 @@ def read_config(home: Path) -> dict:
             and isinstance(rule.get("provider", ""), str) and isinstance(rule.get("model", ""), str)
             and (rule.get("provider") or rule.get("model")) for rule in routes):
         raise ValueError("routes must be a list of {match: {...}, provider and/or model}")
-    from .bots import validate
-    validate(config)
+    if "bots" in config:
+        raise ValueError("bots is no longer supported: every session lives in the default profile. Remove `bots` "
+                         "from config.json and put the per-account reads in `first_turn` (see docs/architecture.md)")
+    first_turn_scope(config)
     return config
+
+
+READ_FAMILIES = ("github", "google", "linear", "slack", "todoist")  # guard_plugin.policy.FAMILIES
+
+
+def first_turn_scope(config: dict) -> dict:
+    """What the first, automatic turn of a third-party session may read (`first_turn` in config.json), normalized:
+    {"reads": [families], "providers": {provider: {"reads": [...], "session_search": bool}}}. A provider entry
+    (an account chosen by `routes`, e.g. a work account) replaces the default reads for sessions on it and
+    allows session_search only when it says so. Without the section every family is read, with no entries.
+    `hermes-auto install-guard` writes this into the guard's scope.json; the prompts name only these reads."""
+    section = config.get("first_turn")
+    if section is None:
+        section = {}
+    if not isinstance(section, dict):
+        raise ValueError("first_turn must be an object {reads, providers}")
+
+    def families(value, where):
+        if not isinstance(value, list) or not all(item in READ_FAMILIES for item in value):
+            raise ValueError(f"{where} must be a list of {', '.join(READ_FAMILIES)}")
+        return sorted(set(value))
+    reads = families(section.get("reads", list(READ_FAMILIES)), "first_turn.reads")
+    providers = section.get("providers") or {}
+    if not isinstance(providers, dict):
+        raise ValueError("first_turn.providers must be an object {provider: {reads, session_search}}")
+    entries = {}
+    for name, spec in providers.items():
+        if not isinstance(name, str) or not name or not isinstance(spec, dict):
+            raise ValueError("first_turn.providers must be an object {provider: {reads, session_search}}")
+        search = spec.get("session_search", False)
+        if not isinstance(search, bool):
+            raise ValueError(f"first_turn.providers.{name}.session_search must be true or false")
+        entries[name] = {"reads": families(spec.get("reads"), f"first_turn.providers.{name}.reads"),
+                         "session_search": search}
+    return {"reads": reads, "providers": entries}
 
 
 ROUTE_FIELDS = ("provider", "model")

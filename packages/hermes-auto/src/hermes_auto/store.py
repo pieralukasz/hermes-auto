@@ -87,7 +87,7 @@ class Store:
                 updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        # The bot (Hermes profile) a job's session lives in; '' = created before bots (the default profile).
+        # The Hermes profile a job's session lives in: '' (before bots) or default; a retired bot's for older jobs.
         if "profile" not in {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}:
             self.db.execute("ALTER TABLE jobs ADD COLUMN profile TEXT NOT NULL DEFAULT ''")
             self.db.commit()

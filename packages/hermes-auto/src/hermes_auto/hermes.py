@@ -8,9 +8,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from . import bots
-from .config import model_route, private_json
-from .runner import full_tools
+from .config import first_turn_scope, model_route, private_json
+from .runner import DEFAULT, full_tools, profile_of, third_party
 
 # Hermes SessionDB.MAX_TITLE_LENGTH; a longer title makes session creation fail.
 TITLE_LIMIT = 100
@@ -81,6 +80,20 @@ def run_alive(pid, directory):
     return False
 
 
+NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")  # a Hermes profile name
+
+
+def profile_home(config, profile):
+    """The Hermes home of a profile: the root home for `default`, else `<root>/profiles/<name>` (older jobs of the
+    retired bots)."""
+    root = Path(config["hermes_home"]).expanduser()
+    if not profile or profile == DEFAULT:
+        return str(root)
+    if not NAME.fullmatch(profile):
+        raise ValueError(f"invalid profile {profile!r}")
+    return str(root / "profiles" / profile)
+
+
 class SessionBusy(RuntimeError):
     """Hermes refused the run: another surface (Desktop) holds the conversation (SESSION_NOT_OWNED)."""
 
@@ -98,24 +111,22 @@ class Hermes:
             raise RuntimeError("Set hermes_source to a supported Hermes Agent source installation")
 
     def profile_config(self, profile):
-        """This config aimed at one bot: `hermes_home` is the bot's profile home (the gateway serves it through
-        the multiplexer, like `hermes -p <bot>`), `bot` says what the bridge must check before using it."""
-        profile = profile or bots.DEFAULT
-        if profile == bots.DEFAULT and not bots.enabled(self.config):
-            return self.config
-        spec = bots.read_only(self.config).get(profile)
-        bot = {"name": profile, "read_only": spec is not None, "reads": sorted((spec or {}).get("reads") or []),
-               "providers": (spec or {}).get("providers") or {}}
-        subagent = bots.subagent(self.config)
-        if profile == bots.settings(self.config).get("default", bots.DEFAULT) and subagent:
-            # Dolores: third-party sessions here need her first_turn guard and a ready read-only subagent.
-            sub = self.profile_config(subagent)
-            bot["subagent"] = {**sub["bot"], "home": sub["hermes_home"]}
-        return {**self.config, "hermes_home": bots.profile_home(self.config, profile), "bot": bot}
+        """This config aimed at one profile's home: the default profile (every session since bots were retired),
+        or the profile an older job's session lives in (read-only queries: inspect, archive states, excerpts). The
+        `first_turn` read scope travels normalized, so the bridge checks the guard's scope.json against it."""
+        config = {**self.config, "first_turn": first_turn_scope(self.config)}
+        profile = profile or DEFAULT
+        return config if profile == DEFAULT else {**config, "hermes_home": profile_home(self.config, profile)}
+
+    def profile_exists(self, profile):
+        """Whether a profile's home still has a state.db: an archived profile of a retired bot has none."""
+        if not profile or profile == DEFAULT:
+            return True  # the bridge answers for a fresh home without state.db itself
+        return (Path(profile_home(self.config, profile)) / "state.db").is_file()
 
     def invoke(self, action, job=None, profile=None, **extra):
-        """Run one bridge action. `profile`: the bot whose home it targets (default: the job's bot)."""
-        profile = profile or (bots.of(job) if job else bots.DEFAULT)
+        """Run one bridge action. `profile`: the profile whose home it targets (default: the job's)."""
+        profile = profile or (profile_of(job) if job else DEFAULT)
         with tempfile.TemporaryDirectory(prefix="request-", dir=self.home) as directory:
             request = Path(directory) / "request.json"
             private_json(request, {"action": action, "config": self.profile_config(profile), "job": job or {},
@@ -189,8 +200,9 @@ class Hermes:
         runs.mkdir(mode=0o700, exist_ok=True)
         directory = Path(tempfile.mkdtemp(prefix=f"job-{job['id']}-", dir=runs))
         request = directory / "request.json"
+        self.require_default(job)
         full, deny = self.tools_of(job)
-        private_json(request, {"action": "run", "config": self.profile_config(bots.of(job)), "job": job,
+        private_json(request, {"action": "run", "config": self.profile_config(DEFAULT), "job": job,
                                "prompt": prompt,
                                "display": display, "full_tools": full, "deny_tools": deny,
                                "route": job_route(job, self.config)})
@@ -237,33 +249,39 @@ class Hermes:
         finally:
             shutil.rmtree(directory, ignore_errors=True)
 
-    def third_party_in_dolores(self, job):
-        """A job with someone else's content whose session lives in Dolores (bots): her subagent prepares it."""
-        return (bots.delegates(self.config) and not bots.is_read_only(self.config, bots.of(job))
-                and job.get("source") not in bots.INTERNAL_SOURCES and not bots.full_tools(job))
+    @staticmethod
+    def require_default(job):
+        """New sessions and runs happen only in the default profile; an older job's session in a retired bot's
+        profile is continued by hand or replaced with `new-session`."""
+        if profile_of(job) != DEFAULT:
+            raise RuntimeError(f"This job's session is in the retired profile {profile_of(job)!r}; open it by hand or "
+                               f"use `hermes-auto new-session {job.get('id', 'JOB_ID')}` (it opens in default)")
 
     def tools_of(self, job):
-        """(full_tools, deny_tools) for a job's session: a job in a read-only bot never has full tools and always
-        has a read profile (an agent-labelled mail thread there reads like any other mail); a third-party job in
-        Dolores keeps its read profile too, which the bridge turns into her delegating launch."""
-        if bots.is_read_only(self.config, bots.of(job)) or self.third_party_in_dolores(job):
+        """(full_tools, deny_tools) for a job's session: a third-party job (mail, also with the agent label, Slack,
+        GitHub, Linear, a "↩" reply) never has full tools and always has a read profile, which the bridge turns
+        into the first-turn launch; a Todoist task has full tools; an internal one (brief, plan) neither."""
+        if third_party(job):
             return False, deny_mode(job) or True
         return full_tools(job), deny_mode(job)
 
     def budget(self, job):
-        # Slack sessions research before drafting (reads only), so they get the full agent budget; so does a
-        # matter Dolores hands to her subagent (bridge.launch_plan: the agent limits).
+        # A Todoist task and a third-party first turn (reads, then a short summary) get the agent budget
+        # (bridge.launch_plan: the agent limits).
         key = ("agent_run_budget_seconds" if job and ((full_tools(job) and not job.get("deny_tools"))
-                                                      or deny_mode(job) in ("research", "slack")
-                                                      or self.third_party_in_dolores(job))
+                                                      or third_party(job))
                else "run_budget_seconds")
         return self.config[key]
 
+    MISSING = {"exists": False, "owned_by": None, "messages": 0, "archived": False, "last_active": None}
+
     def exists(self, job):
-        return self.invoke("inspect", job)["exists"]
+        return self.inspect(job["session_id"], profile_of(job))["exists"]
 
     def inspect(self, session_id, profile=None):
-        return self.invoke("inspect", {"session_id": session_id}, profile=profile)
+        if not self.profile_exists(profile):
+            return dict(self.MISSING)
+        return self.invoke("inspect", {"session_id": session_id}, profile=profile or DEFAULT)
 
     def classify(self, system, user, max_tokens=4000, route=None):
         """One model call through Hermes; `route` (provider/model) overrides the sorter's default model."""
@@ -277,35 +295,37 @@ class Hermes:
         return self.invoke("recent_sessions", days=days, limit=limit, exclude=list(exclude))["result"]
 
     def session_excerpts(self, ids, profile=None):
-        """{session_id: {title, date, last_user, last_assistant}}. Read-only."""
-        return self.invoke("session_excerpts", profile=profile, ids=list(ids))["result"]
+        """{session_id: {title, date, last_user, last_assistant}}. Read-only; nothing from an archived profile."""
+        if not self.profile_exists(profile):
+            return {}
+        return self.invoke("session_excerpts", profile=profile or DEFAULT, ids=list(ids))["result"]
 
     def archive_states(self, sessions):
-        """{session_id: True archived / False open / None missing}: one bridge process per bot profile.
-        `sessions`: session ids (default profile) or (session_id, profile) pairs."""
+        """{session_id: True archived / False open / None missing}: one bridge process per profile.
+        `sessions`: session ids (default profile) or (session_id, profile) pairs. Sessions of a profile that is
+        gone (a retired bot's, archived) are missing, which never finishes their task."""
         groups = {}
         for item in sessions:
-            sid, profile = item if isinstance(item, tuple) else (item, bots.DEFAULT)
-            groups.setdefault(profile or bots.DEFAULT, []).append(sid)
+            sid, profile = item if isinstance(item, tuple) else (item, DEFAULT)
+            groups.setdefault(profile or DEFAULT, []).append(sid)
         states = {}
         for profile, ids in groups.items():
+            if not self.profile_exists(profile):
+                states.update({sid: None for sid in ids})
+                continue
             states.update(self.invoke("archive_states", profile=profile, session_ids=ids)["states"])
         return states
 
     def doctor(self):
-        """The bridge's checks against every bot profile the config names (just `default` without bots)."""
-        names = bots.profiles(self.config) if bots.enabled(self.config) else [bots.DEFAULT]
-        report = {}
-        for name in names:
-            try:
-                report[name] = self.invoke("doctor", profile=name)
-            except Exception as exc:  # noqa: BLE001 - one broken bot must not hide the others
-                report[name] = {"ok": False, "error": str(exc)}
-        return {"ok": all(entry.get("ok") and entry.get("ready", True) for entry in report.values()),
-                "bots": report}
+        """The bridge's checks of the default profile, where every automatic session lives."""
+        try:
+            report = self.invoke("doctor", profile=DEFAULT)
+        except Exception as exc:  # noqa: BLE001 - reported, not raised
+            report = {"ok": False, "ready": False, "error": str(exc)}
+        return {**report, "ok": bool(report.get("ok") and report.get("ready", True))}
 
     def message_count(self, job):
-        return self.invoke("inspect", job)["messages"]
+        return self.inspect(job["session_id"], profile_of(job))["messages"]
 
     def create(self, job, prompt):
         title = session_title(job, prefix=self.config.get("title_prefix", ""))
@@ -314,6 +334,7 @@ class Hermes:
             "Sesja jest gotowa. Automatyczne przygotowanie jest wyłączone; możesz zacząć rozmowę."
             if self.config["language"].lower() in ("polish", "polski", "pl") else
             "This session is ready. Automatic preparation is disabled; continue when you are ready.")
+        self.require_default(job)
         hidden = bool(self.config.get("triage", {}).get("hide_sessions", False))
         # The gateway creates a run's session (its id may differ from the reserved one); `open` keeps it.
         full, deny = self.tools_of(job)
@@ -322,6 +343,7 @@ class Hermes:
                            route=job_route(job, self.config))["session_id"]
 
     def run(self, job, prompt, display=None):
+        self.require_default(job)
         full, deny = self.tools_of(job)
         return self.invoke("run", job, prompt=prompt, display=display, full_tools=full, deny_tools=deny,
                            route=job_route(job, self.config))

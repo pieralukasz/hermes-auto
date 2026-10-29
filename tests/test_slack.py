@@ -212,7 +212,7 @@ def test_private_channel_passes_link_only(store):
     candidates, _, _ = slack_with(fake, NOW + 300).inbox({}, store)
     assert len(candidates) == 1 and candidates[0]["redacted"]
     assert "sekretna" not in json.dumps(candidates[0], ensure_ascii=False)
-    prompt = triage.slack_session_prompt(candidates[0], "", {"language": "Polish"})
+    prompt = triage.mail_session_prompt(candidates[0], "", {"language": "Polish"})
     assert "nie przytaczaj" in prompt and key
 
 
@@ -235,7 +235,7 @@ def test_sorter_opens_research_session_that_never_sends(store, config):
     prompt = prompt_for(job, config)
     # A DM may be a private chat with a friend (the TapIn workspace is also used privately): notice only, no draft.
     assert "Bez szkicu" in prompt and "nie wysyłaj" in prompt and "SLACK-" in prompt
-    assert "NIGDY sam nie odpowiadaj" in triage.slack_session_prompt(
+    assert "NIGDY sam nie odpowiadaj" in triage.mail_session_prompt(
         {**slack_item(), "dm": False, "why": "mention", "place": "#dev"}, "", config)
     row = store.db.execute("SELECT kind FROM triage_items").fetchone()
     assert row["kind"] == "slack"
@@ -247,7 +247,7 @@ def test_sorter_opens_research_session_that_never_sends(store, config):
     triage.process_followups(store, config, fake2)
     newest = store.rows()[-1]
     assert newest["title"].startswith("↩ ") and deny_mode(newest) == "research"
-    assert "ciąg dalszy rozmowy ze Slacka" in prompt_for(newest, config)
+    assert "ciąg dalszy wcześniejszej rozmowy" in prompt_for(newest, config)
 
 
 def test_read_in_slack_opens_nothing(store, config):
@@ -303,8 +303,10 @@ def test_slack_runs_get_the_agent_budget(tmp_path, config):
     hermes.config = config
     assert hermes.budget({"source": "slack", "mode": "draft", "payload": json.dumps({"deny_tools": "slack"})}) \
         == config["agent_run_budget_seconds"]
+    # Every third-party first turn reads before it answers: the agent budget too.
     assert hermes.budget({"source": "gmail", "mode": "draft", "payload": json.dumps({"deny_tools": True})}) \
-        == config["run_budget_seconds"]
+        == config["agent_run_budget_seconds"]
+    assert hermes.budget({"source": "brief", "mode": "open", "payload": "{}"}) == config["run_budget_seconds"]
 
 
 SLACK_MCP = "python3 ~/.hermes/skills/tap-in/tapin-slack/scripts/slack_mcp.py"

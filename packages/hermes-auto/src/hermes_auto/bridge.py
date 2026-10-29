@@ -66,41 +66,28 @@ def route_kwargs(request):
 
 
 def launch_profile(request, config):
-    """The guard profile of a job's session: its read profile, or DELEGATE for third-party content in a bot that
-    hands it to a read-only subagent (Dolores with bots)."""
+    """The guard profile of a job's session: FIRST_TURN for third-party content (any read profile the sorter chose:
+    normal toolsets, the guard locks the first turn to reads), FULL for a Todoist task, None for the bounded
+    preparation of anything else."""
     policy = guard_policy()
     profile = policy.profile_for(request.get("deny_tools"), request.get("full_tools"))
-    if profile in policy.DENY_PROFILES and bot_of(config).get("subagent"):
-        return policy.DELEGATE
-    return profile
+    return policy.FIRST_TURN if profile in policy.DENY_PROFILES else profile
 
 
 def launch_plan(request, config):
     """(guard profile or None, session.create fields) for a job's automatic session.
 
-    The toolsets are the first boundary and the gateway freezes them: third-party mail and Slack/GitHub
-    research get only the guard plugin's read toolset and past-session search (no terminal, files,
-    skill_manage or anything that sends), private content no tools (without bots), bounded preparation web only (research
-    and agent modes) or nothing. Full-tools jobs keep the profile's normal Desktop toolsets, and so does a
-    third-party session in Dolores (DELEGATE): there the guard's first_turn mode is the boundary until the user
-    writes, and the read-only subagent reads."""
+    Full-tools jobs and third-party sessions (FIRST_TURN) keep the default profile's normal Desktop toolsets: for
+    the latter the guard's first_turn mode is the boundary until the user writes (reads only). Anything else gets
+    the bounded preparation (web only for research and agent modes, or nothing)."""
     policy = guard_policy()
     job = request.get("job") or {}
     profile = launch_profile(request, config)
-    if profile in (policy.MAIL, policy.RESEARCH):
-        toolsets = [policy.TOOLSET, "session_search"]
-    elif profile == policy.PRIVATE:
-        toolsets = []
-    elif profile in (policy.FULL, policy.DELEGATE):
-        toolsets = None
-    else:
-        toolsets = ["web"] if job.get("mode") in ("research", "agent") else []
-    agent_limits = profile in (policy.RESEARCH, policy.FULL, policy.DELEGATE)
+    agent_limits = profile in (policy.FULL, policy.FIRST_TURN)
     params = {"max_turns": int(config["agent_max_turns" if agent_limits else "max_turns"]),
               "run_budget": int(config["agent_run_budget_seconds" if agent_limits else "run_budget_seconds"])}
-    if toolsets is not None:
-        params["toolsets"] = toolsets
     if profile is None:
+        params["toolsets"] = ["web"] if job.get("mode") in ("research", "agent") else []
         params["ignore_rules"] = True  # bounded preparation: no project rules, as before
     params.update(route_kwargs(request))
     return profile, params
@@ -148,24 +135,15 @@ def approvals_unattended_unsafe(config=None):
     return mode == "off" or single == "approve" or os.environ.get("HERMES_YOLO_MODE") not in (None, "", "0")
 
 
-# What a read-only bot's profile must switch off and may switch on (its `platform_toolsets.cli`).
-READ_ONLY_DISABLED = frozenset({"terminal", "file", "browser", "web", "code_execution", "computer_use", "delegation",
-                                "cronjob", "memory", "skills", "image_gen", "tts", "kanban", "connections"})
-
-
-def read_only_toolsets():
-    return frozenset({guard_policy().TOOLSET, "session_search"})
-
-
 def marked(prompt, display):
-    """The automatic prompt and its card with the guard's marker: Dolores' guard never takes them for the user."""
+    """The automatic prompt and its card with the guard's marker: the guard never takes them for the user."""
     mark = guard_policy().AUTO_TURN_MARK
     return f"{prompt}\n\n{mark}", (f"{display}\n\n{mark}" if display else display)
 
 
 def register(config, sid, job):
-    """Record `sid` as an automatic session with third-party content in this profile's guard registry, before
-    anything is sent to it (the first_turn guard locks it until the user writes)."""
+    """Record `sid` as an automatic session with third-party content in the guard's registry, before anything is
+    sent to it (the first_turn guard locks it to reads until the user writes)."""
     guard_policy().register_session(config["hermes_home"], sid, job.get("id"))
 
 
@@ -191,163 +169,49 @@ def plugin_version():
     return match.group(1).strip() if match else ""
 
 
-def bot_of(config):
-    return config.get("bot") or {"name": "default", "read_only": False, "reads": []}
-
-
 def expected_scope(config):
-    """scope.json as `hermes-auto install-guard` writes it for this bot (guard.scope_data, without importing it)."""
-    bot = bot_of(config)
-    data = {"version": 1, "reads": sorted(set(bot.get("reads") or []))}
-    if bot.get("providers"):
+    """scope.json as `hermes-auto install-guard` writes it from config.json `first_turn` (guard.scope_data, without
+    importing it: this script runs isolated). read_config already validated the section."""
+    policy = guard_policy()
+    section = config.get("first_turn") or {}
+    data = {"version": policy.SCOPE_VERSION, "mode": policy.FIRST_TURN_MODE,
+            "reads": sorted(set(section.get("reads", policy.FAMILIES)))}
+    if section.get("providers"):
         data["providers"] = {name: {"reads": sorted(set(spec.get("reads") or [])),
                                     "session_search": bool(spec.get("session_search", False))}
-                             for name, spec in sorted(bot["providers"].items())}
+                             for name, spec in sorted(section["providers"].items())}
     return data
 
 
-def expected_first_turn_scope(config):
-    """scope.json as `hermes-auto install-guard default` writes it for Dolores (guard.scope_data)."""
-    return {"version": 1, "mode": "first_turn", "reads": [], "subagent": bot_of(config)["subagent"]["name"]}
-
-
-def subagent_config(config):
-    """This config aimed at Dolores' read-only subagent profile (for its readiness checks)."""
-    sub = bot_of(config)["subagent"]
-    return {**config, "hermes_home": sub["home"], "bot": {key: value for key, value in sub.items() if key != "home"}}
-
-
-def delegator_problems(config):
-    """Why this home (Dolores) cannot take third-party sessions, read from its config.yaml (empty: ready): the guard
-    enabled with the first_turn scope, her subagent reachable through delegate_task (the delegation toolset and the
-    profile_routes backend listing it), the hermes-auto toolset on (the subagent inherits her toolsets, and the
-    read tool is in it), approvals that deny what nobody can approve, and the advanced-delegation plugin (the
-    profile_routes backend) enabled with its source files on disk; `delegator_report` adds the running gateway."""
+def readiness_problems(config):
+    """Why this home cannot take third-party sessions, read from its config.yaml (empty: ready): the guard enabled
+    with the scope config.json asks for, the hermes-auto toolset on (the first turn reads through it), approvals
+    that deny what nobody can approve. `readiness_report` adds the running gateway."""
     policy = guard_policy()
     home = Path(config["hermes_home"])
-    name = bot_of(config)["subagent"]["name"]
     settings = raw_settings(config)
     problems = []
     if policy.GUARD_NAME not in string_list((settings.get("plugins") or {}).get("enabled")):
         problems.append("plugins.enabled lacks hermes-auto-guard")
-    if policy.load_scope(home / "plugins" / policy.GUARD_NAME) != expected_first_turn_scope(config):
-        problems.append("the guard's scope is not the first_turn scope for this subagent; run `hermes-auto "
-                        "install-guard default`")
+    if policy.load_scope(home / "plugins" / policy.GUARD_NAME) != expected_scope(config):
+        problems.append("the guard's scope differs from config.json `first_turn`; run `hermes-auto install-guard`")
     platform = set(string_list((settings.get("platform_toolsets") or {}).get("cli")))
-    for toolset, why in ((policy.TOOLSET, "the subagent inherits these toolsets and reads through it"),
-                         ("delegation", "the first turn hands the matter over with delegate_task")):
-        if toolset not in platform:
-            problems.append(f"platform_toolsets.cli lacks {toolset} ({why})")
-    disabled = set(string_list((settings.get("agent") or {}).get("disabled_toolsets"))) & {policy.TOOLSET,
-                                                                                         "delegation"}
-    if disabled:
-        problems.append(f"agent.disabled_toolsets switches off {sorted(disabled)}")
-    delegation = settings.get("delegation") or {}
-    routes = ((delegation.get("backends") or {}).get("profile_routes") or {}).get("profiles") or []
-    if delegation.get("backend") != "profile_routes":
-        problems.append("delegation.backend must be profile_routes (delegate_task with a profile)")
-    if not any(isinstance(entry, dict) and entry.get("name") == name for entry in routes):
-        problems.append(f"delegation.backends.profile_routes.profiles lacks {name!r}")
+    if policy.TOOLSET not in platform:
+        problems.append(f"platform_toolsets.cli lacks {policy.TOOLSET} (the first turn reads through it)")
+    if policy.TOOLSET in set(string_list((settings.get("agent") or {}).get("disabled_toolsets"))):
+        problems.append(f"agent.disabled_toolsets switches off {policy.TOOLSET}")
     if approvals_unattended_unsafe(config):
         problems.append("approvals.mode off (or single_query_mode approve)")
-    if DELEGATION_PLUGIN not in string_list((settings.get("plugins") or {}).get("enabled")):
-        problems.append(f"plugins.enabled lacks {DELEGATION_PLUGIN} (the profile_routes backend of delegate_task)")
-    source = home / "plugins" / DELEGATION_PLUGIN
-    missing = [name for name in DELEGATION_FILES if not (source / name).is_file()]
-    if missing:
-        problems.append(f"{DELEGATION_PLUGIN} is not installed in {source} (missing {', '.join(missing)}); reinstall "
-                        "the plugin")
     return problems
 
 
-# The plugin that provides delegate_task's profile_routes backend, and the files it cannot load without.
-DELEGATION_PLUGIN = "advanced-delegation"
-DELEGATION_FILES = ("plugin.yaml", "__init__.py", "profile_routes.py")
-
-
-async def delegation_status(client):
-    """What the RUNNING gateway loaded of the delegation plugin for this profile (`plugins.list`): enabled, no load
-    error, and its /delegation command registered (its register() returns early, registering nothing, on a Hermes
-    core without pluggable delegation providers)."""
-    listing = await client.rpc("plugins.list")
-    for plugin in listing.get("plugins") or []:
-        if DELEGATION_PLUGIN in (plugin.get("name"), str(plugin.get("key") or "").rsplit("/", 1)[-1]):
-            ok = plugin.get("enabled") is True and not plugin.get("error") and int(plugin.get("commands") or 0) >= 1
-            return {"loaded": True, "ok": ok, **{key: plugin.get(key) for key in
-                                                 ("version", "enabled", "commands", "error")}}
-    return {"loaded": False, "ok": False}
-
-
-def delegation_message(status):
-    if not status.get("loaded"):
-        return (f"the running Hermes gateway has not loaded the {DELEGATION_PLUGIN} plugin (delegate_task with a "
-                "profile needs its profile_routes backend; `hermes-auto guard-reload default` after enabling it)")
-    why = status.get("error") or ("disabled" if status.get("enabled") is not True else
-                                  "it registered nothing: a Hermes core without pluggable delegation providers?")
-    return f"{DELEGATION_PLUGIN} is loaded but not active ({why})"
-
-
-async def subagent_guard_status(sub_config):
-    """guard_status of the subagent profile, asked of the gateway as that profile (`hermes -p <name>`)."""
-    from hermes_cli.gateway_client import connect_gateway
-    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-    token = set_hermes_home_override(str(sub_config["hermes_home"]))
-    try:
-        async with connect_gateway() as client:
-            return await guard_status(client)
-    finally:
-        reset_hermes_home_override(token)
-
-
-async def delegator_report(client, config):
-    """(problems, guard status, subagent guard status, delegation plugin status) of Dolores and her subagent,
-    without a model call."""
-    problems = delegator_problems(config)
+async def readiness_report(client, config):
+    """(problems, guard status) of the default profile, without a model call."""
+    problems = readiness_problems(config)
     status = await guard_status(client)
     if not status["ok"]:
-        problems.append(guard_message(status) + " (`hermes-auto guard-reload default`)")
-    delegation = await delegation_status(client)
-    if not delegation["ok"]:
-        problems.append(delegation_message(delegation))
-    sub = subagent_config(config)
-    name = sub["bot"]["name"]
-    problems += [f"subagent {name!r}: {problem}" for problem in profile_problems(sub)]
-    sub_status = await subagent_guard_status(sub)
-    if not sub_status.get("ok"):
-        problems.append(f"subagent {name!r}: {guard_message(sub_status)} (`hermes-auto guard-reload {name}`)")
-    return problems, status, sub_status, delegation
-
-
-def profile_problems(config):
-    """Why this home is not a ready read-only bot, read from its config.yaml as Hermes reads it (empty: ready).
-    The boundary is the profile's own configuration: only the hermes-auto read toolset and session_search,
-    everything that runs code, touches files, browses or sends switched off, the guard plugin enabled."""
-    from agent.skill_utils import parse_config_string_list
-    home = Path(config["hermes_home"])
-    if not (home / "config.yaml").is_file():
-        return [f"profile {bot_of(config)['name']!r} does not exist ({home})"]
-    settings = raw_settings(config)
-    problems = []
-    platform = set(parse_config_string_list((settings.get("platform_toolsets") or {}).get("cli")))
-    if not platform or not platform <= read_only_toolsets():
-        problems.append(f"platform_toolsets.cli must be a subset of {sorted(read_only_toolsets())}, "
-                        f"is {sorted(platform) or 'unset (all tools)'}")
-    disabled = set(parse_config_string_list((settings.get("agent") or {}).get("disabled_toolsets")))
-    if READ_ONLY_DISABLED - disabled:
-        problems.append(f"agent.disabled_toolsets lacks {sorted(READ_ONLY_DISABLED - disabled)}")
-    memory = settings.get("memory") or {}
-    if memory.get("memory_enabled", True) is not False or memory.get("user_profile_enabled", True) is not False:
-        problems.append("memory.memory_enabled and memory.user_profile_enabled must be false (no memory written "
-                        "from third-party content)")
-    review = (settings.get("auxiliary") or {}).get("background_review") or {}
-    if review.get("enabled", True) is not False:
-        problems.append("auxiliary.background_review.enabled must be false (no memory or skill patches after a turn)")
-    if guard_policy().GUARD_NAME not in parse_config_string_list((settings.get("plugins") or {}).get("enabled")):
-        problems.append("plugins.enabled lacks hermes-auto-guard")
-    scope = guard_policy().load_scope(home / "plugins" / guard_policy().GUARD_NAME)
-    if scope != expected_scope(config):
-        problems.append("the installed read scope differs from hermes-auto's config; run `hermes-auto install-guard`")
-    return problems
+        problems.append(guard_message(status) + " (`hermes-auto guard-reload`)")
+    return problems, status
 
 
 async def guard_status(client):
@@ -368,10 +232,10 @@ async def guard_status(client):
 
 def guard_message(status):
     if not status.get("loaded"):
-        return "the running Hermes gateway has not loaded the hermes-auto-guard plugin for this bot"
+        return "the running Hermes gateway has not loaded the hermes-auto-guard plugin"
     if status.get("version") != status.get("expected_version"):
-        return (f"the running gateway has hermes-auto-guard {status.get('version')!r} for this bot, this hermes-auto "
-                f"needs {status.get('expected_version')!r}")
+        return (f"the running gateway has hermes-auto-guard {status.get('version')!r}, this hermes-auto needs "
+                f"{status.get('expected_version')!r}")
     return f"hermes-auto-guard is loaded but not active ({status.get('error') or 'disabled or incomplete'})"
 
 
@@ -379,43 +243,30 @@ INTERNAL_SOURCES = ("brief", "questions", "proposals", "unblocked")  # triage.IN
 
 
 def third_party(profile, job, request):
-    """Whether a job carries someone else's content: a read or delegating profile, or anything that is neither the
-    user's own full-tools job nor an internal source (a brief or plan hermes-auto wrote)."""
+    """Whether a job carries someone else's content: a first-turn profile, or anything that is neither the user's
+    own full-tools job nor an internal source (a brief or plan hermes-auto wrote)."""
     policy = guard_policy()
-    return profile in policy.DENY_PROFILES + (policy.DELEGATE,) or (
+    return profile in policy.DENY_PROFILES + (policy.FIRST_TURN,) or (
         profile is None and not request.get("full_tools") and job.get("source") not in INTERNAL_SOURCES)
 
 
-async def require_bot(client, config, profile, job, request):
-    """Fail closed before anything reaches a session (create, import or run): third-party content only in a ready
-    read-only bot; a full-tools automatic turn only in a working bot whose approvals deny what nobody can approve.
-    Without a `bots` section (no `bot` in the request) only the old bounded preparation, with no tools, passes."""
-    bot = bot_of(config)
+async def require_ready(client, config, profile, job, request):
+    """Fail closed before anything reaches a session (create, import or run): third-party content only with the
+    first_turn guard ready (configured and loaded by the running gateway); a full-tools automatic turn only with
+    approvals that deny what nobody can approve. The old bounded preparation, with no tools, always passes."""
+    policy = guard_policy()
     retry = f"Nothing was sent. Fix it, then `hermes-auto new-session {job.get('id', 'JOB_ID')}`."
-    if bot.get("read_only"):
-        if profile == guard_policy().FULL:
-            raise Refusal(f"Refused: a full-tools job cannot run in the read-only bot {bot['name']!r}. {retry}")
-        problems = profile_problems(config)
-        status = await guard_status(client)
-        if not status["ok"]:
-            problems.append(guard_message(status) + f" (`hermes-auto guard-reload {bot['name']}`)")
+    if profile == policy.FIRST_TURN:
+        problems = (await readiness_report(client, config))[0]
         if problems:
-            raise Refusal(f"Refused: bot {bot['name']!r} is not a ready read-only bot: {'; '.join(problems)}. {retry}")
-    elif profile == guard_policy().DELEGATE:
-        if not bot.get("subagent"):
-            raise Refusal(f"Refused: bot {bot['name']!r} has no read-only subagent for third-party content. {retry}")
-        problems = (await delegator_report(client, config))[0]
-        if problems:
-            raise Refusal(f"Refused: bot {bot['name']!r} cannot take third-party content yet: {'; '.join(problems)}. "
+            raise Refusal(f"Refused: the default profile cannot take third-party content yet: {'; '.join(problems)}. "
                           f"{retry}")
-    elif third_party(profile, job, request) and (profile is not None or config.get("bot")):
-        raise Refusal(f"Refused: third-party content goes only to a read-only bot, not to profile "
-                      f"{bot['name']!r} (configure `bots` in hermes-auto's config.json). {retry}")
-    elif profile == guard_policy().FULL and approvals_unattended_unsafe(config):
-        raise Refusal(f"Refused: bot {bot['name']!r} has approvals.mode off (or single_query_mode approve), so "
-                      "an automatic turn would run approval-gated commands without anyone. Set `hermes "
-                      f"-p {bot['name']} config set approvals.mode manual` (single_query_mode stays deny) "
-                      f"or route these tasks to another bot. {retry}")
+    elif profile in policy.DENY_PROFILES or third_party(profile, job, request):
+        raise Refusal(f"Refused: third-party content runs only as a first-turn session. {retry}")
+    elif profile == policy.FULL and approvals_unattended_unsafe(config):
+        raise Refusal("Refused: approvals.mode is off (or single_query_mode approve), so an automatic turn would run "
+                      "approval-gated commands without anyone. Set `hermes config set approvals.mode manual` "
+                      f"(single_query_mode stays deny). {retry}")
 
 
 def run_gateway(work):
@@ -473,7 +324,7 @@ async def rename(client, hermes_home, sid, title):
 
 
 def create_agent_session(request, config, job, db):
-    """A gateway session for an automatic run in the job's bot profile (this home): frozen toolsets, turn limit,
+    """A gateway session for an automatic run in the default profile (this home): frozen toolsets, turn limit,
     budget and model route, then the title. Idempotent: the creation key is the job's reserved id."""
     profile, params = launch_plan(request, config)
     home = config["hermes_home"]
@@ -484,12 +335,12 @@ def create_agent_session(request, config, job, db):
         if "gui" not in (contract.get("sources") or []) or missing:
             raise Refusal("Refused: this Hermes gateway cannot create automatic sessions with "
                           f"{', '.join(missing) or 'source gui'}; update Hermes.")
-        await require_bot(client, config, profile, job, request)
+        await require_ready(client, config, profile, job, request)
         snapshot = await client.rpc("session.create", request_id=f"hermes-auto:{job['session_id']}",
                                     source="gui", cwd=str(Path.home()), **params,
                                     **({"hidden": True} if request.get("hidden") else {}))
         sid = snapshot["stored_session_id"]
-        if profile == guard_policy().DELEGATE:
+        if profile == guard_policy().FIRST_TURN:
             register(config, sid, job)  # locked from the start, before the run sends anything
         row = db.get_session(sid) or {}
         if not row.get("title"):
@@ -505,14 +356,14 @@ def create_open_session(request, config, job, db):
     if db.get_session(sid) is not None:
         return sid
     profile = launch_profile(request, config)
-    delegated = profile == guard_policy().DELEGATE
+    guarded = profile == guard_policy().FIRST_TURN
     def free(candidate):
         if title_owner(config["hermes_home"], candidate) is not None:
             raise ValueError("already in use")
     title = unique_title(free, request["title"])
     now = time.time()
-    # Someone else's text imported into Dolores: marked and registered, so nothing but the user unlocks it.
-    content = marked(request["prompt"], None)[0] if delegated else request["prompt"]
+    # Someone else's text imported here: marked and registered, so nothing but the user unlocks it.
+    content = marked(request["prompt"], None)[0] if guarded else request["prompt"]
     session = {"id": sid, "source": "cli", "title": title, "started_at": now, "hidden": int(bool(request.get("hidden"))),
                "messages": [{"role": "user", "content": content, "timestamp": now},
                             {"role": "assistant", "content": request["open_message"], "timestamp": now + 0.001}]}
@@ -524,8 +375,8 @@ def create_open_session(request, config, job, db):
             session["model"] = route["model"]
 
     async def work(client):
-        await require_bot(client, config, profile, job, request)
-        if delegated:
+        await require_ready(client, config, profile, job, request)
+        if guarded:
             register(config, sid, job)
         return await client.rpc("session.mutate", session_id=sid, request_id=f"hermes-auto-import:{sid}",
                                 expected_revision=0, operation="import", payload={"sessions": [session]})
@@ -539,22 +390,22 @@ def run_session(request, config, job):
     """Submit the job's prompt to its gateway session as one finite turn and print the stream-json result.
 
     Refused (nothing submitted) when the session's frozen launch differs from what this job needs (an older
-    session, created by hand or before Hermes v0.22.5), or when its bot is not ready for it (`require_bot`)."""
+    session, created by hand or before Hermes v0.22.5), or when the profile is not ready for it (`require_ready`)."""
     sid = job["session_id"]
     profile, params = launch_plan(request, config)
     prompt, display = request["prompt"], request.get("display")
-    delegated = profile == guard_policy().DELEGATE
-    if delegated:
+    guarded = profile == guard_policy().FIRST_TURN
+    if guarded:
         prompt, display = marked(prompt, display)
 
     async def work(client):
-        await require_bot(client, config, profile, job, request)
+        await require_ready(client, config, profile, job, request)
         snapshot = await client.rpc("session.resume", session_id=sid)
         different = launch_mismatch((snapshot.get("info") or {}).get("launch_request"), params)
         if different:
             raise Refusal(f"Refused: this session's frozen launch differs from the job's ({', '.join(different)}); "
                           f"nothing was sent. Use `hermes-auto new-session {job.get('id', 'JOB_ID')}`.")
-        if delegated:
+        if guarded:
             register(config, sid, job)  # the guard locks the turn before the prompt arrives
         from hermes_cli.gateway_chat_view import GatewayChatView
         from hermes_cli.stream_json import StreamJsonEmitter
@@ -576,9 +427,9 @@ def run_session(request, config, job):
 
 
 def doctor(config, db):
-    """Import and contract checks without a model call for this home's bot: the gateway client, its creation
-    contract, and for a read-only bot its profile configuration and the guard plugin in the running gateway;
-    for a working bot whether automatic turns would auto-approve."""
+    """Import and contract checks without a model call for the default profile: the gateway client, its creation
+    contract, the guard plugin in the running gateway with the scope config.json asks for (third-party sessions)
+    and whether automatic turns would auto-approve (Todoist tasks)."""
     from hermes_cli.gateway_chat_view import GatewayChatView
     from hermes_cli.stream_json import StreamJsonEmitter
     from hermes_state import SessionDB
@@ -586,9 +437,6 @@ def doctor(config, db):
     assert callable(call_llm) and callable(GatewayChatView.run) and callable(StreamJsonEmitter.emit_result)
     assert callable(SessionDB.get_compression_lineage) and callable(SessionDB.resolve_resume_session_id)
     assert "read_only" in SessionDB.__init__.__code__.co_varnames
-    bot = bot_of(config)
-    if not (Path(config["hermes_home"]) / "config.yaml").is_file() and bot["name"] != "default":
-        return {"ok": False, "ready": False, "bot": bot["name"], "problems": [f"profile {bot['name']!r} does not exist"]}
 
     async def work(client):
         contract = (await client.rpc("runtime.describe")).get("session_create") or {}
@@ -596,28 +444,12 @@ def doctor(config, db):
         missing = sorted(needed - set(contract.get("parameters") or []))
         if "gui" not in (contract.get("sources") or []) or missing:
             raise Refusal(f"Hermes gateway lacks the creation contract hermes-auto needs: {missing or 'source gui'}")
-        if bot.get("read_only"):
-            return await guard_status(client)
-        if bot.get("subagent"):
-            return await delegator_report(client, config)
-        return None
-    guard = run_gateway(work)
-    report = {"ok": True, "bot": bot["name"], "home": config["hermes_home"], "read_only": bool(bot.get("read_only")),
-              "python": sys.executable, "source": config["hermes_source"]}
-    if bot.get("read_only"):
-        problems = profile_problems(config) + ([] if guard["ok"] else [guard_message(guard)])
-        report.update(guard=guard, reads=bot.get("reads"), problems=problems, ready=not problems)
-    elif bot.get("subagent"):
-        # Dolores: her own sessions run as before; third-party ones need the first_turn guard and the subagent.
-        problems, status, sub_status, delegation = guard
-        unsafe = approvals_unattended_unsafe(config)
-        report.update(approvals_off=unsafe, guard=status, mode="first_turn", subagent=bot["subagent"]["name"],
-                      subagent_guard=sub_status, delegation=delegation, problems=problems, ready=not problems)
-    else:
-        unsafe = approvals_unattended_unsafe(config)
-        report.update(approvals_off=unsafe, ready=not unsafe,
-                      problems=["approvals.mode off: automatic Todoist runs here are refused"] if unsafe else [])
-    return report
+        return await readiness_report(client, config)
+    problems, status = run_gateway(work)
+    return {"ok": True, "profile": "default", "home": config["hermes_home"], "python": sys.executable,
+            "source": config["hermes_source"], "mode": guard_policy().FIRST_TURN_MODE,
+            "approvals_off": approvals_unattended_unsafe(config), "guard": status, "scope": expected_scope(config),
+            "problems": problems, "ready": not problems}
 
 
 def parse_json_block(text):
@@ -960,8 +792,7 @@ def main():
             # are re-discovered in the running gateway, open conversations keep running.
             from gateway.control_socket import reload_gateway_plugins
             home = Path(config["hermes_home"])
-            root = home.parent.parent if bot_of(config)["name"] != "default" else home
-            answer = reload_gateway_plugins(root, profile_home=home) or {"reloaded": False,
+            answer = reload_gateway_plugins(home, profile_home=home) or {"reloaded": False,
                                                                          "error": "no gateway answered"}
             answer = {key: answer.get(key) for key in ("reloaded", "error", "plugins")}
             answer["guard"] = run_gateway(guard_status) if answer.get("reloaded") else None

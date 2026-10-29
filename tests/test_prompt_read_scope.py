@@ -1,5 +1,5 @@
-"""Session prompts of read-only research sessions name only the reads their bot/account scope allows and leave
-the draft to the bot the matter is handed to (synthetic config: a work org on its own account)."""
+"""The first, automatic turn's prompt names only the reads the guard grants the session's account (config.json
+`first_turn`; synthetic config: a work org on its own account, which also reads Todoist) and asks for no draft."""
 from hermes_auto import triage
 
 WORK = "work-account"
@@ -11,12 +11,8 @@ CONFIG = {
         {"match": {"source": "github", "owner": "acme-work"}, "provider": WORK},
         {"match": {"source": "linear"}, "provider": WORK},
     ],
-    "bots": {
-        "default": "default", "inbox": "inbox",
-        "read_only": {"inbox": {"reads": ["github", "google", "linear", "slack", "todoist"],
-                                "providers": {WORK: {"reads": ["github", "linear", "slack"],
-                                                     "session_search": False}}}},
-    },
+    "first_turn": {"reads": ["github", "google", "linear", "slack", "todoist"],
+                   "providers": {WORK: {"reads": ["github", "linear", "slack", "todoist"], "session_search": False}}},
 }
 
 
@@ -37,47 +33,53 @@ def linear(**extra):
             "why": "issueNewComment", "body": "QA FAIL", **extra}
 
 
-PRIVATE_ONLY = ("td task list", "Todoist", "session_search", "calendar list", "kalendarz")
+PRIVATE_ONLY = ("session_search", "calendar list", "kalendarz", "gmail", "Gmail")
+
+
+def work_prompts(config=CONFIG):
+    return (triage.mail_session_prompt(github("acme-work"), "", config),
+            triage.mail_session_prompt(slack_channel(), "", config),
+            triage.mail_session_prompt(linear(), "", config))
 
 
 def test_work_account_prompts_name_only_work_reads():
-    for prompt in (triage.mail_session_prompt(github("acme-work"), "", CONFIG),
-                   triage.mail_session_prompt(slack_channel(), "", CONFIG),
-                   triage.mail_session_prompt(linear(), "", CONFIG)):
+    for prompt in work_prompts():
         for word in PRIVATE_ONLY:
             assert word not in prompt.split("<<<")[0], word
         assert "`gh` (pr view" in prompt and "`linear` (issue view" in prompt and "slack_read_thread" in prompt
+        assert "td task list --filter 'search: <fraza>' --json" in prompt  # Todoist: the user agreed
 
 
-def test_private_account_keeps_todoist_lookup_and_history():
+def test_private_account_keeps_the_calendar_gmail_and_history():
     prompt = triage.mail_session_prompt(github("someone-else"), "", CONFIG)
     assert "td task list --filter 'search: <fraza>' --json" in prompt and "session_search" in prompt
-    assert "kalendarz (`google_api.py calendar list`)" in prompt
+    assert "calendar list" in prompt and "gmail search" in prompt
 
 
-def test_research_prompts_hand_off_instead_of_drafting():
-    for prompt in (triage.mail_session_prompt(github("acme-work"), "", CONFIG),
-                   triage.mail_session_prompt(slack_channel(), "", CONFIG),
-                   triage.mail_session_prompt(linear(), "", CONFIG)):
-        assert "bloku kodu" not in prompt and "przekaż do <bot>" in prompt and "Gotowego szkicu nie pisz" in prompt
+def test_first_turn_prompts_present_without_drafting_or_handing_off():
+    for prompt in work_prompts():
+        assert "hermes_auto_read" in prompt and "1–3 zdaniach" in prompt and "Bez szkicu" in prompt
+        assert "przekaż do" not in prompt and "delegate_task" not in prompt and "bloku kodu" not in prompt
     assert "NIGDY sam nic nie publikuj na GitHubie" in triage.mail_session_prompt(github("acme-work"), "", CONFIG)
 
 
 def test_followup_without_search_does_not_point_at_session_search():
     origin = {"id": "s1", "title": "GitHub · review", "date": "2026-10-25"}
     prompt = triage.mail_session_prompt(github("acme-work", followup_of=origin), "", CONFIG)
-    assert "session_search" not in prompt.split("<<<")[0] and "po przekazaniu sprawy" in prompt
+    assert "session_search" not in prompt.split("<<<")[0] and "Tamtej rozmowy nie ruszam" in prompt
     prompt = triage.mail_session_prompt(github("someone-else", followup_of=origin), "", CONFIG)
-    assert "kontekst znajdziesz przez session_search" in prompt
+    assert "więcej kontekstu znajdziesz przez session_search" in prompt
 
 
-def test_reply_in_a_conversation_uses_that_bots_scope():
-    config = {**CONFIG, "bots": {**CONFIG["bots"], "read_only": {
-        **CONFIG["bots"]["read_only"], "narrow": {"reads": ["github"]}}}}
-    prompt = triage.mail_session_prompt(github("someone-else", bot="narrow"), "", config)
-    assert "`gh` (pr view" in prompt and "td task list" not in prompt and "slack_read_thread" not in prompt
+def test_the_jobs_source_picks_the_route():
+    """A mail item has no `kind`; the job's source decides its route, as for the session itself."""
+    config = {**CONFIG, "routes": [{"match": {"source": "gmail"}, "provider": WORK}]}
+    mail = {"from": "a@example.test", "subject": "S", "body": "b"}
+    assert "gmail search" in triage.mail_session_prompt(mail, "", config)
+    assert "gmail search" not in triage.mail_session_prompt(mail, "", config, source="gmail")
 
 
-def test_without_bots_every_read_stays():
+def test_without_a_first_turn_section_every_read_stays():
     prompt = triage.mail_session_prompt(github("acme-work"), "", {"language": "Polish", "routes": CONFIG["routes"]})
     assert "td task list" in prompt and "session_search" in prompt and "slack_read_thread" in prompt
+    assert "calendar list" in prompt

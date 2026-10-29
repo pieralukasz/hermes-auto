@@ -132,11 +132,11 @@ def test_private_profile_allows_no_command(command):
 # ── Tool policy at the batch boundary, with a fake agent ─────────────────────
 
 def refused(profile, name, arguments):
-    """Whether a read-only bot refuses this call: the read tool by the grammar of `profile`'s reads, any other
-    tool by the hook (the same for every session of the bot)."""
+    """Whether a locked first turn refuses this call: the read tool by the grammar of `profile`'s reads, any other
+    tool by the hook (an account that may search earlier conversations)."""
     if name == policy.READ_TOOL:
         return policy.read_argv(arguments.get("command"), profile) is None
-    return policy.decide(name, arguments) is not None
+    return policy.decide_first_turn(name, arguments, search=True) is not None
 
 
 WRAPPERS = [("tool_call", {"calls": [{"name": "terminal", "arguments": {"command": "td today"}}]}),

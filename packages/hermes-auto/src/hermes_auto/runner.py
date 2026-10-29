@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 
-from . import bots
-from .bots import choose as choose_bot
 from .finish import mark_open
 
 
 MODES = ("open", "draft", "research", "agent")
+DEFAULT = "default"  # the Hermes profile every automatic session lives in
+INTERNAL_SOURCES = ("brief", "questions", "proposals", "unblocked")  # triage.INTERNAL_SOURCES
 
 
 def full_tools(job):
@@ -15,33 +15,36 @@ def full_tools(job):
     return job["source"] == "todoist" or job["mode"] == "agent"
 
 
-def delegated(job, config):
-    """A third-party job whose session lives in Dolores (bots): her read-only subagent prepares it."""
-    from .triage import INTERNAL_SOURCES
-    return (bots.delegates(config) and not bots.is_read_only(config, job.get("profile"))
-            and job["source"] not in INTERNAL_SOURCES and not bots.full_tools(job))
+def third_party(job):
+    """Whether a job carries someone else's content: everything but the user's Todoist tasks and the automation's
+    own briefs and plans. Its session's first, automatic turn only reads (the guard's first_turn mode), also for a
+    mail thread the user gave the agent label: it still holds other people's replies."""
+    return job.get("source") not in INTERNAL_SOURCES and job.get("source") != "todoist"
+
+
+def profile_of(job):
+    """The Hermes profile a job's session lives in: default, or for an older job the retired bot it was made in
+    (jobs from before bots have '')."""
+    return (job or {}).get("profile") or DEFAULT
 
 
 def prompt_for(job, config, retry=False):
-    from .triage import INTERNAL_SOURCES, delegation_note, delegator_prompt, internal_prompt, mail_session_prompt
+    from .triage import internal_prompt, mail_session_prompt
     if job["source"] in INTERNAL_SOURCES:
-        return internal_prompt(job, config) + delegation_note(job, config, comment=True)
+        return internal_prompt(job, config)
     triaged = json.loads(job["payload"]).get("triage") if job["source"] != "todoist" else None
-    if delegated(job, config) and not retry:
-        # Third-party content in Dolores: her first turn hands it to the read-only subagent (guard: first_turn).
-        payload = json.loads(job["payload"])
-        return delegator_prompt(payload, (triaged or {}).get("reason", ""), config)
-    if triaged and not retry:
-        # New mail the sorter flagged: summary and reply draft, tools blocked for this step.
-        return mail_session_prompt(json.loads(job["payload"]), triaged.get("reason", ""), config)
+    if third_party(job) and not retry:
+        # Someone else's content: the first turn reads the context itself and presents the matter (guard: reads
+        # only until the user writes).
+        return mail_session_prompt(json.loads(job["payload"]), (triaged or {}).get("reason", ""), config,
+                                   source=job["source"])
     if retry:
         base = ("The user explicitly requested continuation of the interrupted preparation. "
                 "Inspect this conversation, avoid repeating completed work, and finish the original request. ")
-        if delegated(job, config):
-            sub = bots.subagent(config)
-            return base + (f"Until the user writes here only delegate_task with profile \"{sub}\" works: if {sub} "
-                           "has not prepared the matter yet, hand it over as the first message says; then present "
-                           "its result in 1-3 sentences. Send or change nothing.")
+        if third_party(job):
+            return base + ("Until the user writes here only reads work (hermes_auto_read, skill reads, "
+                           "session_search): read what is still missing as the first message says, then present the "
+                           "matter in 1-3 sentences. Send or change nothing.")
         if job["source"] == "todoist":
             # The user's standing rule: tick off a Todoist task the agent actually finished.
             return base + ("Do not send, buy, publish or change other external records. If the task is now "
@@ -77,7 +80,7 @@ def prompt_for(job, config, retry=False):
                 "away (only this occurrence if it recurs) and read it back. If the result awaits my approval, "
                 "e.g. a draft to send, leave the task open.)")
         parts = [task.get("content") or job.get("title", ""), task.get("description") or "", note]
-        return "\n\n".join(part.strip() for part in parts if part and part.strip()) + delegation_note(job, config)
+        return "\n\n".join(part.strip() for part in parts if part and part.strip())
     if full:
         origin = ("The task title and description below are the user's own assignment; follow its rules."
                   if job["source"] == "todoist" else
@@ -108,7 +111,7 @@ def display_for(job, config, retry=False):
     visible (briefs and plans are written to be read; a retry is a short continuation anyway)."""
     if retry:
         return None
-    from .triage import INTERNAL_SOURCES, session_card
+    from .triage import session_card
     if job["source"] in INTERNAL_SOURCES:
         return None
     payload = json.loads(job["payload"])
@@ -121,7 +124,6 @@ def display_for(job, config, retry=False):
 
 
 def source_enabled(job, config):
-    from .triage import INTERNAL_SOURCES
     if job["source"] in INTERNAL_SOURCES:
         return bool(config.get("triage", {}).get("enabled"))
     return bool(config["sources"].get(job["source"], {}).get("enabled"))
@@ -187,12 +189,18 @@ def process_jobs(store, config, hermes, blocked_sources=()):
         prompt = prompt_for(job, config, retry)
         continuation = retry  # a retry prompt continues an existing turn; it shows as typed
         try:
-            # The bot is chosen once, before the session exists, and stays with the job (its session lives in
-            # that profile). A job from before bots whose session was never created (a refused create being
-            # retried) gets its bot now; one with a real session in the default profile keeps it.
-            if not job.get("profile") and (job["status"] == "pending" or not hermes.exists(job)):
-                job = {**job, "profile": choose_bot(job, config)}
-                store.update(job["id"], profile=job["profile"])
+            # Every new session opens in the default profile. An older job whose session was never created (a
+            # refused create being retried) moves there too; one whose session lives in a retired bot's profile
+            # stays there and is not continued automatically (open it by hand or use new-session).
+            if job.get("profile") != DEFAULT and (job["status"] == "pending" or not hermes.exists(job)):
+                job = {**job, "profile": DEFAULT}
+                store.update(job["id"], profile=DEFAULT)
+            elif profile_of(job) != DEFAULT:
+                store.update(job["id"], status="needs_attention",
+                             error=f"The session is in the retired profile {job['profile']!r} (bots are off); open it "
+                                   f"by hand or use `hermes-auto new-session {job['id']}`")
+                failures += 1
+                continue
             if job["status"] == "pending":
                 # ID was persisted at enqueue time, before any Hermes process starts.
                 store.update(job["id"], status="creating")

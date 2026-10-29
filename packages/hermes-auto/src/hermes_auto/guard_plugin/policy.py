@@ -1,26 +1,21 @@
-"""Hermes Auto guard: the read rules of the read-only inbox bots (Hermes profiles such as `inbox`).
+"""Hermes Auto guard: the first, automatic turn of a third-party session in the default profile (Dolores).
 
-Shared by the Hermes plugin (``__init__.py``, loaded by the gateway for the profiles that enable it) and by
+Shared by the Hermes plugin (``__init__.py``, loaded by the gateway for the profile that enables it) and by
 hermes-auto's bridge and tests. Pure Python, no Hermes imports at module level: the bridge loads this file by path
 and the tests import it.
 
-Two modes, chosen by ``scope.json`` in the profile's plugin directory:
-
-* ``read_only`` (default; the `inbox` profile): the boundary lives in the bot profile's own configuration: its
-  `platform_toolsets` name only the `hermes-auto` toolset and `session_search`, `agent.disabled_toolsets` removes
-  terminal, files, browser, web, delegation and the rest, and the gateway refuses a session that asks for more.
-  The plugin applies to every session there (no per-session registry): the one read tool runs only commands its
-  grammar proves to be reads, limited to the read families the profile was installed with, and the
-  ``pre_tool_call`` hook refuses any other tool. This also holds for a subagent Dolores runs as this profile
-  (``delegate_task`` with ``profile``): its turns run in this profile's scope, so this profile's hook guards them.
-* ``first_turn`` (Dolores' `default` profile): sessions hermes-auto registered before their first prompt
-  (``<home>/hermes-auto-guard/sessions/<session id>``) carry someone else's content. Until the user has written in
-  such a session, its turns (and the background review fork, which shares the session id) may only hand the
-  matter to the read-only subagent profile (``delegate_task``, every task with that ``profile``), search this
-  profile's conversations and read skills. Every other session of the profile is untouched. Fail-closed: a
-  registered session whose messages cannot be read stays locked, and a session that cannot be told (registry or
-  state.db unreadable, lineage query failing, a compression lineage over COMPRESSION_HOPS or with a cycle) gets no
-  tool at all. ``tool_search`` is refused in both modes (Hermes may send its queries to remote connectors).
+One mode, ``first_turn``, set by ``scope.json`` in the profile's plugin directory. Sessions hermes-auto registered
+before their first prompt (``<home>/hermes-auto-guard/sessions/<session id>``) carry someone else's content (mail,
+Slack, GitHub, Linear, a "↩" reply). Until the user has written in such a session, its turns (and the background
+review fork, which shares the session id) may only read: the plugin's read tool (one command its grammar proves to
+be a read, limited to the read families of the session's account), raw skill reads and ``session_search`` in this
+profile (when the session's account may search). Every other session of the profile is untouched, and so is a
+registered one once the user wrote in it. The read families come from the scope: default reads, and per provider (an
+account chosen by hermes-auto's ``routes``, e.g. a work account) its own reads and whether it may search earlier
+conversations. Fail-closed: a registered session whose messages cannot be read stays locked; a session that cannot
+be told (registry or state.db unreadable, lineage query failing, a compression lineage with a cycle, a dangling
+parent or over COMPRESSION_HOPS) gets no tool at all; without a valid scope a locked session reads nothing and
+cannot search. ``tool_search`` is refused while locked (Hermes may send its queries to remote connectors).
 """
 from __future__ import annotations
 
@@ -33,30 +28,31 @@ import subprocess
 import sys
 
 GUARD_NAME = "hermes-auto-guard"
-GUARD_VERSION = "2.2.2"
-READ_ONLY_MODE, FIRST_TURN_MODE = "read_only", "first_turn"
-MODES = (READ_ONLY_MODE, FIRST_TURN_MODE)
-PROFILE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")  # bots.NAME
+GUARD_VERSION = "3.0.0"
+FIRST_TURN_MODE = "first_turn"
+SCOPE_VERSION = 2
 TOOLSET = "hermes-auto"
 READ_TOOL = "hermes_auto_read"
 SKILL_VIEW_TOOL = "hermes_auto_skill_view"
 SKILLS_LIST_TOOL = "hermes_auto_skills_list"
 PLUGIN_TOOLS = (READ_TOOL, SKILL_VIEW_TOOL, SKILLS_LIST_TOOL)
-# Tools a session of a read-only bot may call (the hook refuses everything else).
-ALLOWED_TOOLS = frozenset(PLUGIN_TOOLS) | {"session_search"}
+SEARCH = "session_search"
+# Hermes renames some tools on the Anthropic OAuth wire and maps them back before dispatch; the hook treats a wire
+# name like the tool itself.
+ALIASES = {"chat_history_lookup": SEARCH}
+# Tools a locked (first, automatic) turn may call; session_search only in this profile and on an account that may.
+FIRST_TURN_TOOLS = frozenset(PLUGIN_TOOLS) | {SEARCH}
 
-# How a job's automatic session is launched. "mail" and "research" read through READ_TOOL in a read-only bot;
-# "private" (private Slack channels) has no tools at all without bots (in Dolores it is DELEGATE like the rest);
-# "full" is a Todoist task (or a mail the user gave the agent label) with the target bot's normal tools.
+# How a job's automatic session is launched (its `deny_tools`): "mail", "research" and "private" are the read
+# profiles the sorter chose, and every one of them is a FIRST_TURN launch in the default profile (normal toolsets;
+# this guard locks the turn until the user writes). "full" is a Todoist task with the profile's normal tools.
 MAIL, RESEARCH, PRIVATE, FULL = "mail", "research", "private", "full"
 DENY_PROFILES = (MAIL, RESEARCH, PRIVATE)
 PROFILES = DENY_PROFILES + (FULL,)
-# A third-party job in Dolores' profile (bots): her normal tools under the first_turn guard; the read-only
-# subagent profile reads.
-DELEGATE = "delegate"
-# Read families: which programs a profile's read tool may run.
+FIRST_TURN = "first_turn"
+# Read families: which programs the read tool may run.
 GOOGLE, TODOIST, GITHUB, LINEAR, SLACK = "google", "todoist", "github", "linear", "slack"
-FAMILIES = (GOOGLE, TODOIST, GITHUB, LINEAR, SLACK)
+FAMILIES = (GITHUB, GOOGLE, LINEAR, SLACK, TODOIST)
 PROFILE_FAMILIES = {MAIL: frozenset({GOOGLE, TODOIST}), RESEARCH: frozenset(FAMILIES)}
 OUTPUT_LIMIT = 30000
 COMMAND_TIMEOUT = 120
@@ -83,24 +79,22 @@ def families_for(profile):
     return frozenset()
 
 
-def valid_scope(data):
-    """scope.json: {"version": 1, "reads": [families], "providers": {provider: {"reads": [...], "session_search":
-    bool}}}. `reads` apply to sessions on any other account; a provider entry (e.g. a work account chosen by a
-    hermes-auto route) replaces them for sessions running on that provider.
+def valid_families(value):
+    return isinstance(value, list) and all(item in FAMILIES for item in value)
 
-    Dolores' profile: {"version": 1, "mode": "first_turn", "reads": [], "subagent": "<read-only profile>"}: no
-    reads of its own and no providers; `subagent` is the only profile an automatic first turn may delegate to."""
-    if not (isinstance(data, dict) and data.get("version") == 1 and isinstance(data.get("reads"), list)
-            and all(item in FAMILIES for item in data["reads"]) and data.get("mode", READ_ONLY_MODE) in MODES):
+
+def valid_scope(data):
+    """scope.json: {"version": 2, "mode": "first_turn", "reads": [families], "providers": {provider: {"reads":
+    [...], "session_search": bool}}}. `reads` apply to sessions on any other account; a provider entry (e.g. a
+    work account chosen by a hermes-auto route) replaces them for sessions running on that provider. The scopes of
+    guard 2.x (read-only bots, the delegating `subagent` scope) are not valid here."""
+    if not (isinstance(data, dict) and data.get("version") == SCOPE_VERSION and data.get("mode") == FIRST_TURN_MODE
+            and valid_families(data.get("reads")) and set(data) <= {"version", "mode", "reads", "providers"}):
         return False
-    if data.get("mode") == FIRST_TURN_MODE:
-        subagent = data.get("subagent")
-        return (data["reads"] == [] and "providers" not in data and isinstance(subagent, str)
-                and bool(PROFILE_NAME.fullmatch(subagent)))
     providers = data.get("providers", {})
     return isinstance(providers, dict) and all(
-        isinstance(name, str) and isinstance(spec, dict) and isinstance(spec.get("reads"), list)
-        and all(item in FAMILIES for item in spec["reads"]) and isinstance(spec.get("session_search", False), bool)
+        isinstance(name, str) and bool(name) and isinstance(spec, dict) and valid_families(spec.get("reads"))
+        and isinstance(spec.get("session_search", False), bool) and set(spec) <= {"reads", "session_search"}
         for name, spec in providers.items())
 
 
@@ -114,16 +108,10 @@ def load_scope(plugin_dir):
     return data if valid_scope(data) else None
 
 
-def read_scope(plugin_dir):
-    """The default read families of a profile's plugin; none (every read refused) without a valid scope."""
-    data = load_scope(plugin_dir)
-    return frozenset(data["reads"]) if data else frozenset()
-
-
 def session_scope(data, provider):
     """(read families, session_search allowed) for a session running on `provider` under scope `data`.
 
-    One bot may serve two accounts (private and work): a session on a provider with its own entry gets only that
+    The profile serves two accounts (private and work): a session on a provider with its own entry gets only that
     entry's reads, others the default reads with session_search. An unknown provider (None: the session's row could
     not be read) gets what every entry allows and no session_search; no scope gets nothing."""
     if not data:
@@ -424,11 +412,12 @@ def read_only_command(command, profile=True):
 
 # --- Hook decision -------------------------------------------------------------------------------------
 
-REFUSED_READ = ("Not run: this bot only reads (third-party content). Use hermes_auto_read for one plain read "
-                "command, hermes_auto_skill_view/hermes_auto_skills_list for skills and session_search for earlier "
-                "conversations. Sending and writing happen in Dolores (\"Kontynuuj w Dolores\").")
-REFUSED_PROFILE = ("Not run: this bot may search only its own conversations (no `profile`, no `profile/id` "
-                   "session links).")
+REFUSED_READ = ("Not run: the first, automatic turn of this session only reads (third-party content). Use "
+                "hermes_auto_read for one plain read command, hermes_auto_skill_view/hermes_auto_skills_list for "
+                "skills and session_search for earlier conversations; every tool works after the user's first "
+                "message.")
+REFUSED_PROFILE = ("Not run: an automatic turn may search only this profile's conversations (no `profile`, no "
+                   "`profile/id` session links).")
 
 
 def own_profile_search(args):
@@ -445,9 +434,9 @@ def own_profile_search(args):
 # Hermes' Tool Search bridge. Plugin tools are deferred behind it: a session calls them by their exact name through
 # `tool_call` (or directly when the request lists them). `tool_search` is no local catalog read: with
 # manage_connections among the session's tools Hermes sends every query to the connector service
-# (tools/tool_search.py, `connections_in_scope`), so it is refused in both modes. `tool_describe` reaches the
-# connector service only for `connectors__` names (tools/connectors/search.py, `remote_schemas_for`): it may load
-# only the mode's own tools.
+# (tools/tool_search.py, `connections_in_scope`), so a locked turn may not use it. `tool_describe` reaches the
+# connector service only for `connectors__` names (tools/connectors/search.py, `remote_schemas_for`): a locked
+# turn may load only its own tools.
 SEARCH_TOOL, DESCRIBE_TOOL = "tool_search", "tool_describe"
 REFUSED_TOOL_SEARCH = (
     "Not run: tool_search is off here (it can send its queries to remote connectors). Call a tool by its exact "
@@ -462,7 +451,7 @@ def described_names(args):
     names = [names] if isinstance(names, str) else names
     if not isinstance(names, list) or not names or not all(isinstance(name, str) for name in names):
         return None
-    return frozenset(name.strip() for name in names)
+    return frozenset(ALIASES.get(name.strip(), name.strip()) for name in names)
 
 
 def describe_allowed(args, allowed):
@@ -470,48 +459,9 @@ def describe_allowed(args, allowed):
     return bool(names) and names <= allowed
 
 
-def bridged_names(args):
-    """The real tool names inside a `tool_call` bridge call ({"name"} or {"calls": [{"name"}, ...]})."""
-    if not isinstance(args, dict):
-        return frozenset()
-    calls = args.get("calls")
-    if calls is None:
-        calls = [args]
-    if isinstance(calls, str):
-        try:
-            calls = json.loads(calls)
-        except ValueError:
-            return frozenset({""})
-    if isinstance(calls, dict):
-        calls = [calls]
-    if not isinstance(calls, list):
-        return frozenset({""})
-    return frozenset(str(call.get("name") or "") if isinstance(call, dict) else "" for call in calls)
-
-
-REFUSED_SEARCH = ("Not run: earlier conversations are not searchable from a session on this account (the bot also "
-                  "serves another account's matters).")
-
-
-def decide(tool_name, args, search=True):
-    """The block message for one tool call in a read-only bot's session, or None to let it run: only the
-    plugin's tools, session_search in this profile (when the session's account may search) and the Tool Search
-    bridge to them (tool_call, tool_describe of these tools; never tool_search)."""
-    if tool_name == "session_search":
-        if not search:
-            return REFUSED_SEARCH
-        return None if own_profile_search(args) else REFUSED_PROFILE
-    if tool_name in ALLOWED_TOOLS:
-        return None
-    if tool_name == SEARCH_TOOL:
-        return REFUSED_TOOL_SEARCH
-    if tool_name == DESCRIBE_TOOL:
-        return None if describe_allowed(args, ALLOWED_TOOLS) else REFUSED_READ
-    if tool_name == "tool_call":
-        names = bridged_names(args)
-        if names and names <= ALLOWED_TOOLS:
-            return None  # Hermes unwraps the bridge and checks the real tool again before it runs
-    return REFUSED_READ
+REFUSED_SEARCH = ("Not run: earlier conversations are not searchable from an automatic turn on this account (the "
+                  "profile also holds the other account's matters). (Nie uruchomiono: z automatycznej tury na tym "
+                  "koncie nie przeszukuje się wcześniejszych rozmów.)")
 
 
 # --- first_turn: Dolores' automatic sessions ------------------------------------------------------------
@@ -526,14 +476,11 @@ SYSTEM_PREFIXES = ("[IMPORTANT:", "[System", "[ASYNC", "[INTERNAL", "[CONTEXT CO
                    "[PRIOR CONTEXT", "[STILL IN PROGRESS")
 # Display kinds of rows a person typed: a normal message (NULL), a steer, a hidden composer send.
 HUMAN_KINDS = ("steer", "hidden")
-FIRST_TURN_TOOLS = frozenset({SKILL_VIEW_TOOL, SKILLS_LIST_TOOL})
-# What tool_describe may load in a locked session (no connector name: those are described remotely).
-FIRST_TURN_DESCRIBE = frozenset({"delegate_task", "session_search"}) | FIRST_TURN_TOOLS
 REFUSED_FIRST_TURN = (
-    "Nie uruchomiono: to pierwsza, automatyczna tura sesji z treścią od osoby trzeciej. Teraz działa tylko "
-    "delegate_task z zadaniami `profile: \"{subagent}\"` (agent {subagent} czyta i przygotowuje sprawę), "
-    "session_search w tym profilu i odczyt skilli. Pełne narzędzia ruszą po pierwszej wiadomości Łukasza w tej "
-    "sesji. (Not run: automatic first turn; full tools after the user's first message.)")
+    "Nie uruchomiono: to pierwsza, automatyczna tura sesji z treścią od osoby trzeciej. Teraz działają tylko "
+    "odczyty: hermes_auto_read (jedno polecenie odczytu), hermes_auto_skill_view/hermes_auto_skills_list i "
+    "session_search w tym profilu. Pełne narzędzia ruszą po pierwszej wiadomości Łukasza w tej sesji. (Not run: "
+    "automatic first turn, reads only; every tool after the user's first message.)")
 REFUSED_UNKNOWN = (
     "Nie uruchomiono: nie da się ustalić, czy ta sesja jest automatyczną sesją z treścią od osoby trzeciej "
     "({why}), więc hermes-auto-guard wstrzymuje wszystkie narzędzia, dopóki odczyt się nie uda. Spróbuj ponownie "
@@ -697,45 +644,28 @@ def bridged_calls(args):
     return found
 
 
-def delegation_allowed(args, subagent):
-    """`delegate_task` that only hands work to `subagent`: `list`, or a spawn whose every task names that profile
-    (no top-level goal: Hermes would run it in this profile) and carries no local images."""
-    if not isinstance(args, dict):
-        return False
-    action = str(args.get("action") or "").strip().lower()
-    if action == "list":
-        return True
-    if action not in ("", "spawn") or args.get("images"):
-        return False
-    tasks = args.get("tasks")
-    if isinstance(tasks, str):
-        try:
-            tasks = json.loads(tasks)
-        except ValueError:
-            return False
-    return (isinstance(tasks, list) and bool(tasks)
-            and all(isinstance(task, dict) and task.get("profile") == subagent and not task.get("images")
-                    for task in tasks))
-
-
-def decide_first_turn(tool_name, args, subagent):
-    """The block message for one tool call in a locked automatic session of Dolores' profile, or None."""
-    allowed = None
-    if tool_name == "delegate_task":
-        allowed = delegation_allowed(args, subagent)
-    elif tool_name == "session_search":
-        allowed = own_profile_search(args)
-    elif tool_name in FIRST_TURN_TOOLS:
-        allowed = True
-    elif tool_name == SEARCH_TOOL:
+def decide_first_turn(tool_name, args, search=False):
+    """The block message for one tool call in a locked automatic session, or None to let it run: the plugin's read
+    tools, session_search in this profile when the session's account may search (`search`), and the Tool Search
+    bridge to them (tool_call; tool_describe of these tools; never tool_search). The read tool checks its command
+    and the account's read families itself."""
+    tool_name = ALIASES.get(tool_name, tool_name)
+    if tool_name == SEARCH:
+        if not search:
+            return REFUSED_SEARCH
+        return None if own_profile_search(args) else REFUSED_PROFILE
+    if tool_name in PLUGIN_TOOLS:
+        return None
+    if tool_name == SEARCH_TOOL:
         return REFUSED_TOOL_SEARCH
-    elif tool_name == DESCRIBE_TOOL:
-        allowed = describe_allowed(args, FIRST_TURN_DESCRIBE)
-    elif tool_name == "tool_call":
+    if tool_name == DESCRIBE_TOOL:
+        return None if describe_allowed(args, FIRST_TURN_TOOLS) else REFUSED_FIRST_TURN
+    if tool_name == "tool_call":
         calls = bridged_calls(args)
-        allowed = bool(calls) and all(name != "tool_call" and decide_first_turn(name, arguments, subagent) is None
-                                      for name, arguments in calls)
-    return None if allowed else REFUSED_FIRST_TURN.format(subagent=subagent)
+        if calls and all(name.strip() != "tool_call" and decide_first_turn(name.strip(), arguments, search) is None
+                         for name, arguments in calls):
+            return None  # Hermes unwraps the bridge and checks the real tool again before it runs
+    return REFUSED_FIRST_TURN
 
 
 # --- Skill reads (raw text: no template rendering, inline shell or dependency install) ---------------

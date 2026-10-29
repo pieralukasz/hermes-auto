@@ -1,6 +1,7 @@
-"""hermes-auto-guard: the Hermes plugin of the read-only inbox bots (second layer after the profile's toolsets)."""
+"""hermes-auto-guard: the read rules of a locked first turn in the default profile (see also test_one_session)."""
 import json
 import os
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -10,13 +11,32 @@ from hermes_auto import guard_plugin as plugin
 from hermes_auto.guard_plugin import policy
 
 
+def locked(home, *sids):
+    """Registered automatic sessions with only the automation's (marked) first message: locked to reads."""
+    db = sqlite3.connect(home / "state.db")
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, end_reason TEXT);
+        CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT,
+            content TEXT, api_content TEXT, display_kind TEXT, display_metadata TEXT,
+            _compressed_summary INTEGER DEFAULT 0);
+    """)
+    for sid in sids:
+        db.execute("INSERT INTO sessions VALUES (?, NULL, NULL)", (sid,))
+        db.execute("INSERT INTO messages(session_id, role, content) VALUES (?, 'user', ?)",
+                   (sid, "card " + policy.AUTO_TURN_MARK))
+        policy.register_session(home, sid)
+    db.commit()
+    db.close()
+
+
 @pytest.fixture
 def home(tmp_path, monkeypatch):
-    """A bot profile home with the plugin installed for mail reads (Google and Todoist)."""
-    home = tmp_path / "hermes" / "profiles" / "inbox"
+    """The default profile with the plugin installed for mail reads (Google and Todoist) and a locked session s1."""
+    home = tmp_path / "hermes"
     home.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
     guard.install(home, ["google", "todoist"])
+    locked(home, "s1")
     return home
 
 
@@ -24,10 +44,15 @@ def hook(name, args=None, session_id="s1"):
     return plugin.pre_tool_call(tool_name=name, args=args or {}, session_id=session_id, task_id="", turn_id="t1")
 
 
-# ── Every session of the bot is read-only ────────────────────────────────────
+# ── A locked first turn only reads; other sessions are untouched ─────────────
 
-@pytest.mark.parametrize("session_id", ["s1", "a-session-the-user-opened-by-hand"])
-def test_every_session_of_the_bot_allows_only_the_read_tools(home, session_id):
+def test_a_session_the_user_opened_by_hand_is_untouched(home):
+    for name in ("terminal", "delegate_task", "write_file", "tool_search"):
+        assert hook(name, session_id="a-session-the-user-opened-by-hand") is None, name
+
+
+@pytest.mark.parametrize("session_id", ["s1"])
+def test_a_locked_first_turn_allows_only_the_read_tools(home, session_id):
     for name in ("hermes_auto_read", "hermes_auto_skill_view", "hermes_auto_skills_list", "session_search"):
         assert hook(name, session_id=session_id) is None, name
     assert hook("tool_describe", {"names": ["hermes_auto_read"]}, session_id=session_id) is None
@@ -47,8 +72,9 @@ def test_session_search_stays_in_this_profile(home):
     assert hook("session_search", {"session_id": "20261028_x", "around_message_id": 3}) is None
     assert hook("session_search", {"query": "secret", "profile": "default"})["action"] == "block"
     assert hook("session_search", {"session_id": "default/20261028_x"})["action"] == "block"
-    # Through the bridge the real call is checked again by this hook once Hermes unwraps it.
-    assert hook("tool_call", {"name": "session_search", "arguments": {"profile": "default"}}) is None
+    # Through the bridge too (Hermes also checks the unwrapped call again with this hook).
+    assert hook("tool_call", {"name": "session_search", "arguments": {"profile": "default"}})["action"] == "block"
+    assert hook("tool_call", {"name": "session_search", "arguments": {"query": "x"}}) is None
 
 
 def test_skills_are_read_as_raw_text_inside_their_directory(tmp_path):
@@ -97,7 +123,8 @@ def test_a_work_bot_scope_reads_github_but_no_private_mail(home, monkeypatch):
 
 
 @pytest.mark.parametrize("scope", [None, "{not json", json.dumps({"version": 1, "reads": ["shell"]}),
-                                   json.dumps({"version": 2, "reads": ["todoist"]})])
+                                   json.dumps({"version": 1, "reads": ["todoist"]}),
+                                   json.dumps({"version": 2, "mode": "first_turn", "reads": ["shell"]})])
 def test_without_a_valid_scope_every_read_is_refused(home, monkeypatch, scope):
     calls = fake_run(monkeypatch)
     path = home / "plugins" / policy.GUARD_NAME / policy.SCOPE_FILE
@@ -110,7 +137,7 @@ def test_without_a_valid_scope_every_read_is_refused(home, monkeypatch, scope):
 
 
 def test_the_scope_is_read_from_the_home_of_the_turn(tmp_path, monkeypatch):
-    """One module may serve two bots in one gateway: each turn reads its own profile's scope."""
+    """One module may serve several profiles in one gateway: each turn reads its own profile's scope."""
     calls = fake_run(monkeypatch)
     private, work = tmp_path / "profiles" / "inbox", tmp_path / "profiles" / "work-inbox"
     guard.install(private, ["todoist"])
@@ -134,14 +161,15 @@ def provider_db(home, rows):
     db.close()
 
 
-def test_one_bot_two_accounts_each_session_reads_what_its_account_may(home, monkeypatch):
-    """The inbox bot serves private and work matters; the account frozen into a session picks its reads."""
+def test_one_profile_two_accounts_each_session_reads_what_its_account_may(home, monkeypatch):
+    """The default profile holds private and work matters; the account frozen into a session picks its reads."""
     calls = fake_run(monkeypatch)
     guard.install(home, ["google", "todoist", "github"],
                   {"anthropic-work": {"reads": ["github", "slack"], "session_search": False}})
     provider_db(home, [("private", {"toolsets": ["hermes-auto"]}),
                        ("work", {"provider": "anthropic-work", "toolsets": ["hermes-auto"]}),
                        ("work-custom", {"provider": "anthropic-work", "model": "m"})])
+    locked(home, "private", "work", "work-custom", "unknown")
     google = "python3 ~/.hermes/skills/productivity/google-workspace/scripts/google_api.py gmail search x"
     assert json.loads(plugin.read_tool({"command": google}, session_id="private"))["exit_code"] == 0
     assert hook("session_search", {"query": "x"}, session_id="private") is None
@@ -165,7 +193,7 @@ def test_trusted_script_paths_are_expanded_without_a_shell():
     assert policy.read_argv(command.replace("gmail search", "gmail send"), "mail") is None
 
 
-def test_the_slack_script_is_trusted_in_the_tapin_bots_skills():
+def test_the_slack_script_is_trusted_in_both_places_of_the_tapin_skills():
     for path in ("~/.hermes/skills/tap-in/tapin-slack/scripts/slack_mcp.py",
                  "~/.hermes/profiles/tapin/skills/tap-in/tapin-slack/scripts/slack_mcp.py"):
         assert policy.read_argv(f"python3 {path} call slack_read_thread '{{}}'", ["slack"]) is not None, path
