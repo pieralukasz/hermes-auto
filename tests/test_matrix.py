@@ -376,3 +376,94 @@ def test_chats_stay_on_the_private_account_under_the_work_routes(store, server):
 def test_the_homeserver_must_be_configured():
     with pytest.raises(MatrixError, match="homeserver"):
         Matrix(Source.defaults())
+
+
+# ── Push: the listener next to the homeserver ────────────────────────────────
+
+from hermes_auto import listening  # noqa: E402
+from hermes_auto_matrix.listener import MatrixListener  # noqa: E402
+
+
+class Sink:
+    """Records what the listener publishes; `fail` makes it refuse like an unreachable relay."""
+
+    def __init__(self):
+        self.emitted, self.beats, self.fail = [], [], False
+
+    def emit(self, source, hint=None, wake_after=None):
+        if self.fail:
+            raise RuntimeError("Relay did not accept the event")
+        self.emitted.append((source, hint, wake_after))
+
+    def beat(self, sources, connected):
+        self.beats.append((tuple(sources), connected))
+
+    def pump(self):
+        pass
+
+
+def listener(tmp_path, server, sink, now=NOW, **settings):
+    return MatrixListener(tmp_path, {**settings}, http=server, sink=sink, clock=lambda: now)
+
+
+def test_the_listener_publishes_when_someone_else_writes_and_never_the_text(tmp_path, server):
+    sink = Sink()
+    watch = listener(tmp_path, server, sink)
+    server.say(DM, ANNA, "sprzed startu", NOW - 60)
+    assert watch.check()  # the baseline after a start: one check for whatever came while it was down
+    syncs = [params for path, params in server.calls if path.endswith("/sync")]
+    assert json.loads(syncs[0]["filter"])["room"]["timeline"]["limit"] == 0
+    server.say(DM, ME, "moja odpowiedź", NOW + 1)
+    server.say(MGMT, "@whatsappbot:example.test", "Bridge status: connected", NOW + 2)
+    assert not watch.check()  # own message and the bridge bot: nothing to publish
+    server.say(DM, ANNA, "Czy możesz jutro o 10?", NOW + 3)
+    assert watch.check()
+    assert sink.emitted == [("matrix", None, None), ("matrix", None, None)]  # the source name only, no text
+    syncs = [params for path, params in server.calls if path.endswith("/sync")]
+    assert all(params["set_presence"] == "offline" for params in syncs)
+    assert int(syncs[-1]["timeout"]) == 30_000  # a long poll, not a busy loop
+    assert sink.beats and sink.beats[0] == (("matrix",), True)
+
+
+def test_a_refused_publish_keeps_the_position_so_the_message_publishes_again(tmp_path, server):
+    sink = Sink()
+    watch = listener(tmp_path, server, sink)
+    watch.check()
+    server.say(DM, ANNA, "halo", NOW + 3)
+    sink.fail = True
+    with pytest.raises(RuntimeError):
+        watch.check()
+    sink.fail = False
+    assert watch.check() and len(sink.emitted) == 2
+
+
+def test_skipped_rooms_and_old_backfill_do_not_publish(tmp_path, server):
+    sink = Sink()
+    watch = listener(tmp_path, server, sink, skip_rooms=[GROUP])
+    watch.check()
+    server.say(GROUP, ANNA, "w pominiętej grupie", NOW + 1)
+    server.say(DM, ANNA, "historia sprzed dwóch dni", NOW - 2 * 86400)
+    assert not watch.check() and len(sink.emitted) == 1
+
+
+def test_a_nudge_makes_the_mac_check_matrix_once_the_room_went_quiet(store, server, tmp_path):
+    # Relay -> LocalSink on the Mac writes matrix-listener.json; the source is due after `quiet_seconds`
+    # without waiting for its polling interval, and the burst is ready by then.
+    baseline(store, server)
+    settings = {"enabled": True, "poll_seconds": 0}
+    assert not Source().due(settings, store, NOW, NOW + 5)
+    server.say(DM, ANNA, "Czy możesz jutro o 10?", NOW + 10)
+    listening.write_state(tmp_path, "matrix", {"nudge_at": NOW + 11})
+    assert not Source().due(settings, store, NOW, NOW + 11 + QUIET - 1)  # still quiet-waiting
+    assert Source().due(settings, store, NOW, NOW + 11 + QUIET)
+    assert [c["room_id"] for c in check(store, server, NOW + 11 + QUIET)] == [DM]
+    assert not Source().due(settings, store, NOW + 11 + QUIET, NOW + 200)  # that nudge is used up
+
+
+def test_polling_stays_as_the_fallback(store):
+    assert Source().due({"poll_seconds": 60}, store, NOW, NOW + 60)
+    assert not Source().due({"poll_seconds": 60}, store, NOW, NOW + 30)
+
+
+def test_chats_wait_at_most_30_seconds_of_quiet():
+    assert Source.defaults()["quiet_seconds"] <= 30

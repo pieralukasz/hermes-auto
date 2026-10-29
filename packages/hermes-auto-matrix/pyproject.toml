@@ -16,6 +16,7 @@ Issues = "https://github.com/pieralukasz/hermes-auto/issues"
 
 [project.scripts]
 hermes-auto-matrix = "hermes_auto_matrix:main"
+hermes-auto-matrix-listen = "hermes_auto_matrix.listener:main"
 
 [project.entry-points."hermes_auto.sources"]
 matrix = "hermes_auto_matrix:Source"

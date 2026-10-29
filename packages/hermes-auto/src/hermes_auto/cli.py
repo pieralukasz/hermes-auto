@@ -420,7 +420,9 @@ def main(argv=None):
             finally:
                 store.close()
     except Exception as exc:
-        print(f"hermes-auto: {exc}", file=sys.stderr)
+        # Scheduled checks write to service.log: date the line. Interactive commands show the bare message.
+        stamp = f"{time.strftime('%Y-%m-%d %H:%M:%S')} " if args.command in ("tick", "run", "scan") else ""
+        print(f"{stamp}hermes-auto: {exc}", file=sys.stderr)
         return 1
 
 
@@ -628,7 +630,10 @@ def dispatch(args, home, config, store):
         counts = {}
         for job in store.rows():
             counts[job["status"]] = counts.get(job["status"], 0) + 1
-        print(json.dumps({"jobs": counts, "source_errors": errors, "failed_this_run": failures}))
+        # `at`, `checked` and `seconds` date each line of service.log, so a late session can be traced to its check.
+        print(json.dumps({"at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(started)), "checked": checked,
+                          "seconds": round(time.time() - started, 1), "jobs": counts, "source_errors": errors,
+                          "failed_this_run": failures}))
         return int(bool(errors or failures))
     return 0
 

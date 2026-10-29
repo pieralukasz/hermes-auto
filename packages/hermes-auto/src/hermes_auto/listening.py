@@ -180,26 +180,37 @@ def run_tick(home):
 
 
 class TickPump:
-    """Runs a tick once the latest event's quiet period ends; a busy run lock retries in 30 seconds,
-    a tick that crashed or timed out in `RETRY_SECONDS`."""
+    """Runs a tick at every requested time: each event's quiet period end, a source's later wake-up.
+    Times that passed together run one tick. A busy run lock retries in 30 seconds, a tick that crashed
+    or timed out in `RETRY_SECONDS`.
+
+    Every time is kept, not only the latest: one later wake-up (a Todoist settle time, `again_after`)
+    must not swallow the earlier end of another source's quiet period."""
 
     RETRY_SECONDS = 60
 
     def __init__(self, runner, clock=time.time, logger=None):
         self.runner, self.clock, self.logger = runner, clock, logger or log
         self.lock = threading.Lock()
-        self.due_at = None
+        self.times = set()
+
+    @property
+    def due_at(self):
+        """The next tick (None: nothing waits)."""
+        with self.lock:
+            return min(self.times) if self.times else None
 
     def schedule(self, at):
         with self.lock:
-            self.due_at = max(self.due_at or 0, at)
+            self.times.add(float(at))
 
     def pump(self):
         with self.lock:
-            due = self.due_at
-            if due is None or self.clock() < due:
+            now = self.clock()
+            passed = {at for at in self.times if at <= now}
+            if not passed:
                 return
-            self.due_at = None
+            self.times -= passed
         try:
             code, error = self.runner()
         except Exception as exc:  # noqa: BLE001 - the pumping thread must outlive a hung or failed tick

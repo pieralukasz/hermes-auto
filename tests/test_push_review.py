@@ -495,3 +495,26 @@ def test_slack_listener_reports_liveness_to_the_sink(tmp_path):
     assert sink.beats[-1] == (("slack",), True)
     listener.beat(connected=False)
     assert sink.beats[-1] == (("slack",), False)
+
+
+def test_a_later_wake_does_not_swallow_an_earlier_tick():
+    # Todoist asks for a check in 16 minutes; a chat's quiet period ends in 30 seconds: both run, in order.
+    clock, runs = [0.0], []
+
+    def runner():
+        runs.append(clock[0])
+        return 0, ""
+
+    pump = listening.TickPump(runner, lambda: clock[0], logger=lambda message: None)
+    pump.schedule(960)
+    pump.schedule(30)
+    assert pump.due_at == 30
+    clock[0] = 30
+    pump.pump()
+    clock[0] = 100
+    pump.pump()
+    assert runs == [30]
+    clock[0] = 960
+    pump.pump()
+    pump.pump()
+    assert runs == [30, 960] and pump.due_at is None

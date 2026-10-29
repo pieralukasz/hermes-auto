@@ -349,16 +349,29 @@ class Source:
                 # The user's own puppets (without double puppeting his messages come from these).
                 "own_puppets": [],
                 "skip_rooms": [],
-                # A room is handed over after nobody wrote for this long (seconds).
-                "quiet_seconds": 90,
-                # No push to this Mac: check this often (seconds; 0 = only full checks). One /sync per check.
+                # A room is handed over after nobody wrote for this long (seconds). The listener's tick
+                # comes this long after the last message, too.
+                "quiet_seconds": 30,
+                # Check this often (seconds; 0 = never on a timer). With a listener behind the relay this is
+                # the fallback; one /sync per check.
                 "poll_seconds": 60,
+                # Listener: how long one /sync waits on the homeserver for something new (seconds).
+                "listen_timeout_seconds": 30,
                 # Messages older than this are never new (a bridge backfilling history).
                 "max_age_hours": 24,
                 "context_messages": 8, "max_burst": 40}
 
     def due(self, settings, store, last_poll, now):
+        """Due when the listener (on this machine or behind the relay) saw a message and the room has been
+        quiet since, or the polling interval elapsed."""
+        from hermes_auto.listening import nudged
         settings = {**self.defaults(), **settings}
+        try:
+            home = Path(store.path).parent
+        except (AttributeError, TypeError):
+            home = None
+        if home is not None and nudged(home, "matrix", last_poll, now, float(settings["quiet_seconds"])):
+            return True
         return bool(settings["poll_seconds"]) and now - last_poll >= float(settings["poll_seconds"])
 
     def poll(self, config, store):
