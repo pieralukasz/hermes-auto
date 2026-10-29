@@ -30,6 +30,7 @@ struct ConnectionDisclosureStyle: DisclosureGroupStyle {
 struct OverviewView: View {
     @Bindable var model: Model
     @Binding var tab: Tab
+    @Binding var filter: EventFilter
 
     var body: some View {
         ScrollView(.vertical) {
@@ -43,6 +44,7 @@ struct OverviewView: View {
                                 ConnectionRow(connection: connection, model: model) {
                                     model.sourceFilter = connection.source
                                     model.channelFilter = connection.channel
+                                    filter = .all
                                     tab = .events
                                 }
                                 if connection.id != group.items.last?.id {
@@ -117,7 +119,7 @@ struct OverviewView: View {
                     }.padding(.vertical, 4).contentShape(Rectangle())
                 }.buttonStyle(.plain)
             }
-            Text("Expand a source to inspect its connection and latest read.")
+            Text("Expand a source to see its recent activity.")
                 .font(.callout).foregroundStyle(Color.secondaryText)
         }
     }
@@ -138,33 +140,7 @@ struct ConnectionRow: View {
 
     var body: some View {
         DisclosureGroup(isExpanded: $expanded) {
-            VStack(alignment: .leading, spacing: 12) {
-                Text(connection.path.joined(separator: " → "))
-                    .font(.callout.weight(.medium)).fixedSize(horizontal: false, vertical: true)
-                VStack(alignment: .leading, spacing: 8) {
-                    LabeledContent(connection.channel == nil ? "Last successful read" : "Last Matrix read",
-                                   value: relativeTime(connection.health.lastPoll, now: model.now))
-                    if let retry = connection.health.retryAt {
-                        LabeledContent("Next retry", value: retry > model.now.timeIntervalSince1970
-                                       ? Date(timeIntervalSince1970: retry).formatted(date: .omitted, time: .standard)
-                                       : "waiting for the next check")
-                    }
-                    if let listener = connection.health.listener {
-                        LabeledContent("Event listener", value: listener.connected.map { $0 ? "connected" : "disconnected" } ?? "unknown")
-                        LabeledContent("Last heartbeat", value: relativeTime(listener.heartbeat, now: model.now))
-                        LabeledContent("Last signal", value: relativeTime(listener.lastEventAt, now: model.now))
-                    }
-                }.font(.callout)
-                if connection.source == "matrix" {
-                    Text(connection.channel == nil
-                         ? "No messenger list is available from this CLI. Connections may still exist."
-                         : "Recognized in cached conversations. A successful Matrix read does not confirm that this bridge is working; separate bridge health is unavailable.")
-                        .font(.caption).foregroundStyle(Color.secondaryText)
-                }
-                Button("Show \(connection.title) history", action: showHistory)
-                    .controlSize(.small)
-            }
-            .textSelection(.enabled)
+            InlineSourceHistory(connection: connection, model: model, openHistory: showHistory)
         } label: {
             HStack(spacing: 10) {
                 Image(systemName: sourceSymbol(connection.source))

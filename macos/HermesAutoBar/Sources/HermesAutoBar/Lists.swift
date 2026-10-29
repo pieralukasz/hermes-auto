@@ -13,9 +13,9 @@ struct EventsList: View {
                     ForEach(EventFilter.allCases) { Text($0.rawValue).tag($0) }
                 }
                 .pickerStyle(.menu)
-                .fixedSize()
-                Spacer()
-                SourceScopeBar(model: model)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                HistorySourcePicker(model: model)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
             }
             .padding(.horizontal, 12)
             .padding(.bottom, 4)
@@ -136,7 +136,7 @@ struct JobsList: View {
         let jobs = Array(SourceScope.jobs(model.recentJobs, source: model.sourceFilter).prefix(150))
         VStack(spacing: 0) {
             if model.sourceFilter != nil {
-                SourceScopeBar(model: model)
+                SourceScopeBar(model: model, includesChannel: false)
                     .frame(maxWidth: .infinity, alignment: .trailing)
                     .padding(.horizontal, 12)
                     .padding(.bottom, 4)

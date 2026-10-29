@@ -53,7 +53,7 @@ struct ContentView: View {
                 .pickerStyle(.segmented).labelsHidden().padding(12)
                 switch tab {
                 case .overview:
-                    OverviewView(model: model, tab: $tab)
+                    OverviewView(model: model, tab: $tab, filter: $filter)
                 case .events: EventsList(model: model, filter: $filter)
                 case .sessions: JobsList(model: model)
                 case .problems: ProblemsList(model: model)
@@ -73,9 +73,6 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 460, idealWidth: 480, minHeight: 580, idealHeight: 680)
-        .onChange(of: tab) { _, value in
-            if value == .sessions { model.channelFilter = nil }
-        }
         .task { await model.refresh() }
     }
 
@@ -179,10 +176,11 @@ struct RelayDetails: View {
 
 struct SourceScopeBar: View {
     @Bindable var model: Model
+    var includesChannel = true
     var body: some View {
         if let source = model.sourceFilter {
             HStack(spacing: 6) {
-                Text("Only \(model.channelFilter ?? sourceLabel(source))").font(.caption.weight(.medium))
+                Text("Only \((includesChannel ? model.channelFilter : nil) ?? sourceLabel(source))").font(.caption.weight(.medium))
                 Button { model.sourceFilter = nil; model.channelFilter = nil } label: {
                     Image(systemName: "xmark.circle.fill")
                 }

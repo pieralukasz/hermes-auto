@@ -6,15 +6,17 @@ explicit corrections. It reads and changes the automation only through the insta
 
 | Tab | Shows | Actions |
 |---|---|---|
-| Status | Problems first, work in progress, then grouped connections | Expand a source to inspect its path, read and listener timestamps; **Show history** explicitly filters the history |
+| Status | Problems first, work in progress, then grouped connections | Expand a source to see its recent events inline; **Open in History** opens that source in the full history |
 | History | Every sorter decision with its source, reason and resulting session status | Open the session in Hermes, open the source, **Create session** (`hermes-auto open-item`) |
 | Sessions | Sessions the automation opened, with their status | Open in Hermes (`hermes://open/<id>`) |
 | Issues | `needs_attention` jobs and replies, source read errors, items waiting for a classifier retry | `retry`, `new-session`, `retry-followup`; **Dismiss** hides a problem in the app until it changes |
 
 Connections are grouped into **Messages**, **Mail**, **Tasks & projects** and, for other adapters,
-**Other**. There is no horizontal source strip. A disclosure expands connection details without changing
-filters. **Show history** selects the source and, for a bridged messenger, its channel. Switching to Sessions
-clears the channel filter because jobs do not expose it; the source filter stays visible and removable.
+**Other**. There is no horizontal source strip. A disclosure shows the latest five loaded events, with **Show more** to reveal more inline.
+**Open in History** selects the source and messenger, resets the event type to All and opens the full history.
+History has separate **Source** and **Show** pickers. Source choices include configured sources and sources
+seen in loaded events, including individual Matrix messengers. Switching to Sessions leaves the History
+selection intact; Sessions shows and applies only the source filter because jobs do not expose channels.
 ZimaBlade lives in a separate **Infrastructure** section.
 
 Matrix messenger names come from cached room metadata in `health.sources.matrix.channels`, not from a
