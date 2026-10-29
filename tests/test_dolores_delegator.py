@@ -191,9 +191,13 @@ def write_dolores(home, *, enabled=True, toolsets=("terminal", "delegation", "he
                 "delegation": {"backend": backend, "backends": {"profile_routes": {"profiles": [
                     {"name": name, "description": "synthetic"} for name in routed]}}}}
     if enabled:
-        settings["plugins"] = {"enabled": ["other-plugin", "hermes-auto-guard"]}
+        settings["plugins"] = {"enabled": ["other-plugin", "hermes-auto-guard", "advanced-delegation"]}
     (home / "config.yaml").write_text(json.dumps(settings))
     shutil.rmtree(home / "plugins", ignore_errors=True)
+    delegation = home / "plugins" / "advanced-delegation"  # the profile_routes backend (synthetic stand-in)
+    delegation.mkdir(parents=True)
+    for name in ("plugin.yaml", "__init__.py", "profile_routes.py"):
+        (delegation / name).write_text("# synthetic\n")
     if scope:
         guard.install(home, [], mode=policy.FIRST_TURN_MODE, subagent="inbox")
 
@@ -221,10 +225,13 @@ class FakeClient:
     def __init__(self, version=None, tools=3, hooks=1):
         self.plugin = {"name": policy.GUARD_NAME, "enabled": True, "hooks": hooks, "tools": tools,
                        "version": version or bridge.plugin_version()}
+        # The delegation backend as the gateway lists it (it registers the /delegation command).
+        self.rows = [{"name": "advanced-delegation", "key": "advanced-delegation", "enabled": True,
+                      "version": "1.0.0", "tools": 0, "hooks": 0, "commands": 1, "error": None}]
 
     async def rpc(self, method, **_):
         assert method == "plugins.list"
-        return {"plugins": [self.plugin]}
+        return {"plugins": [self.plugin, *self.rows]}
 
 
 def test_a_third_party_session_needs_a_ready_dolores_and_a_ready_subagent(tmp_path, monkeypatch, json_settings):
@@ -298,11 +305,17 @@ def test_research_matters_are_delegated_too(item, needle):
     assert 'profile: "inbox"' in prompt and needle in prompt.split("CEL", 1)[1]
 
 
-def test_a_private_slack_channel_is_not_read_at_all():
-    item = {"kind": "slack", "why": "channel", "from": "Bob", "place": "#secret", "redacted": True,
-            "deny_tools": "private", "triage": {"reason": "r"}}
+def test_a_private_slack_channel_is_delegated_like_any_other_matter():
+    """Łukasz's decision: a private channel's matter goes to inbox like every third-party matter."""
+    item = {"kind": "slack", "why": "channel", "from": "Bob", "place": "#secret (prywatny)", "private": True,
+            "redacted": True, "deny_tools": "private", "body": "Wiadomość w prywatnym kanale.",
+            "triage": {"reason": "r"}}
     prompt = prompt_for(job("slack", **item), config())
-    assert "Nie deleguj" in prompt and "delegate_task" not in prompt.replace("Nie deleguj", "")
+    public = prompt_for(job("slack", **{**item, "private": False, "redacted": False, "deny_tools": "research",
+                                        "place": "#dev"}), config())
+    assert "Nie deleguj" not in prompt and "niczego nie czytaj" not in prompt
+    assert 'profile: "inbox"' in prompt and "slack_read_thread" in prompt.split("CEL", 1)[1]
+    assert prompt.split("CEL", 1)[0].replace("#secret (prywatny)", "#dev") == public.split("CEL", 1)[0]
 
 
 def test_a_reply_to_an_old_inbox_conversation_is_delegated_from_dolores():
@@ -439,9 +452,10 @@ def test_an_automatic_session_may_only_hand_over_to_inbox(dolores):
                  {"action": "stop", "subagent_id": "a"}, delegation("inbox", images=["/tmp/x.png"]),
                  {"tasks": [{"goal": "x", "profile": "inbox", "images": ["/tmp/x.png"]}]}, {}, None):
         assert hook("delegate_task", args)["action"] == "block", args
-    for name in ("session_search", "hermes_auto_skill_view", "hermes_auto_skills_list", "tool_search",
-                 "tool_describe"):
+    for name in ("session_search", "hermes_auto_skill_view", "hermes_auto_skills_list"):
         assert hook(name, {"query": "x"} if name == "session_search" else {}) is None, name
+    assert hook("tool_describe", {"names": ["delegate_task"]}) is None
+    assert hook("tool_search", {"queries": ["x"]})["action"] == "block"  # it can query remote connectors
     assert hook("session_search", {"query": "x", "profile": "tapin"})["action"] == "block"
 
 
@@ -506,7 +520,8 @@ def test_an_unreadable_database_keeps_a_registered_session_locked(dolores):
     (dolores / "state.db").unlink()
     (dolores / "state.db").write_text("not a database")
     assert hook("terminal")["action"] == "block"
-    assert hook("terminal", session_id="20261029_100000_byhand") is None  # not registered: no lock
+    # Not registered, but it could be a continuation of one: cannot be told, so refused.
+    assert hook("terminal", session_id="20261029_100000_byhand")["action"] == "block"
     assert hook("delegate_task", delegation("inbox")) is None
 
 

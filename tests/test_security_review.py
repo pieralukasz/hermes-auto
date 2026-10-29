@@ -174,9 +174,11 @@ def test_research_cannot_send_private_context_to_arbitrary_web(tool, args):
 
 def test_profiles_keep_their_reads():
     for name, arguments in (("hermes_auto_skills_list", {}), ("hermes_auto_read", {"command": "gh pr view 12"}),
-                            ("tool_search", {"query": "read"}), ("session_search", {"query": "x"}),
+                            ("tool_describe", {"names": ["hermes_auto_read"]}), ("session_search", {"query": "x"}),
                             ("tool_call", {"name": "hermes_auto_read", "arguments": {"command": "gh pr view 12"}})):
         assert not refused("research", name, arguments), name
+    # tool_search queries remote connectors when manage_connections is in the session's tools.
+    assert refused("research", "tool_search", {"queries": ["read"]})
 
 
 @pytest.mark.parametrize("profile", [True, "research"])

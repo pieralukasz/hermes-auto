@@ -28,9 +28,10 @@ def hook(name, args=None, session_id="s1"):
 
 @pytest.mark.parametrize("session_id", ["s1", "a-session-the-user-opened-by-hand"])
 def test_every_session_of_the_bot_allows_only_the_read_tools(home, session_id):
-    for name in ("hermes_auto_read", "hermes_auto_skill_view", "hermes_auto_skills_list", "session_search",
-                 "tool_search", "tool_describe"):
+    for name in ("hermes_auto_read", "hermes_auto_skill_view", "hermes_auto_skills_list", "session_search"):
         assert hook(name, session_id=session_id) is None, name
+    assert hook("tool_describe", {"names": ["hermes_auto_read"]}, session_id=session_id) is None
+    assert hook("tool_search", {"queries": ["read"]}, session_id=session_id)["action"] == "block"  # remote connectors
     assert hook("tool_call", {"name": "hermes_auto_read", "arguments": {"command": "td today"}}) is None
     for name in ("terminal", "execute_code", "delegate_task", "write_file", "patch", "skill_manage", "memory",
                  "web_search", "web_extract", "browser_navigate", "cronjob_manage", "send_message", "clarify",

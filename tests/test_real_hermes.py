@@ -155,6 +155,9 @@ def provider_yaml(port):
 # The advanced-delegation plugin (Hermes' profile_routes delegation backend): its source directory, e.g. from a
 # checkout of NousResearch/hermes-official-plugins. Only the delegation contract needs it.
 DELEGATION_PLUGIN = os.environ.get("HERMES_AUTO_TEST_DELEGATION_PLUGIN", "")
+# Dolores takes third-party content only with the delegation backend loaded (bridge.delegator_report).
+DELEGATION = pytest.mark.skipif(not DELEGATION_PLUGIN,
+                                reason="HERMES_AUTO_TEST_DELEGATION_PLUGIN (advanced-delegation) not set")
 DOLORES_TOOLSETS = ["terminal", "file", "memory", "skills", "delegation", "session_search", "hermes-auto", "todo"]
 
 
@@ -297,6 +300,7 @@ def bridged(call_id, name, arguments):
 
 
 @CONTRACT
+@DELEGATION
 def test_open_sessions_are_imported_by_the_gateway_under_their_reserved_id(make_world):
     world = make_world()
     brief = world.job("brief", title="Plans", mode="open", source="questions")
@@ -460,6 +464,7 @@ def test_without_bots_dolores_gets_no_third_party_content(make_world):
 
 
 CHILD_GOAL = "SYNTHETIC-CHILD-GOAL: przygotuj sprawę"
+LEAK = "SYNTHETIC-LEAK-CANARY.test"
 AUTO_PROMPT = "AUTO-PROMPT: synthetic third-party matter"
 MARK = "<!-- hermes-auto:auto-turn -->"
 
@@ -481,8 +486,14 @@ def subagent_sessions(world, parent):
 
 
 @CONTRACT
-@pytest.mark.skipif(not DELEGATION_PLUGIN, reason="HERMES_AUTO_TEST_DELEGATION_PLUGIN (advanced-delegation) not set")
-def test_dolores_first_turn_only_hands_the_matter_to_inbox_whose_guard_keeps_the_subagent_read_only(make_world):
+@DELEGATION
+@pytest.mark.parametrize("matter", [
+    dict(source="mailish", deny_tools=True),
+    # A private Slack channel is a matter like any other (Łukasz's decision): the same delegation.
+    dict(source="slack", deny_tools="private", private=True, redacted=True),
+])
+def test_dolores_first_turn_only_hands_the_matter_to_inbox_whose_guard_keeps_the_subagent_read_only(make_world,
+                                                                                                    matter):
     """Real gateway, fake model: a third-party session lives in Dolores. Her first, automatic turn tries terminal,
     memory and a delegation to another profile (all refused by her first_turn guard) and delegates to inbox (runs).
     The subagent runs as inbox: inbox's guard refuses its terminal and runs its read in inbox's scope."""
@@ -495,11 +506,14 @@ def test_dolores_first_turn_only_hands_the_matter_to_inbox_whose_guard_keeps_the
             task = {"goal": CHILD_GOAL, "context": "SYNTHETIC-DATA from a third party"}
             return ([call(request, "toolu_term", "terminal", {"command": "echo dolores-should-not-run"}),
                      call(request, "toolu_mem", "memory", {"action": "add", "target": "memory", "content": "x"}),
+                     # tool_search may send its queries to remote connectors: refused.
+                     call(request, "toolu_search", "tool_search", {"queries": [LEAK]}),
                      call(request, "toolu_tapin", "delegate_task", {"tasks": [{**task, "profile": "work"}]}),
                      call(request, "toolu_inbox", "delegate_task", {"tasks": [{**task, "profile": "inbox"}]})],
                     "tool_use")
         if CHILD_GOAL in text and not done:  # the inbox subagent
             return ([call(request, "toolu_child_term", "terminal", {"command": "echo child-should-not-run"}),
+                     call(request, "toolu_child_search", "tool_search", {"queries": [LEAK]}),
                      bridged("toolu_child_td", "hermes_auto_read", {"command": "td today --json"})], "tool_use")
         return None
 
@@ -507,7 +521,7 @@ def test_dolores_first_turn_only_hands_the_matter_to_inbox_whose_guard_keeps_the
     doctor = world.hermes.doctor()["bots"]
     assert doctor["default"]["ready"] is True and doctor["default"]["mode"] == "first_turn", doctor
     assert doctor["inbox"]["ready"] is True, doctor
-    job = world.job("mail", source="mailish", deny_tools=True, triage={"reason": "test"})
+    job = world.job("matter", triage={"reason": "test"}, **matter)
     assert job["profile"] == "default"
     sid = world.hermes.create(job, "unused")
     assert (world.home / "hermes-auto-guard" / "sessions" / sid).is_file()
@@ -521,7 +535,7 @@ def test_dolores_first_turn_only_hands_the_matter_to_inbox_whose_guard_keeps_the
         db.close()
     assert user["content"] == "Synthetic card\n\n" + MARK and MARK in user["api_content"]
     tools = world.tool_results(sid)
-    for refused in ("toolu_term", "toolu_mem", "toolu_tapin"):
+    for refused in ("toolu_term", "toolu_mem", "toolu_tapin", "toolu_search"):
         assert "Nie uruchomiono" in str(tools[refused]), (refused, tools[refused])
     assert "dolores-should-not-run" not in json.dumps(tools)
     assert "Nie uruchomiono" not in str(tools["toolu_inbox"]), tools["toolu_inbox"]
@@ -530,11 +544,12 @@ def test_dolores_first_turn_only_hands_the_matter_to_inbox_whose_guard_keeps_the
     while time.time() < deadline:
         children = [row for row in subagent_sessions(world, sid) if row.get("source") == "subagent"]
         child = world.tool_results(children[0]["id"]) if children else {}
-        if "toolu_child_td" in child and "toolu_child_term" in child:
+        if {"toolu_child_td", "toolu_child_term", "toolu_child_search"} <= set(child):
             break
         time.sleep(1)
     assert children and children[0].get("profile_name") == "inbox", children
     assert "Not run: this bot only reads" in str(child["toolu_child_term"]), child
+    assert "Not run" in str(child["toolu_child_search"]), child
     assert "child-should-not-run" not in json.dumps(child)
     assert child["toolu_child_td"] == {"output": "synthetic td: today --json\n", "exit_code": 0}
 
@@ -560,6 +575,7 @@ def test_a_task_runs_in_its_bot_where_hermes_denies_approval_gated_calls(make_wo
 
 
 @CONTRACT
+@DELEGATION
 def test_a_session_without_the_jobs_launch_is_refused_with_a_new_session_hint(make_world):
     world = make_world()
     old = world.job("old", mode="open")
