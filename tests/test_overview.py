@@ -49,11 +49,14 @@ def test_events_show_decision_and_reason_without_the_body(store, tmp_path, confi
     assert "Poufna" not in out  # message bodies stay out of CLI output
 
 
-def test_open_item_queues_a_session_and_later_mail_follows_it(store, tmp_path, config, capsys):
+def test_open_item_queues_a_session_and_later_mail_follows_it(store, tmp_path, config, capsys, monkeypatch):
     item = add_item(store, "brief")
+    started = []
+    monkeypatch.setattr(cli, "start_now", lambda store, config, home, job_id: started.append(job_id) or "Started")
     code, out = run(store, tmp_path, config, capsys, "open-item", account=GMAIL, item_id="m1")
     assert code == 0
     job = store.job(json.loads(out)["job_id"])
+    assert started == [job["id"]]  # the session is created at once, not on the next check
     payload = json.loads(job["payload"])
     assert job["status"] == "pending" and job["mode"] == "draft" and job["source"] == "gmail"
     assert payload["triage"]["decision"] == "session" and payload["deny_tools"] is True

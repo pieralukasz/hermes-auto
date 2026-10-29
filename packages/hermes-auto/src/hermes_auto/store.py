@@ -6,6 +6,7 @@ import fcntl
 import json
 import os
 import sqlite3
+import time
 import uuid
 from pathlib import Path
 
@@ -15,14 +16,20 @@ def session_id() -> str:
 
 
 @contextlib.contextmanager
-def locked(home: Path):
+def locked(home: Path, wait: float = 0):
+    """Hold the run lock. `wait`: seconds an interactive command waits for a running check to finish."""
     home.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(home / "run.lock", os.O_CREAT | os.O_RDWR, 0o600)
     with os.fdopen(fd, "w") as handle:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise RuntimeError("Another hermes-auto operation is running; try again later") from exc
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Another hermes-auto operation is running; try again later") from exc
+                time.sleep(0.25)
         yield
 
 
@@ -187,6 +194,7 @@ class Store:
             (f"Replaced by job {new_id} (new-session)", job["event_key"], new_id),
         )
         self.db.commit()
+        return new_id
 
     def backup(self):
         destination = self.path.with_name("state.backup.sqlite3")

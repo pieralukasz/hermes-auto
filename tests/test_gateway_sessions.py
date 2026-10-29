@@ -127,10 +127,8 @@ def test_a_create_refused_until_the_guard_is_active_can_be_retried(store, config
     assert job["status"] == "needs_attention" and "hermes-auto-guard" in job["error"]
     assert hermes.sessions == set() and store.get_meta(f"create:{job['id']}") == reserved
     monkeypatch.setattr(cli, "Hermes", lambda *args: hermes)
-    cli.dispatch(argparse.Namespace(command="retry", job_id=job["id"]), tmp_path, config, store)
-    assert store.rows()[0]["status"] == "retry_pending"
     hermes.refuse = False
-    process_jobs(store, config, hermes)
+    cli.dispatch(argparse.Namespace(command="retry", job_id=job["id"]), tmp_path, config, store)
     job = store.rows()[0]
     assert job["status"] == "running" and job["session_id"] == "local-" + reserved
 
@@ -158,3 +156,57 @@ def test_rebinding_moves_only_session_references(store):
     assert store.get_meta("threadXsession:x") == "old-id"
     assert store.get_meta("thread_session:gmail:a:t1") == "new-id" and store.get_meta("create:7") == "new-id"
     assert store.get_meta("cursor:example") == "old-id"
+
+
+def test_new_session_starts_at_once_instead_of_waiting_for_the_next_check(store, config, tmp_path, monkeypatch):
+    import argparse
+
+    from hermes_auto import cli
+    hermes = FakeHermes()
+    store.enqueue("e1", "example", "1", "Title", "draft", {})
+    store.db.commit()
+    job = store.rows()[0]
+    store.update(job["id"], status="needs_attention", error="Hermes run failed (exit 2)")
+    monkeypatch.setattr(cli, "Hermes", lambda *args: hermes)
+    cli.dispatch(argparse.Namespace(command="new-session", job_id=job["id"]), tmp_path, config, store)
+    old, new = sorted(store.rows(), key=lambda row: row["generation"])
+    assert old["status"] == "superseded"
+    assert new["status"] == "running" and new["session_id"] in hermes.sessions
+
+
+def test_paused_automation_only_queues_the_new_session(store, config, tmp_path, monkeypatch):
+    import argparse
+
+    from hermes_auto import cli
+    hermes = FakeHermes()
+    store.enqueue("e1", "example", "1", "Title", "draft", {})
+    store.db.commit()
+    store.set_meta("paused", True)
+    monkeypatch.setattr(cli, "Hermes", lambda *args: hermes)
+    cli.dispatch(argparse.Namespace(command="new-session", job_id=1), tmp_path, config, store)
+    assert max(store.rows(), key=lambda row: row["generation"])["status"] == "pending" and not hermes.sessions
+
+
+def test_an_interactive_command_waits_for_a_running_check(tmp_path):
+    import threading
+    import time
+
+    from hermes_auto.store import locked
+    held = threading.Event()
+
+    def check():
+        with locked(tmp_path):
+            held.set()
+            time.sleep(0.6)
+    worker = threading.Thread(target=check)
+    worker.start()
+    held.wait()
+    started = time.time()
+    with locked(tmp_path, wait=5):
+        waited = time.time() - started
+    worker.join()
+    assert 0.3 < waited < 5
+    with locked(tmp_path):
+        with pytest.raises(RuntimeError, match="Another hermes-auto operation"):
+            with locked(tmp_path, wait=0.2):
+                pass

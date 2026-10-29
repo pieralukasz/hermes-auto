@@ -14,8 +14,9 @@ Source chips (Gmail, GitHub, …) show each source's last successful read; a cli
 events and sessions (a second click or the x next to "Tylko …" shows everything again). The ZimaBlade chip opens
 the relay's connection details.
 
-The header pauses and resumes the automation. A check in progress holds the CLI lock; actions retry for 30 s.
-Queued sessions start on the next scheduled check (within a minute).
+The header pauses and resumes the automation. A check in progress holds the CLI lock; an action waits for it
+(up to 120 s), then **Ponów**, **Nowa sesja** and **Daj temu sesję** create the session at once (its run continues in
+the background). A retried reply still starts on the next scheduled check (within a minute).
 
 ## Build and run
 

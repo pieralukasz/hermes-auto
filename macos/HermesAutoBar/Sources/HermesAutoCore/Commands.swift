@@ -24,7 +24,8 @@ public enum Action: Equatable, Sendable {
         switch self {
         case .pause: return "Automat wstrzymany"
         case .resume: return "Automat wznowiony"
-        case .retry, .newSession, .retryFollowup, .openItem: return "W kolejce: sesja powstanie w ciągu minuty"
+        case .retry, .newSession, .openItem: return "Sesja założona, jest już w Hermesie"
+        case .retryFollowup: return "W kolejce: sesja powstanie w ciągu minuty"
         }
     }
 }
@@ -59,7 +60,7 @@ public struct CLIRunner: CommandRunner {
     public var executable: URL
     public var timeout: TimeInterval
 
-    public init(executable: URL, timeout: TimeInterval = 60) {
+    public init(executable: URL, timeout: TimeInterval = 180) {
         self.executable = executable
         self.timeout = timeout
     }

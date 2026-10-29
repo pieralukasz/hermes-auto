@@ -371,7 +371,8 @@ def main(argv=None):
                 return dispatch(args, home, read_config(home), store)
             finally:
                 store.close()
-        with locked(home):
+        interactive = args.command in ("retry", "new-session", "retry-followup", "open-item", "pause", "resume")
+        with locked(home, wait=120 if interactive else 0):
             if args.command == "init":
                 if not (home / "config.json").exists():
                     private_json(home / "config.json", defaults())
@@ -388,6 +389,21 @@ def main(argv=None):
     except Exception as exc:
         print(f"hermes-auto: {exc}", file=sys.stderr)
         return 1
+
+
+def start_now(store, config, home, job_id):
+    """Create the clicked job's session at once (its run goes to the background), not on the next check.
+
+    Only jobs are started: no source reads and no sorter calls, so this stays a matter of seconds."""
+    if store.get_meta("paused", False):
+        return "Queued; the automation is paused, so it starts after 'hermes-auto resume'."
+    process_jobs(store, config, Hermes(config, home))
+    job = store.job(job_id)
+    if job["status"] in ("running", "ready", "created"):
+        return f"Started: session {job['session_id']}"
+    if job["status"] == "needs_attention":
+        raise RuntimeError(job["error"] or "Starting the session failed")
+    return "Queued. Run 'hermes-auto run' or wait for the next scheduled check."
 
 
 def dispatch(args, home, config, store):
@@ -475,7 +491,8 @@ def dispatch(args, home, config, store):
     elif command == "open-item":
         from .triage import open_item
         job_id = open_item(store, args.account, args.item_id)
-        print(json.dumps({"job_id": job_id, "queued": True}))
+        message = start_now(store, config, home, job_id) if job_id else None
+        print(json.dumps({"job_id": job_id, "queued": True, "message": message}))
     elif command in ("pause", "resume"):
         store.set_meta("paused", command == "pause")
         print(command + "d")
@@ -487,7 +504,7 @@ def dispatch(args, home, config, store):
     elif command in ("retry", "new-session"):
         job = store.job(args.job_id)
         if command == "new-session":
-            store.new_generation(job["id"])
+            job = store.job(store.new_generation(job["id"]))
         else:
             if job["status"] != "needs_attention":
                 raise ValueError("Only needs_attention jobs can be retried; use new-session for a fresh conversation")
@@ -497,7 +514,7 @@ def dispatch(args, home, config, store):
             # A create the bridge refused (or interrupted) left `create:<job>`: the retry finishes that
             # create with the same creation key instead of calling the session deleted.
             store.update(job["id"], status="retry_pending", error="")
-        print("Queued. Run 'hermes-auto run' or wait for the next scheduled check.")
+        print(start_now(store, config, home, job["id"]))
     elif command == "retry-followup":
         retry_followup(store, Hermes(config, home), args.followup_id)
         print("Queued; it opens a new session. Run 'hermes-auto run' or wait for the next scheduled check.")
