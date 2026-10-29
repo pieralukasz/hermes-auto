@@ -33,19 +33,21 @@ def job(source, mode="draft", **payload):
 
 
 @pytest.mark.parametrize("item, expected", [
-    (job("gmail", deny_tools=True), "inbox"),  # the gmail rule names a full bot: never for third-party content
-    (job("proton", deny_tools=True), "inbox"),
-    (job("slack", deny_tools="research", dm=True), "inbox"),
-    (job("slack", deny_tools="research", dm=False), "inbox"),
-    (job("slack", deny_tools="private", private=True), "inbox"),
-    (job("linear", deny_tools="research"), "inbox"),
-    (job("github", deny_tools="research", owner="gigaverse-app"), "inbox"),
-    (job("todoist", "agent", projectId=TAPIN_PROJECT), "tapin"),
-    (job("todoist", "agent", projectId=ECMR_PROJECT), "ecmr"),
+    # With bots every session lives in Dolores (`bots.default`); she hands third-party matters to the read-only
+    # `inbox` profile as a subagent, and work for other profiles to those profiles (delegate_task).
+    (job("gmail", deny_tools=True), "default"),
+    (job("proton", deny_tools=True), "default"),
+    (job("slack", deny_tools="research", dm=True), "default"),
+    (job("slack", deny_tools="research", dm=False), "default"),
+    (job("slack", deny_tools="private", private=True), "default"),
+    (job("linear", deny_tools="research"), "default"),
+    (job("github", deny_tools="research", owner="gigaverse-app"), "default"),
+    (job("todoist", "agent", projectId=TAPIN_PROJECT), "default"),
+    (job("todoist", "agent", projectId=ECMR_PROJECT), "default"),
     (job("todoist", "agent", projectId="other"), "default"),
-    (job("proton", "agent"), "inbox"),
-    (job("gmail", "agent"), "inbox"),  # an agent-labelled thread still carries other people's replies
-    (job("brief", "open"), "inbox"),  # the digest quotes other people's subjects and snippets
+    (job("proton", "agent"), "default"),
+    (job("gmail", "agent"), "default"),
+    (job("brief", "open"), "default"),
     (job("questions", "open"), "default"),
     (job("proposals", "open"), "default"),
 ])
@@ -64,14 +66,14 @@ def test_each_job_goes_to_its_bot(item, expected):
 def test_one_inbox_bot_with_the_account_chosen_by_routes(item, provider):
     from hermes_auto.hermes import job_route
     assert bots.choose({**item, "payload": json.dumps({**json.loads(item["payload"]), "deny_tools": True})},
-                       config()) == "inbox"
+                       config()) == "default"
     assert job_route(item, config(routes=ROUTES)).get("provider") == provider
 
 
-def test_a_reply_stays_in_the_read_only_bot_of_its_conversation_but_never_moves_into_a_full_one():
+def test_a_reply_to_a_conversation_of_the_read_only_bot_opens_in_dolores():
     two = config(bots={**BOTS, "read_only": {**BOTS["read_only"], "inbox2": {"reads": []}}})
-    assert bots.choose(job("slack", deny_tools="research", bot="inbox2", dm=True), two) == "inbox2"
-    assert bots.choose(job("gmail", deny_tools=True, bot="default"), config()) == "inbox"
+    assert bots.choose(job("slack", deny_tools="research", bot="inbox2", dm=True), two) == "default"
+    assert bots.choose(job("gmail", deny_tools=True, bot="default"), config()) == "default"
     assert bots.choose(job("todoist", "agent", bot="inbox"), config()) == "default"
 
 
@@ -154,8 +156,8 @@ def test_the_bot_is_chosen_once_before_the_session_exists(tmp_path):
     store.db.commit()
     fake = FakeHermes()
     process_jobs(store, cfg, fake)
-    assert sorted(fake.created) == [(1, "inbox"), (2, "tapin")]
-    assert {row["id"]: row["profile"] for row in store.rows()} == {1: "inbox", 2: "tapin"}
+    assert sorted(fake.created) == [(1, "default"), (2, "default")]
+    assert {row["id"]: row["profile"] for row in store.rows()} == {1: "default", 2: "default"}
     # A changed mapping does not move a job whose session already exists.
     store.new_generation(1)
     assert store.rows()[-1]["profile"] == ""  # chosen again when its new session is created
@@ -182,7 +184,7 @@ def test_bridge_requests_target_the_bots_home(tmp_path, monkeypatch):
     assert legacy.profile_config("default") is legacy.config
 
 
-def test_a_reply_opens_its_new_session_in_the_bot_of_the_conversation(tmp_path):
+def test_a_reply_reads_the_old_conversation_in_its_bot_and_opens_in_dolores(tmp_path):
     store = Store(tmp_path, initialize=True)
     store.enqueue("slack:T:1", "slack", "1", "Slack · x", "draft", {"deny_tools": "research", "dm": True})
     store.db.commit()
@@ -207,5 +209,5 @@ def test_a_reply_opens_its_new_session_in_the_bot_of_the_conversation(tmp_path):
     assert triage.process_followups(store, config(), fake) == 0
     assert fake.excerpts == [("inspect", "inbox"), ("excerpts", "inbox")]
     reply = store.rows()[-1]
-    assert json.loads(reply["payload"])["bot"] == "inbox"
-    assert bots.choose(reply, config()) == "inbox"
+    assert json.loads(reply["payload"])["bot"] == "inbox"  # where its context was read from
+    assert bots.choose(reply, config()) == "default"  # the new session opens in Dolores
