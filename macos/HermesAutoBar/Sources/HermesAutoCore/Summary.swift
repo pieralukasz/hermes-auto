@@ -171,6 +171,7 @@ public func jobStatusLabel(_ status: String) -> String {
     case "needs_attention": return "Wymaga uwagi"
     case "deferred": return "Odłożone"
     case "deleted": return "Usunięta"
+    case "superseded": return "Zastąpiona nową sesją"
     default: return status
     }
 }

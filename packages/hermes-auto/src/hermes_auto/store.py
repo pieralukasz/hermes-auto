@@ -178,6 +178,14 @@ class Store:
             (job["event_key"], generation, job["source"], job["external_id"], job["title"],
              job["mode"], job["payload"], session_id()),
         )
+        # The fresh session replaces a failed or queued attempt, so it leaves the problem list (and a
+        # queued retry cannot open a second session). Ready sessions stay: they are real conversations.
+        new_id = self.db.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.db.execute(
+            "UPDATE jobs SET status='superseded', error=?, updated=CURRENT_TIMESTAMP "
+            "WHERE event_key=? AND id<>? AND status IN ('needs_attention','retry_pending')",
+            (f"Replaced by job {new_id} (new-session)", job["event_key"], new_id),
+        )
         self.db.commit()
 
     def backup(self):

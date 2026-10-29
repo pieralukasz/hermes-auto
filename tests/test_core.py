@@ -400,3 +400,21 @@ def test_superseded_generation_never_finishes(store, config):
     hermes.archived[store.rows()[0]["session_id"]] = True
     sync_finished(store, config, lambda: hermes, {"todoist": FinishingSource})
     assert FinishingSource.finished == []
+
+
+def test_new_session_supersedes_the_failed_attempt(store, config):
+    """A fresh session replaces the failed attempt: the old one leaves the problem list."""
+    enqueue(store)
+    store.update(1, status="needs_attention", error="Hermes run failed (exit 2)")
+    store.new_generation(1)
+    old, new = sorted(store.rows(), key=lambda job: job["generation"])
+    assert old["status"] == "superseded" and str(new["id"]) in old["error"]
+    assert new["status"] == "pending"
+
+
+def test_new_session_keeps_a_ready_earlier_session(store, config):
+    enqueue(store)
+    store.update(1, status="ready")
+    store.new_generation(1)
+    old = min(store.rows(), key=lambda job: job["generation"])
+    assert old["status"] == "ready"
