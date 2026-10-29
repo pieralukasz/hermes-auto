@@ -35,7 +35,7 @@ def job_route(job, config):
 # Sources named at the start of a title ("GitHub · Aviad: review sports stat cards"). Briefs, plans and
 # proposals already say what they are ("Brief 27.10 06:00").
 SOURCE_LABELS = {"gmail": "Gmail", "proton": "Proton", "slack": "Slack", "github": "GitHub", "linear": "Linear",
-                 "todoist": "Todoist"}
+                 "todoist": "Todoist", "imessage": "iMessage"}
 ARROWS = re.compile(r"^(?:↩\s*)+")
 OLD_SUFFIX = re.compile(r"(?: · [a-z]+ · #\d+)+$")
 
@@ -51,6 +51,13 @@ def session_title(job, limit=TITLE_LIMIT, prefix=""):
     text = ARROWS.sub("", text)
     text = OLD_SUFFIX.sub("", text)  # a title copied from a session named before this format
     label = SOURCE_LABELS.get(job.get("source", ""))
+    if job.get("source") == "matrix":
+        # A bridged chat is titled by its messenger ("WhatsApp · Anna"), not by the transport.
+        try:
+            channel = json.loads(job.get("payload") or "{}").get("channel")
+        except (ValueError, AttributeError):
+            channel = None
+        label = " ".join(str(channel or "Matrix").split())[:40] or "Matrix"
     if label and not text.startswith(label + " · "):
         # Older names carried the source as "GitHub: ..." or "Slack: ..."; keep only one.
         text = f"{label} · " + re.sub(rf"^{re.escape(label)}:\s*", "", text)

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+[project]
+name = "hermes-auto-matrix"
+version = "0.1.0"
+description = "Hermes sessions for chats bridged into your Matrix homeserver: WhatsApp, Messenger, Instagram (sorter source, read-only)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{name = "Lukasz Piera"}]
+dependencies = ["hermes-auto==0.1.0"]
+[project.urls]
+Repository = "https://github.com/pieralukasz/hermes-auto"
+Issues = "https://github.com/pieralukasz/hermes-auto/issues"
+
+[project.scripts]
+hermes-auto-matrix = "hermes_auto_matrix:main"
+
+[project.entry-points."hermes_auto.sources"]
+matrix = "hermes_auto_matrix:Source"
