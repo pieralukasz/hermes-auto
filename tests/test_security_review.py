@@ -197,6 +197,18 @@ def test_linear_view_requires_no_attachment_download():
     assert read_only_command("linear issue view WEB-12 --no-download", "research") is True
 
 
+@pytest.mark.parametrize("command", [
+    # After `--` the guard's parser takes `--no-download` for an argument, so the CLI would download (Codex review
+    # of guard 3.0.0); `--` also hides options such as --workspace (another account's credential) from the grammar.
+    "linear issue view WEB-12 -- --no-download",
+    "linear issue view -- WEB-12 --no-download",
+    "linear issue list -- --workspace other",
+    "linear issue view WEB-12 WEB-13 --no-download",
+])
+def test_linear_reads_take_no_option_terminator(command):
+    assert read_only_command(command, "research") is False
+
+
 def test_mail_profile_keeps_its_reads():
     assert not refused(True, "hermes_auto_read", {"command": "td today"})
     assert refused(True, "hermes_auto_read", {"command": "gh pr view 12"})  # research reads only

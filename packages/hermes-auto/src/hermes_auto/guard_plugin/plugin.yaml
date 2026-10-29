@@ -1,5 +1,5 @@
 name: hermes-auto-guard
-version: "3.0.0"
+version: "3.0.1"
 description: "hermes-auto guard for the default profile. Until the user writes in an automatic session with third-party content, only reads: the hermes-auto read toolset (one grammar-checked read command within the reads of the session's account, raw skill reads) and session_search in this profile when that account may search; tool_search refused. A session that cannot be told gets no tool. Every other session untouched. Scope from scope.json (hermes-auto install-guard)."
 author: Lukasz Piera
 hooks:

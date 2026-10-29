@@ -28,7 +28,7 @@ import subprocess
 import sys
 
 GUARD_NAME = "hermes-auto-guard"
-GUARD_VERSION = "3.0.0"
+GUARD_VERSION = "3.0.1"
 FIRST_TURN_MODE = "first_turn"
 SCOPE_VERSION = 2
 TOOLSET = "hermes-auto"
@@ -359,9 +359,15 @@ def linear_read(tokens):
         query = args[1].strip() if len(args) == 2 else ""
         return query.startswith(("query", "{")) and "mutation" not in query.lower()
     spec = LINEAR_READS.get(tuple(args[:2]))
-    if tuple(args[:2]) == ("issue", "view") and "--no-download" not in args[2:]:
+    # No `--`: after it the grammar would take options (the required --no-download, --workspace) for arguments.
+    if spec is None or "--" in args:
         return False
-    return spec is not None and split_options(args[2:], spec) is not None
+    positionals = split_options(args[2:], spec)
+    if positionals is None or any(value.startswith("-") for value in positionals):
+        return False
+    if tuple(args[:2]) == ("issue", "view"):
+        return "--no-download" in args[2:] and len(positionals) <= 1
+    return True
 
 
 def slack_read_command(tokens, words=None, families=None):
@@ -471,9 +477,32 @@ REFUSED_SEARCH = ("Not run: earlier conversations are not searchable from an aut
 AUTO_TURN_MARK = "<!-- hermes-auto:auto-turn -->"
 REGISTRY = ("hermes-auto-guard", "sessions")
 SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
-# User rows Hermes writes itself with no display kind: notices and wake-ups (old rows), compaction handoffs.
-SYSTEM_PREFIXES = ("[IMPORTANT:", "[System", "[ASYNC", "[INTERNAL", "[CONTEXT COMPACTION", "[CONTEXT SUMMARY]",
-                   "[PRIOR CONTEXT", "[STILL IN PROGRESS")
+# User rows Hermes writes itself with no display kind: notices and wake-ups (old rows), compaction handoffs, the
+# todo and planning snapshots, cron output (agent.context_compressor._SYNTHETIC_USER_ROW_PREFIXES).
+SYSTEM_PREFIXES = ("[IMPORTANT:", "[System", "[ASYNC", "[INTERNAL", "[CONTEXT", "[PRIOR CONTEXT", "[STILL IN PROGRESS",
+                   "[Your active task list", "[Planning state preserved", "Cronjob Response:")
+# Hermes' own nudges persisted as plain user rows (SessionDB drops their metadata flags; Hermes recognizes them by
+# this exact text, agent.context_compressor._is_synthetic_compression_user_turn). The iteration-limit request lands
+# when the automatic turn spends agent_max_turns, which a third party's instructions can force; the background
+# review fork runs right after it.
+HERMES_NUDGES = frozenset({
+    "You've reached the maximum number of tool-calling iterations allowed. Please provide a final response "
+    "summarizing what you've found and accomplished so far, without calling any more tools.",
+    "Continue from the compressed conversation context above. This marker exists because no human user turn was "
+    "available.",
+    "Continue from the compressed conversation context above. This marker exists because the compacted transcript "
+    "contained no preserved user turn.",
+    "You just executed tool calls but returned an empty response. Please process the tool results above and "
+    "continue with the task.",
+    "Your previous turn indicated a tool call but none was included. Do not narrate a plan or restate intent — "
+    "issue the actual tool call now to continue the task.",
+})
+# A steer delivered while a turn runs rides inside a TOOL result between these markers; a compaction restates the
+# newest one as a plain user row (agent.conversation_compression._ensure_compressed_has_user_turn). Tool output
+# also carries third-party text (a mail read through hermes_auto_read), so a user row restating it is not the user.
+STEER_OPEN = ("[OUT-OF-BAND USER MESSAGE — a direct message from the user, delivered once at this position; not tool "
+              "output and not a new delivery when replayed from conversation history]")
+STEER_OPEN_PREFIX, STEER_CLOSE = "[OUT-OF-BAND USER MESSAGE", "[/OUT-OF-BAND USER MESSAGE]"
 # Display kinds of rows a person typed: a normal message (NULL), a steer, a hidden composer send.
 HUMAN_KINDS = ("steer", "hidden")
 REFUSED_FIRST_TURN = (
@@ -544,8 +573,65 @@ def _ancestors(conn, session_id):
     return found, False
 
 
-def human_row(content, api_content, kind, metadata, summary):
-    """Whether one user row was written by a person (see the module docstring for what counts)."""
+_HERMES = {}
+
+
+def hermes_function(module, name):
+    """A Hermes function this guard double-checks with when it runs inside Hermes, else None (looked up once)."""
+    key = (module, name)
+    if key not in _HERMES:
+        try:
+            _HERMES[key] = getattr(__import__(module, fromlist=[name]), name)
+        except Exception:  # noqa: BLE001 - outside Hermes (tests, the bridge), or a Hermes without it
+            _HERMES[key] = None
+    return _HERMES[key]
+
+
+def hermes_synthetic(text):
+    """Hermes' own recognizer of its synthetic user rows (False outside Hermes or when it fails: the static lists
+    above still apply)."""
+    compressor = hermes_function("agent.context_compressor", "ContextCompressor")
+    try:
+        return bool(compressor and compressor._is_synthetic_compression_user_turn({"role": "user", "content": text}))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def steer_text(text):
+    """The text a compaction would restate from one tool result's steer marker (Hermes'
+    _extract_steer_text_from_message, replicated: the first marker pair), or None."""
+    text = str(text or "")
+    start = text.find(STEER_OPEN)
+    if start == -1:
+        start = text.find(STEER_OPEN_PREFIX)
+        if start == -1:
+            return None
+        newline = text.find("\n", start)
+        start = newline + 1 if newline != -1 else start + len(STEER_OPEN_PREFIX)
+    else:
+        start += len(STEER_OPEN)
+    end = text.find(STEER_CLOSE, start)
+    return (text[start:end].strip() or None) if end != -1 else None
+
+
+def restated_steers(tool_contents):
+    """Texts a compaction may restate as user rows from these tool results (Hermes' extraction and ours)."""
+    extract = hermes_function("agent.conversation_compression", "_extract_steer_text_from_message")
+    found = set()
+    for content in tool_contents:
+        found.add(steer_text(content))
+        try:
+            found.add(extract({"role": "tool", "content": content}) if extract else None)
+        except Exception:  # noqa: BLE001
+            pass
+    found.discard(None)
+    return frozenset(" ".join(str(text).split()) for text in found)
+
+
+def human_row(content, api_content, kind, metadata, summary, restated=frozenset()):
+    """Whether one user row was written by a person (see the module docstring for what counts). `restated`: steer
+    texts found in the lineage's tool results (`restated_steers`); a plain row repeating one is a compaction's
+    restatement of tool output, not the user."""
     if summary or (kind is not None and kind not in HUMAN_KINDS):
         return False
     if kind == "hidden" and metadata and "notification_category" in str(metadata):
@@ -553,7 +639,12 @@ def human_row(content, api_content, kind, metadata, summary):
     texts = [str(content or ""), str(api_content or "")]
     if any(AUTO_TURN_MARK in text for text in texts):
         return False
-    return not str(content or "").lstrip().startswith(SYSTEM_PREFIXES)
+    if not texts[0].strip():
+        return False  # no words, so no person (fail-closed)
+    for text in (item.strip() for item in texts):
+        if text and (text.startswith(SYSTEM_PREFIXES) or text in HERMES_NUDGES or hermes_synthetic(text)):
+            return False
+    return kind is not None or " ".join(texts[0].split()) not in restated
 
 
 def first_turn_state(home, session_id):
@@ -602,9 +693,12 @@ def first_turn_state(home, session_id):
             rows = conn.execute(
                 f"SELECT content, {optional[0]}, display_kind, {optional[1]}, {optional[2]} FROM messages "
                 f"WHERE session_id IN ({marks}) AND role = 'user'", lineage).fetchall()
+            restated = restated_steers(row[0] for row in conn.execute(
+                f"SELECT content FROM messages WHERE session_id IN ({marks}) AND role = 'tool' AND "
+                f"instr(content, ?) > 0", [*lineage, STEER_OPEN_PREFIX]))
         except sqlite3.Error:
             return LOCKED, ""
-        return (OPEN, "") if any(human_row(*row) for row in rows) else (LOCKED, "")
+        return (OPEN, "") if any(human_row(*row, restated=restated) for row in rows) else (LOCKED, "")
     finally:
         conn.close()
 
