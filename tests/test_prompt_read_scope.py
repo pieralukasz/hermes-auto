@@ -56,6 +56,11 @@ def test_private_account_keeps_the_calendar_gmail_and_history():
     assert "calendar list" in prompt and "gmail search" in prompt
 
 
+def test_prompt_does_not_ask_to_report_empty_lookups():
+    prompt = triage.mail_session_prompt(github("someone-else"), "", CONFIG)
+    assert "Jeśli nie znajdziesz, nie pisz o tym" in prompt
+
+
 def test_first_turn_prompts_present_without_drafting_or_handing_off():
     for prompt in work_prompts():
         assert "hermes_auto_read" in prompt and "1–3 zdaniach" in prompt and "Bez szkicu" in prompt

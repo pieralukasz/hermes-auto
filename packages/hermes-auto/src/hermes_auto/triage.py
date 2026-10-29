@@ -478,12 +478,14 @@ TODOIST_LOOKUP_PL = (
     "Sprawdź w Todoist, czy mam zadanie o tej sprawie: `td task list --filter 'search: <fraza>' --json` dla 1–3 "
     "krótkich fraz (numer PR, issue albo ticketu, osoba, firma, temat), także zadania z @czekam i ich podzadania "
     "(`td task view id:... --json`). Jeśli znajdziesz, zacznij odpowiedź od tytułu i id zadania i napisz, co ta "
-    "wiadomość w nim zmienia (np. odblokowuje @czekam, kończy je, dodaje krok). Todoista nie zmieniaj: zmiany "
+    "wiadomość w nim zmienia (np. odblokowuje @czekam, kończy je, dodaje krok). Jeśli nie znajdziesz, nie pisz o "
+    "tym ani o przeszukanych frazach (tak samo przy innych odczytach). Todoista nie zmieniaj: zmiany "
     "dopiero po moim OK. ")
 TODOIST_LOOKUP_EN = (
     "Check whether I have a Todoist task about this: `td task list --filter 'search: <phrase>' --json` for 1-3 "
     "short phrases (PR, issue or ticket number, person, company, topic), including @czekam tasks. If you find one, "
     "start with its title and id and say what this message changes in it (unblocks it, finishes it, adds a step). "
+    "If you find nothing, do not mention it or the phrases you searched (same for other reads). "
     "Do not change Todoist; changes only after my OK. ")
 
 
