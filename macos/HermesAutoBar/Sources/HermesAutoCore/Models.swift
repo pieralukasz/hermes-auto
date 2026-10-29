@@ -103,9 +103,10 @@ public struct SourceHealth: Decodable, Sendable, Equatable {
     public var lastPoll: Double?
     public var retryAt: Double?
     public var listener: Listener?
+    public var channels: [String]?
 
     enum CodingKeys: String, CodingKey {
-        case listener
+        case listener, channels
         case lastPoll = "last_poll", retryAt = "retry_at"
     }
 }
@@ -122,6 +123,7 @@ public struct Listener: Decodable, Sendable, Equatable {
 }
 
 public struct Event: Decodable, Sendable, Equatable, Identifiable {
+    public var channel: String?
     public var account: String
     public var itemId: String
     public var source: String
@@ -140,9 +142,13 @@ public struct Event: Decodable, Sendable, Equatable, Identifiable {
     public var canOpen: Bool
 
     public var id: String { account + "\u{1}" + itemId }
+    public var sourceName: String {
+        guard let channel, !channel.isEmpty else { return sourceLabel(source) }
+        return channel
+    }
 
     enum CodingKeys: String, CodingKey {
-        case account, source, kind, decision, reason, summary, created, title, from, place, url
+        case account, source, channel, kind, decision, reason, summary, created, title, from, place, url
         case itemId = "item_id", jobId = "job_id", jobStatus = "job_status", sessionId = "session_id"
         case canOpen = "can_open"
     }

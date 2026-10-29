@@ -106,3 +106,27 @@ def test_status_health_reports_listener_heartbeat_and_retry(store, tmp_path, con
     assert gmail["last_poll"] == pytest.approx(now - 60) and gmail["retry_at"] == pytest.approx(now + 120)
     assert gmail["listener"]["connected"] is True and "secret" not in gmail["listener"]
     assert health["relay"] is None
+
+
+def test_events_name_the_messenger_of_a_matrix_chat(store, tmp_path, config, capsys):
+    add_item(store, "skip", item_id="r1", kind="matrix", account="matrix:@me:example.test", channel="WhatsApp")
+    add_item(store, "skip", item_id="m2", channel={"nested": "x" * 500})
+    # Slack's payload `channel` is a raw channel ID, not a messenger name.
+    add_item(store, "skip", item_id="s1", kind="slack", account="slack:T1", channel="C012EXAMPLE")
+    _, out = run(store, tmp_path, config, capsys, "events", limit=50)
+    channels = {event["item_id"]: event["channel"] for event in json.loads(out)}
+    assert channels == {"r1": "WhatsApp", "m2": "", "s1": ""}  # only a matrix messenger name, never a structure
+
+
+def test_status_health_lists_messengers_seen_in_cached_matrix_rooms(store, tmp_path, config, capsys):
+    config["sources"]["matrix"] = {"enabled": True}
+    rooms = {"!a": ("WhatsApp", "dm"), "!b": ("Messenger", "group"), "!c": ("WhatsApp", "group"),
+             "!d": ("Signal", "management"), "!e": ("", "dm"), "!f": ("Telegram", "space")}
+    for room, (channel, kind) in rooms.items():
+        store.set_meta(f"matrix_room:{room}", {"at": 1, "channel": channel, "kind": kind, "name": "Rodzina"})
+    store.set_meta("matrix_room:!g", "not a dict")
+    _, out = run(store, tmp_path, config, capsys, "status")
+    sources = json.loads(out)["health"]["sources"]
+    assert sources["matrix"]["channels"] == ["Messenger", "WhatsApp"]
+    assert sources["gmail"]["channels"] == []
+    assert "Rodzina" not in out and "!a" not in out  # room names and ids stay out of status

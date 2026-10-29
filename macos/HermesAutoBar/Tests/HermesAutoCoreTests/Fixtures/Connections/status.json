@@ -1,0 +1,128 @@
+{
+  "paused": false,
+  "source_errors": [
+    "triage slack: Hermes classify failed (exit 1); see local last-error.json"
+  ],
+  "jobs": [
+    {
+      "id": 41,
+      "source": "todoist",
+      "title": "Zamówić przegląd kotła · todoist · #41",
+      "mode": "agent",
+      "status": "done",
+      "session_id": "20261026_080000_aaaaaaaaaaaa",
+      "error": "",
+      "created": "2026-10-26 07:00:00",
+      "updated": "2026-10-26 07:20:00"
+    },
+    {
+      "id": 42,
+      "source": "gmail",
+      "title": "Faktura za październik · gmail · #42",
+      "mode": "draft",
+      "status": "needs_attention",
+      "session_id": "20261027_061000_bbbbbbbbbbbb",
+      "error": "Runner stopped before confirming completion. Inspect session before retrying.",
+      "created": "2026-10-27 05:10:00",
+      "updated": "2026-10-27 05:12:00"
+    },
+    {
+      "id": 43,
+      "source": "brief",
+      "title": "Brief 27.10 06:00",
+      "mode": "open",
+      "status": "ready",
+      "session_id": "20261027_050000_cccccccccccc",
+      "error": "",
+      "created": "2026-10-27 05:00:00",
+      "updated": "2026-10-27 05:03:00"
+    },
+    {
+      "id": 44,
+      "source": "github",
+      "title": "↩ GitHub: feat: offline mode · example/app · github · #44",
+      "mode": "draft",
+      "status": "running",
+      "session_id": "20261027_063000_dddddddddddd",
+      "error": "",
+      "created": "2026-10-27 06:30:00",
+      "updated": "2026-10-27 06:30:05"
+    }
+  ],
+  "followups": [],
+  "triage_issues": [],
+  "triage_pending": [
+    {
+      "source": "slack",
+      "account": "T0EXAMPLE",
+      "items": 2,
+      "attempts": 1,
+      "error": "Hermes classify failed (exit 1)",
+      "next_at": "2026-10-27 07:40:00"
+    }
+  ],
+  "health": {
+    "sources": {
+      "gmail": {
+        "last_poll": 1793080800,
+        "retry_at": null,
+        "listener": {
+          "connected": true,
+          "heartbeat": 1793080800,
+          "last_event_at": 1793080800
+        }
+      },
+      "github": {
+        "last_poll": 1793079000,
+        "retry_at": null,
+        "listener": {
+          "connected": true,
+          "heartbeat": 1793079000,
+          "last_event_at": 1793079000
+        }
+      },
+      "slack": {
+        "last_poll": 1793070000,
+        "retry_at": 1793082000,
+        "listener": {
+          "connected": true,
+          "heartbeat": 1793081000,
+          "last_event_at": 1793070000
+        }
+      },
+      "todoist": {
+        "last_poll": 1793081100,
+        "retry_at": null,
+        "listener": null
+      },
+      "imessage": {
+        "last_poll": 1793081100
+      },
+      "matrix": {
+        "last_poll": 1793081100,
+        "channels": [
+          "Messenger",
+          "WhatsApp",
+          "Instagram"
+        ]
+      },
+      "proton": {
+        "last_poll": 1793081100,
+        "listener": {
+          "connected": true,
+          "heartbeat": 1793081150
+        }
+      },
+      "linear": {
+        "last_poll": 1793081100
+      }
+    },
+    "relay": {
+      "connected": true,
+      "heartbeat": 1793081150,
+      "last_event_at": 1793081150
+    },
+    "last_check": 1793081160,
+    "now": 1793081200
+  }
+}

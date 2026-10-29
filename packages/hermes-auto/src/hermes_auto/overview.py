@@ -21,6 +21,10 @@ def _title(payload, kind=""):
     return str(payload.get("name") or payload.get("subject") or "(bez tematu)")[:200]
 
 
+def _channel(value):
+    return value.strip()[:40] if isinstance(value, str) else ""
+
+
 def events(store, limit=200):
     """Newest sorter decisions first, each with the session it led to (if any)."""
     rows = store.db.execute(
@@ -44,7 +48,8 @@ def events(store, limit=200):
             "decision": row["decision"], "reason": row["reason"], "summary": row["summary"],
             "created": row["created"], "title": _title(payload, row["kind"]),
             "from": str(payload.get("from") or "")[:200], "place": str(payload.get("place") or "")[:200],
-            "url": str(payload.get("url") or ""), "job_id": row["job_id"], "job_status": row["job_status"],
+            "url": str(payload.get("url") or ""), "channel": _channel(payload.get("channel")) if source == "matrix" else "",
+            "job_id": row["job_id"], "job_status": row["job_status"],
             "session_id": session or None,
             "can_open": row["kind"] != "task" and row["decision"] in OPENABLE and row["job_id"] is None,
         })
@@ -59,6 +64,16 @@ def _listener(path: Path):
     return {key: data.get(key) for key in ("connected", "heartbeat", "last_event_at", "events_since_start")}
 
 
+def _matrix_channels(store):
+    # Messengers of chats the Matrix source has cached (`matrix_room:*`); says nothing about a bridge being up.
+    channels = set()
+    for (value,) in store.db.execute("SELECT value FROM meta WHERE key GLOB 'matrix_room:*'"):
+        room = json.loads(value)
+        if isinstance(room, dict) and room.get("kind") in ("dm", "group"):
+            channels.add(_channel(room.get("channel")))
+    return sorted(channels - {""})
+
+
 def sources(config, store, home: Path, now=None):
     """Per enabled source: last successful read, a pending retry, and its push listener's heartbeat."""
     now = time.time() if now is None else now
@@ -71,6 +86,7 @@ def sources(config, store, home: Path, now=None):
             "last_poll": store.get_meta(f"last_poll:{name}"),
             "retry_at": (retry or {}).get("next_at") if isinstance(retry, dict) else None,
             "listener": _listener(home / f"{name}-listener.json"),
+            "channels": _matrix_channels(store) if name == "matrix" else [],
         }
     relay = _listener(home / "relay-listener.json")
     return {"sources": result, "relay": relay, "last_check": store.get_meta("last_poll"), "now": now}

@@ -2,12 +2,10 @@ import HermesAutoCore
 import SwiftUI
 
 enum Tab: String, CaseIterable, Identifiable {
-    case events = "Zdarzenia", sessions = "Sesje", problems = "Problemy"
+    case overview = "Status", events = "History", sessions = "Sessions", problems = "Issues"
     var id: String { rawValue }
 }
 
-/// Screenshot scenes, honoured only with sample data (`HERMES_AUTO_BAR_FIXTURE`):
-/// `HERMES_AUTO_BAR_TAB=events|sessions|problems`, `HERMES_AUTO_BAR_EXPAND=<item id>`.
 enum Preview {
     static let environment = ProcessInfo.processInfo.environment
     static let enabled = environment["HERMES_AUTO_BAR_FIXTURE"] != nil
@@ -22,126 +20,128 @@ struct ContentView: View {
     @Bindable var model: Model
     var inWindow: Bool
     @Environment(\.openWindow) private var openWindow
-    @State private var tab: Tab = Preview.tab ?? .events
+    @State private var tab: Tab = Preview.tab ?? .overview
     @State private var filter: EventFilter = .all
 
     var body: some View {
         VStack(spacing: 0) {
             header
+            if model.isFixture {
+                Text("Sample data. Your automation is unchanged.")
+                    .font(.caption).foregroundStyle(Color.secondaryText).padding(.bottom, 8)
+            }
             Divider()
-            if let status = model.status {
-                SourcesStrip(status: status, now: model.now, model: model)
-                Divider()
-                Picker("", selection: $tab) {
-                    ForEach(Tab.allCases) { tab in
-                        Text(tab == .problems && !model.openProblems.isEmpty
-                             ? "Problemy (\(model.openProblems.count))" : tab.rawValue).tag(tab)
+            if let error = model.loadError, model.status != nil {
+                Label("Status refresh failed. Showing the last known state.\n\(error)", systemImage: "exclamationmark.triangle")
+                    .font(.callout).foregroundStyle(.primary)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(12)
+                    .background(Color.orange.opacity(0.1))
+            }
+            if let error = model.eventsError, model.status != nil, model.loadError == nil, tab == .events {
+                Label("History refresh failed. Showing the last known events.\n\(error)", systemImage: "exclamationmark.triangle")
+                    .font(.callout).foregroundStyle(.primary)
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(12)
+                    .background(Color.orange.opacity(0.1))
+            }
+            if model.status != nil {
+                Picker("View", selection: $tab) {
+                    ForEach(Tab.allCases) { item in
+                        Text(item == .problems && !model.openProblems.isEmpty
+                             ? "Issues (\(model.openProblems.count))" : item.rawValue).tag(item)
                     }
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
+                .pickerStyle(.segmented).labelsHidden().padding(12)
                 switch tab {
+                case .overview:
+                    OverviewView(model: model, tab: $tab)
                 case .events: EventsList(model: model, filter: $filter)
                 case .sessions: JobsList(model: model)
                 case .problems: ProblemsList(model: model)
                 }
+            } else if let error = model.loadError {
+                Unavailable(message: error)
             } else {
-                Unavailable(message: model.loadError ?? "Wczytuję…")
+                VStack(spacing: 10) {
+                    ProgressView().controlSize(.small)
+                    Text("Checking automation status…").foregroundStyle(Color.secondaryText)
+                }.frame(maxWidth: .infinity, maxHeight: .infinity)
             }
             if let notice = model.notice {
                 Divider()
-                Text(notice)
-                    .font(.callout)
-                    .foregroundStyle(model.noticeIsError ? .red : .secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
+                Label(notice, systemImage: model.noticeIsError ? "exclamationmark.triangle" : "info.circle")
+                    .font(.callout).frame(maxWidth: .infinity, alignment: .leading).padding(12)
             }
         }
-        .frame(minWidth: 440, idealWidth: 460, minHeight: 520, idealHeight: 620)
-        .onChange(of: model.sourceFilter) { _, source in
-            // Problems are not per source; a chip click means "show me what came from there".
-            if source != nil && tab == .problems { tab = .events }
+        .frame(minWidth: 460, idealWidth: 480, minHeight: 580, idealHeight: 680)
+        .onChange(of: tab) { _, value in
+            if value == .sessions { model.channelFilter = nil }
         }
         .task { await model.refresh() }
     }
 
     private var header: some View {
-        HStack(spacing: 8) {
+        HStack(alignment: .top, spacing: 10) {
             OverallBadge(overall: model.overall)
-            VStack(alignment: .leading, spacing: 1) {
+            VStack(alignment: .leading, spacing: 3) {
                 Text("Hermes Auto").font(.headline)
-                Text(subtitle).font(.caption).foregroundStyle(.secondary)
+                Text(subtitle).font(.callout)
+                if let last = model.status?.health?.lastCheck {
+                    Text("Last check: \(relativeTime(last, now: model.now))")
+                        .font(.caption).foregroundStyle(Color.secondaryText)
+                }
             }
-            Spacer()
+            Spacer(minLength: 4)
             if model.busyAction != nil { ProgressView().controlSize(.small) }
             if let status = model.status {
                 Button {
                     model.perform(status.paused ? .resume : .pause, label: "pause")
                 } label: {
-                    Label(status.paused ? "Wznów" : "Wstrzymaj", systemImage: status.paused ? "play.fill" : "pause.fill")
+                    Image(systemName: status.paused ? "play" : "pause").frame(width: 24, height: 24)
                 }
-                .help(status.paused ? "Wznów sprawdzanie źródeł i przygotowanie sesji"
-                      : "Wstrzymaj automat: bez nowych sesji, do wznowienia")
+                .accessibilityLabel(status.paused ? "Resume automation" : "Pause automation")
+                .help(status.paused ? "Resume automation" : "Pause new sessions. Existing sessions keep running.")
                 .disabled(model.busyAction != nil)
             }
-            Button { Task { await model.refresh() } } label: { Image(systemName: "arrow.clockwise") }
-                .help("Odśwież")
+            Button { Task { await model.refresh() } } label: { Image(systemName: "arrow.clockwise").frame(width: 24, height: 24) }
+                .accessibilityLabel("Refresh status").help("Refresh status")
             Menu {
                 if !inWindow {
-                    Button("Otwórz w oknie") {
-                        openWindow(id: "main")
-                        NSApp.activate()
-                    }
+                    Button("Open in Window") { openWindow(id: "main"); NSApp.activate() }
                 }
-                Button("Pokaż log automatu") { model.openLog() }
+                Button("Open Automation Log") { model.openLog() }
                 if !model.dismissed.isEmpty {
-                    Button("Przywróć odłożone problemy (\(model.dismissed.count))") { model.restoreDismissed() }
+                    Button("Restore Dismissed Issues (\(model.dismissed.count))") { model.restoreDismissed() }
                 }
                 Divider()
-                Button("Zakończ Hermes Auto Bar") { NSApp.terminate(nil) }
-            } label: { Image(systemName: "ellipsis.circle") }
-                .menuIndicator(.hidden)
-                .fixedSize()
+                Button("Quit Hermes Auto Bar") { NSApp.terminate(nil) }
+            } label: { Image(systemName: "ellipsis").frame(width: 24, height: 24) }
+                .menuIndicator(.hidden).fixedSize().accessibilityLabel("More options")
         }
-        .buttonStyle(.borderless)
-        .padding(12)
+        .buttonStyle(.borderless).controlSize(.regular).padding(16)
     }
 
     private var subtitle: String {
-        var parts: [String] = []
+        guard model.status != nil || model.loadError != nil else { return "Connecting to automation" }
         switch model.overall {
-        case .ok: parts.append("Wszystko działa")
-        case .paused: parts.append("Wstrzymany")
-        case .working(let n): parts.append("Pracuje: \(n)")
-        case .attention(let n): parts.append("Wymaga uwagi: \(n)")
-        case .unavailable: parts.append("Brak połączenia z CLI")
+        case .ok: return "No issues reported"
+        case .paused: return "Automation paused"
+        case .working(let count): return "In progress: \(count)"
+        case .attention(let count): return "Needs attention: \(count)"
+        case .unavailable: return "Status outdated or unavailable"
         }
-        if let last = model.status?.health?.lastCheck {
-            parts.append("ostatnie sprawdzenie \(Times.ago(Date(timeIntervalSince1970: last), now: model.now)) temu"
-                .replacingOccurrences(of: "teraz temu", with: "przed chwilą"))
-        }
-        if model.isFixture { parts.append("dane przykładowe") }
-        return parts.joined(separator: " · ")
     }
 }
 
 struct OverallBadge: View {
     var overall: Overall
-
     var body: some View {
-        Image(systemName: symbol(overall))
-            .font(.title2)
-            .foregroundStyle(color)
-            .frame(width: 28)
+        Image(systemName: symbol(overall)).font(.title2)
+            .foregroundStyle(color).frame(width: 28).accessibilityHidden(true)
     }
-
     private var color: Color {
         switch overall {
-        case .ok: return .green
-        case .working: return .blue
+        case .ok: return .secondary
+        case .working: return .accentColor
         case .paused: return .secondary
         case .attention: return .orange
         case .unavailable: return .red
@@ -151,133 +151,58 @@ struct OverallBadge: View {
 
 func symbol(_ overall: Overall) -> String {
     switch overall {
-    case .ok: return "checkmark.circle.fill"
-    case .working: return "arrow.triangle.2.circlepath.circle.fill"
-    case .paused: return "pause.circle.fill"
-    case .attention: return "exclamationmark.triangle.fill"
-    case .unavailable: return "xmark.octagon.fill"
+    case .ok: return "checkmark.circle"
+    case .working: return "arrow.triangle.2.circlepath"
+    case .paused: return "pause.circle"
+    case .attention: return "exclamationmark.triangle"
+    case .unavailable: return "questionmark.circle"
     }
 }
 
-/// Source chips: last successful read per source. A click shows only that source's events and sessions;
-/// a second click (or the chip in the list header) shows everything again. ZimaBlade opens relay details.
-struct SourcesStrip: View {
-    var status: Status
-    var now: Date
-    @Bindable var model: Model
-    @State private var relayDetails = false
-
-    var body: some View {
-        let sources = (status.health?.sources ?? [:]).sorted { $0.key < $1.key }
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 6) {
-                if let relay = status.health?.relay {
-                    Button { relayDetails.toggle() } label: {
-                        chip(symbol: "antenna.radiowaves.left.and.right", label: "ZimaBlade",
-                             detail: relay.connected == true ? "połączony" : "rozłączony",
-                             bad: relay.connected != true, selected: false)
-                    }
-                    .help("Relay zdarzeń z ZimaBlade (Slack, GitHub, webhooki). Kliknij po szczegóły.")
-                    .popover(isPresented: $relayDetails, arrowEdge: .bottom) { RelayDetails(relay: relay, now: now) }
-                }
-                ForEach(sources, id: \.key) { name, health in
-                    let failing = health.retryAt.map { $0 > now.timeIntervalSince1970 } ?? false
-                    let selected = model.sourceFilter == name
-                    Button {
-                        withAnimation(.snappy(duration: 0.15)) {
-                            model.sourceFilter = SourceScope.toggle(model.sourceFilter, name)
-                        }
-                    } label: {
-                        chip(symbol: sourceSymbol(name), label: sourceLabel(name),
-                             detail: failing ? "błąd odczytu"
-                                 : Times.ago(health.lastPoll.map { Date(timeIntervalSince1970: $0) }, now: now),
-                             bad: failing, selected: selected)
-                    }
-                    .help(selected ? "Pokaż wszystkie źródła"
-                          : "Pokaż tylko \(sourceLabel(name))" + (failing
-                              ? ". Odczyt się nie udał; ponowienie samo, z rosnącym odstępem" : ""))
-                    .accessibilityAddTraits(selected ? .isSelected : [])
-                }
-            }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-        }
-    }
-
-    private func chip(symbol: String, label: String, detail: String, bad: Bool, selected: Bool) -> some View {
-        HStack(spacing: 4) {
-            Image(systemName: symbol).imageScale(.small)
-            Text(label).font(.caption.weight(.medium))
-            Text(detail).font(.caption)
-                .foregroundStyle(selected ? AnyShapeStyle(.white.opacity(0.85)) : bad ? AnyShapeStyle(.red)
-                                 : AnyShapeStyle(.secondary))
-        }
-        .foregroundStyle(selected ? AnyShapeStyle(.white) : AnyShapeStyle(.primary))
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(selected ? AnyShapeStyle(Color.accentColor)
-                    : bad ? AnyShapeStyle(.red.opacity(0.12)) : AnyShapeStyle(.quaternary.opacity(0.6)),
-                    in: Capsule())
-        .contentShape(Capsule())
-    }
+func relativeTime(_ value: Double?, now: Date) -> String {
+    guard let value else { return "not available" }
+    let text = Times.ago(Date(timeIntervalSince1970: value), now: now)
+    return text == "now" ? "just now" : "\(text) ago"
 }
 
 struct RelayDetails: View {
     var relay: Listener
     var now: Date
-
     var body: some View {
-        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
-            GridRow { Text("Połączenie").foregroundStyle(.secondary)
-                Text(relay.connected == true ? "połączony" : "rozłączony") }
-            GridRow { Text("Ostatnie zdarzenie").foregroundStyle(.secondary)
-                Text(ago(relay.lastEventAt)) }
-            GridRow { Text("Sygnał życia").foregroundStyle(.secondary)
-                Text(ago(relay.heartbeat)) }
-        }
-        .font(.callout)
-        .padding(12)
-    }
-
-    private func ago(_ value: Double?) -> String {
-        guard let value else { return "–" }
-        let text = Times.ago(Date(timeIntervalSince1970: value), now: now)
-        return text == "teraz" ? "przed chwilą" : "\(text) temu"
+        VStack(alignment: .leading, spacing: 8) {
+            LabeledContent("Connection", value: relay.connected.map { $0 ? "connected" : "disconnected" } ?? "unknown")
+            LabeledContent("Last event", value: relativeTime(relay.lastEventAt, now: now))
+            LabeledContent("Last heartbeat", value: relativeTime(relay.heartbeat, now: now))
+        }.font(.callout)
     }
 }
 
-/// Shown above a list while a source chip is selected; the x clears it.
 struct SourceScopeBar: View {
     @Bindable var model: Model
-
     var body: some View {
         if let source = model.sourceFilter {
             HStack(spacing: 6) {
-                Image(systemName: sourceSymbol(source)).imageScale(.small)
-                Text("Tylko \(sourceLabel(source))").font(.caption.weight(.medium))
-                Button { withAnimation(.snappy(duration: 0.15)) { model.sourceFilter = nil } } label: {
+                Text("Only \(model.channelFilter ?? sourceLabel(source))").font(.caption.weight(.medium))
+                Button { model.sourceFilter = nil; model.channelFilter = nil } label: {
                     Image(systemName: "xmark.circle.fill")
                 }
-                .buttonStyle(.borderless)
-                .help("Pokaż wszystkie źródła")
+                .buttonStyle(.borderless).help("Show all sources")
+                .accessibilityLabel("Clear source filter")
             }
-            .foregroundStyle(Color.accentColor)
         }
     }
 }
 
 struct Unavailable: View {
     var message: String
-
     var body: some View {
         VStack(spacing: 8) {
-            Image(systemName: "bolt.horizontal.circle").font(.largeTitle).foregroundStyle(.secondary)
-            Text("Nie mam danych z hermes-auto").font(.headline)
-            Text(message).font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            Image(systemName: "questionmark.circle").font(.largeTitle).foregroundStyle(Color.secondaryText)
+            Text("Automation status is unavailable").font(.headline)
+            Text(message).font(.callout).foregroundStyle(Color.secondaryText).multilineTextAlignment(.center)
                 .textSelection(.enabled)
+            Text("Try the refresh button above.").font(.callout)
         }
-        .padding(24)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(24).frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }

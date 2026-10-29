@@ -6,16 +6,15 @@ import Observation
 @MainActor
 @Observable
 final class Model {
-    var status: Status?
-    var events: [Event] = []
-    var loadError: String?
+    private(set) var snapshot = OverviewSnapshot()
     var lastRefresh: Date?
     var busyAction: String?
     var notice: String?
     var noticeIsError = false
     var dismissed: Set<String>
-    /// Source chip selected in the strip: only its events and sessions are listed (nil = all).
+    /// History source selection also scopes the sessions list (nil = all).
     var sourceFilter: String? = Preview.source
+    var channelFilter: String?
 
     let runner: CommandRunner
     let isFixture: Bool
@@ -25,14 +24,23 @@ final class Model {
     init(runner: CommandRunner, isFixture: Bool) {
         self.runner = runner
         self.isFixture = isFixture
-        dismissed = Set(UserDefaults.standard.stringArray(forKey: "dismissedProblems") ?? [])
+        dismissed = isFixture ? [] : Set(UserDefaults.standard.stringArray(forKey: "dismissedProblems") ?? [])
     }
 
-    var overall: Overall { Summary.overall(status, error: loadError, dismissed: dismissed) }
+    var status: Status? { snapshot.status }
+    var events: [Event] { snapshot.events }
+    /// Only a failed `status` read; it makes the whole state stale.
+    var loadError: String? { snapshot.statusError }
+    var eventsError: String? { snapshot.eventsError }
+    var overall: Overall { snapshot.overall(dismissed: dismissed) }
     var problems: [Problem] { status.map(Summary.problems) ?? [] }
     var openProblems: [Problem] { problems.filter { !dismissed.contains($0.key) } }
     var activeJobs: [Job] { status.map(Summary.active) ?? [] }
-    var now: Date { Date(timeIntervalSince1970: status?.health?.now ?? Date().timeIntervalSince1970) }
+    /// Fixtures carry their own clock so screenshots stay stable; live data is measured against the real time.
+    var now: Date {
+        guard isFixture, let fixed = status?.health?.now else { return Date() }
+        return Date(timeIntervalSince1970: fixed)
+    }
 
     /// Newest automation sessions first (Todoist runs, briefs, mail, replies).
     var recentJobs: [Job] {
@@ -52,24 +60,9 @@ final class Model {
         refreshing = true
         defer { refreshing = false }
         let statusResult = await runner.run(["status"])
-        guard statusResult.exitCode == 0 else {
-            loadError = statusResult.message
-            return
-        }
-        do {
-            status = try Decode.status(statusResult.stdout)
-            loadError = nil
-        } catch {
-            loadError = "Nie rozumiem odpowiedzi `hermes-auto status`: \(error.localizedDescription)"
-            return
-        }
+        guard snapshot.acceptStatus(statusResult) else { return }
         let eventsResult = await runner.run(["events", "--limit", "300"])
-        if eventsResult.exitCode == 0, let decoded = try? Decode.events(eventsResult.stdout) {
-            events = decoded
-        } else if eventsResult.exitCode != 0 {
-            // An older CLI without `events`: the status part still works.
-            loadError = "Oś zdarzeń niedostępna: \(eventsResult.message)"
-        }
+        snapshot.acceptEvents(eventsResult)
         lastRefresh = Date()
     }
 
@@ -83,13 +76,13 @@ final class Model {
             var attempts = 0
             while result.isBusy && attempts < 6 {
                 attempts += 1
-                notice = "Automat właśnie pracuje, ponawiam (\(attempts)/6)…"
+                notice = "Automation is busy, retrying (\(attempts)/6)…"
                 try? await Task.sleep(for: .seconds(5))
                 result = await runner.run(action.arguments)
             }
             busyAction = nil
             if result.exitCode == 0 {
-                show(isFixture ? "Podgląd: \(action.arguments.joined(separator: " "))" : action.done, error: false)
+                show(isFixture ? "Preview: \(action.arguments.joined(separator: " "))" : action.done, error: false)
             } else {
                 show(result.message, error: true)
             }
@@ -111,7 +104,7 @@ final class Model {
         // Keep only keys that still describe a current problem, so the list does not grow forever.
         let current = Set(problems.map(\.key))
         dismissed = dismissed.intersection(current)
-        UserDefaults.standard.set(Array(dismissed), forKey: "dismissedProblems")
+        if !isFixture { UserDefaults.standard.set(Array(dismissed), forKey: "dismissedProblems") }
     }
 
     private func show(_ text: String, error: Bool) {
@@ -125,16 +118,19 @@ final class Model {
     }
 
     func openSession(_ sessionId: String?) {
+        if isFixture { show("Preview: open session in Hermes", error: false); return }
         guard let sessionId, let url = sessionURL(sessionId) else { return }
         NSWorkspace.shared.open(url)
     }
 
     func openSource(_ value: String) {
+        if isFixture { show("Preview: open message in its source", error: false); return }
         guard let url = sourceURL(value) else { return }
         NSWorkspace.shared.open(url)
     }
 
     func openLog() {
+        if isFixture { show("Preview: open automation log", error: false); return }
         let log = FileManager.default.homeDirectoryForCurrentUser.appending(path: ".config/hermes-auto/service.log")
         NSWorkspace.shared.open(log)
     }

@@ -45,10 +45,27 @@ public enum Summary {
             result.append(Problem(kind: .sourceError, title: sourceOfError(error), detail: error, sessionId: nil,
                                   key: "source:\(error)"))
         }
+        let reportedSources = Set(status.sourceErrors.map(sourceOfError))
+        for (name, health) in (status.health?.sources ?? [:]).sorted(by: { $0.key < $1.key }) {
+            guard !reportedSources.contains(sourceLabel(name)) else { continue }
+            let detail: String
+            if health.retryAt != nil {
+                detail = "The last read failed and is not confirmed yet. Hermes Auto will retry."
+            } else if health.listener?.connected == false {
+                detail = "The new-event listener reports a disconnect. The last read does not confirm it is listening."
+            } else { continue }
+            result.append(Problem(kind: .sourceError, title: sourceLabel(name), detail: detail, sessionId: nil,
+                                  key: "connection:\(name):\(health.retryAt ?? health.lastPoll ?? 0):\(detail)"))
+        }
+        if let relay = status.health?.relay, relay.connected == false {
+            result.append(Problem(kind: .sourceError, title: "ZimaBlade: not connected",
+                                  detail: "The relay does not confirm its connection. New signals may not reach this Mac.",
+                                  sessionId: nil, key: "relay:\(relay.lastEventAt ?? 0)"))
+        }
         for pending in status.triagePending {
             result.append(Problem(kind: .pending(pending.source),
-                                  title: "\(sourceLabel(pending.source)): do ponownej klasyfikacji \(pending.items)",
-                                  detail: "Ponowienie \(pending.nextAt). \(pending.error)", sessionId: nil,
+                                  title: "\(sourceLabel(pending.source)): \(pending.items) to reclassify",
+                                  detail: "Next retry \(pending.nextAt). \(pending.error)", sessionId: nil,
                                   key: "pending:\(pending.source):\(pending.account):\(pending.attempts)"))
         }
         for issue in status.triageIssues {
@@ -63,7 +80,8 @@ public enum Summary {
     }
 
     public static func overall(_ status: Status?, error: String?, dismissed: Set<String>) -> Overall {
-        guard let status else { return .unavailable(error ?? "Brak danych") }
+        if let error { return .unavailable(error) }
+        guard let status else { return .unavailable("No data") }
         if status.paused { return .paused }
         let open = problems(status).filter { !dismissed.contains($0.key) }
         if !open.isEmpty { return .attention(open.count) }
@@ -81,7 +99,7 @@ public enum Summary {
 
 /// Timeline filters shown above the list.
 public enum EventFilter: String, CaseIterable, Sendable, Identifiable {
-    case all = "Wszystko", sessions = "Sesje", brief = "Brief", skipped = "Pominięte", todoist = "Todoist"
+    case all = "All", sessions = "Sessions", brief = "Brief", skipped = "Skipped", todoist = "Todoist"
     public var id: String { rawValue }
 
     public func includes(_ event: Event) -> Bool {
@@ -97,8 +115,9 @@ public enum EventFilter: String, CaseIterable, Sendable, Identifiable {
 
 /// What the lists show once a source chip is selected (nil = every source).
 public enum SourceScope {
-    public static func events(_ events: [Event], filter: EventFilter, source: String?) -> [Event] {
-        events.filter { filter.includes($0) && (source == nil || $0.source == source) }
+    public static func events(_ events: [Event], filter: EventFilter, source: String?, channel: String? = nil) -> [Event] {
+        events.filter { filter.includes($0) && (source == nil || $0.source == source)
+            && (channel == nil || $0.channel == channel) }
     }
 
     public static func jobs(_ jobs: [Job], source: String?) -> [Job] {
@@ -120,12 +139,12 @@ public func sourceLabel(_ source: String) -> String {
     case "github": return "GitHub"
     case "linear": return "Linear"
     case "imessage": return "iMessage"
-    case "matrix": return "Komunikatory"
+    case "matrix": return "Matrix"
     case "todoist": return "Todoist"
     case "brief": return "Brief"
-    case "questions": return "Plan Todoist"
-    case "proposals": return "Propozycje"
-    case "unblocked": return "Odblokowane"
+    case "questions": return "Todoist plan"
+    case "proposals": return "Proposals"
+    case "unblocked": return "Unblocked"
     default: return source.isEmpty ? "?" : source.prefix(1).uppercased() + source.dropFirst()
     }
 }
@@ -150,32 +169,32 @@ public func sourceSymbol(_ source: String) -> String {
 
 public func decisionLabel(_ decision: String) -> String {
     switch decision {
-    case "session": return "Sesja"
-    case "followup": return "Odpowiedź ↩"
+    case "session": return "Session"
+    case "followup": return "Reply ↩"
     case "brief": return "Brief"
-    case "skip": return "Pominięte"
-    case "read": return "Przeczytane"
+    case "skip": return "Skipped"
+    case "read": return "Read"
     case "planned": return "Plan"
-    case "moved": return "Przeniesione"
-    case "asked": return "Pytanie"
-    case "baseline": return "Stan początkowy"
-    case "needs_attention": return "Wymaga uwagi"
-    case "user_changed": return "Zmienione przez Ciebie"
+    case "moved": return "Moved"
+    case "asked": return "Question"
+    case "baseline": return "Baseline"
+    case "needs_attention": return "Needs attention"
+    case "user_changed": return "Changed by you"
     default: return decision
     }
 }
 
 public func jobStatusLabel(_ status: String) -> String {
     switch status {
-    case "pending", "created": return "W kolejce"
-    case "creating", "running": return "Pracuje"
-    case "retry_pending": return "Ponowienie w kolejce"
-    case "ready": return "Gotowa"
-    case "done": return "Zrobione"
-    case "needs_attention": return "Wymaga uwagi"
-    case "deferred": return "Odłożone"
-    case "deleted": return "Usunięta"
-    case "superseded": return "Zastąpiona nową sesją"
+    case "pending", "created": return "Queued"
+    case "creating", "running": return "Working"
+    case "retry_pending": return "Retry queued"
+    case "ready": return "Ready"
+    case "done": return "Done"
+    case "needs_attention": return "Needs attention"
+    case "deferred": return "Deferred"
+    case "deleted": return "Deleted"
+    case "superseded": return "Replaced by a new session"
     default: return status
     }
 }
@@ -191,28 +210,28 @@ public enum Times {
         return formatter.date(from: value)
     }
 
-    /// "teraz", "5 min", "3 h", "2 dni"
+    /// "now", "5 min", "3 h", "2 days"
     public static func ago(_ date: Date?, now: Date) -> String {
         guard let date else { return "–" }
         let seconds = max(0, now.timeIntervalSince(date))
-        if seconds < 60 { return "teraz" }
+        if seconds < 60 { return "now" }
         if seconds < 3600 { return "\(Int(seconds / 60)) min" }
         if seconds < 86400 { return "\(Int(seconds / 3600)) h" }
         let days = Int(seconds / 86400)
-        return days == 1 ? "1 dzień" : "\(days) dni"
+        return days == 1 ? "1 day" : "\(days) days"
     }
 
-    /// Section titles of the timeline: "Dziś", "Wczoraj", then the date.
+    /// Section titles of the timeline: "Today", "Yesterday", then the date.
     public static func day(_ date: Date?, now: Date, calendar: Calendar = .current) -> String {
-        guard let date else { return "Bez daty" }
-        if calendar.isDate(date, inSameDayAs: now) { return "Dziś" }
+        guard let date else { return "No date" }
+        if calendar.isDate(date, inSameDayAs: now) { return "Today" }
         if let yesterday = calendar.date(byAdding: .day, value: -1, to: now),
-           calendar.isDate(date, inSameDayAs: yesterday) { return "Wczoraj" }
+           calendar.isDate(date, inSameDayAs: yesterday) { return "Yesterday" }
         let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "pl_PL")
+        formatter.locale = Locale(identifier: "en_US")
         formatter.calendar = calendar
         formatter.timeZone = calendar.timeZone
-        formatter.dateFormat = "EEEE, d MMMM"
+        formatter.dateFormat = "EEEE, MMMM d"
         return formatter.string(from: date)
     }
 

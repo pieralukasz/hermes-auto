@@ -22,10 +22,10 @@ public enum Action: Equatable, Sendable {
     /// What the user reads after it worked.
     public var done: String {
         switch self {
-        case .pause: return "Automat wstrzymany"
-        case .resume: return "Automat wznowiony"
-        case .retry, .newSession, .openItem: return "Sesja założona, jest już w Hermesie"
-        case .retryFollowup: return "W kolejce: sesja powstanie w ciągu minuty"
+        case .pause: return "Hermes Auto paused"
+        case .resume: return "Hermes Auto resumed"
+        case .retry, .newSession, .openItem: return "Session requested"
+        case .retryFollowup: return "Reply retry queued"
         }
     }
 }
@@ -47,7 +47,7 @@ public struct CommandResult: Sendable, Equatable {
     public var message: String {
         let text = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleaned = text.hasPrefix("hermes-auto: ") ? String(text.dropFirst("hermes-auto: ".count)) : text
-        return cleaned.isEmpty ? "hermes-auto zakończył się kodem \(exitCode)" : cleaned
+        return cleaned.isEmpty ? "hermes-auto exited with code \(exitCode)" : cleaned
     }
 }
 
@@ -92,7 +92,7 @@ public struct CLIRunner: CommandRunner {
         do {
             try process.run()
         } catch {
-            return CommandResult(exitCode: 127, stdout: Data(), stderr: "Nie mogę uruchomić \(executable.path): \(error.localizedDescription)")
+            return CommandResult(exitCode: 127, stdout: Data(), stderr: "Cannot start \(executable.path): \(error.localizedDescription)")
         }
         // Read before waiting: a full pipe would block the child forever.
         let group = DispatchGroup()
@@ -109,14 +109,14 @@ public struct CLIRunner: CommandRunner {
                 kill(process.processIdentifier, SIGKILL)
                 _ = group.wait(timeout: .now() + 2)
             }
-            return CommandResult(exitCode: 124, stdout: Data(), stderr: "hermes-auto nie odpowiedział w \(Int(timeout)) s")
+            return CommandResult(exitCode: 124, stdout: Data(), stderr: "hermes-auto did not respond within \(Int(timeout)) s")
         }
         // Both pipes closed; the process may still linger (closed its output but did not exit).
         let exited = DispatchSemaphore(value: 0)
         DispatchQueue.global().async { process.waitUntilExit(); exited.signal() }
         if exited.wait(timeout: .now() + 5) == .timedOut {
             process.terminate()
-            return CommandResult(exitCode: 124, stdout: Data(), stderr: "hermes-auto nie zakończył się po wyjściu")
+            return CommandResult(exitCode: 124, stdout: Data(), stderr: "hermes-auto did not exit after closing its output")
         }
         return CommandResult(exitCode: process.terminationStatus, stdout: stdout.data,
                              stderr: String(decoding: stderr.data, as: UTF8.self))
@@ -144,7 +144,7 @@ public struct FixtureRunner: CommandRunner {
             return CommandResult(exitCode: 0, stdout: Data("{}".utf8), stderr: "")
         }
         guard let data = try? Data(contentsOf: directory.appending(path: name)) else {
-            return CommandResult(exitCode: 1, stdout: Data(), stderr: "Brak \(name) w \(directory.path)")
+            return CommandResult(exitCode: 1, stdout: Data(), stderr: "\(name) not found in \(directory.path)")
         }
         return CommandResult(exitCode: 0, stdout: data, stderr: "")
     }
