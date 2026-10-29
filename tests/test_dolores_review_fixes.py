@@ -235,24 +235,30 @@ def chain(home, root, length, prefix):
     return parent
 
 
-def test_the_hop_limit(dolores):
-    assert policy.COMPRESSION_HOPS == 64
-    chain(dolores, SID, 65, "child")
-    assert is_block(hook("write_file", session_id="child-64"), "Łukasza")  # root found at hop 64: first turn
-    assert hook("delegate_task", delegation("inbox"), session_id="child-64") is None
-    assert is_block(hook("write_file", session_id="child-65"), UNKNOWN)  # root beyond the limit: refused
-    assert is_block(hook("delegate_task", delegation("inbox"), session_id="child-65"), UNKNOWN)
-    say(dolores, "Napisz do niej", sid="child-30")  # a person wrote: still refused past the limit
-    assert hook("write_file", session_id="child-64") is None
-    assert is_block(hook("write_file", session_id="child-65"), UNKNOWN)
+def test_a_long_registered_lineage_stays_locked(dolores):
+    # Codex review: a 64-hop cap once unlocked the 65th continuation. The walk now reads the whole lineage.
+    chain(dolores, SID, 200, "child")
+    assert is_block(hook("write_file", session_id="child-65"), "Łukasza")
+    assert is_block(hook("write_file", session_id="child-200"), "Łukasza")
+    assert hook("delegate_task", delegation("inbox"), session_id="child-200") is None
+    say(dolores, "Napisz do niej", sid="child-30")  # a person wrote in the lineage: open from there on
+    assert hook("write_file", session_id="child-200") is None
 
 
-def test_an_ordinary_lineage_up_to_the_limit_passes(dolores):
+def test_a_long_ordinary_lineage_is_never_refused(dolores):
+    # A long-lived manual chat compressed many times is an ordinary session, not an unknown one.
     add_session(dolores, "own-root")
-    chain(dolores, "own-root", 65, "own")
-    assert hook("write_file", session_id="own-63") is None
-    assert hook("write_file", session_id="own-64") is None  # 64 ancestors, root reached
-    assert is_block(hook("write_file", session_id="own-65"), UNKNOWN)  # cannot see the whole lineage
+    chain(dolores, "own-root", 200, "own")
+    assert hook("write_file", session_id="own-65") is None
+    assert hook("write_file", session_id="own-200") is None
+
+
+def test_a_lineage_beyond_the_safety_bound_refuses(dolores, monkeypatch):
+    monkeypatch.setattr(policy, "COMPRESSION_HOPS", 5)
+    add_session(dolores, "own-root")
+    chain(dolores, "own-root", 7, "own")
+    assert hook("write_file", session_id="own-5") is None
+    assert is_block(hook("write_file", session_id="own-7"), UNKNOWN)
 
 
 def test_a_lineage_cycle_refuses(dolores):

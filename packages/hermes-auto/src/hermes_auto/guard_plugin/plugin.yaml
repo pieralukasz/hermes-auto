@@ -1,5 +1,5 @@
 name: hermes-auto-guard
-version: "2.2.0"
+version: "2.2.1"
 description: "hermes-auto guard. Read-only bots (inbox): the hermes-auto read toolset (one grammar-checked read command, raw skill reads) and a pre_tool_call guard that refuses every other tool in every session. Dolores (first_turn): until the user writes in an automatic session with third-party content, only delegation to the read-only subagent, session_search and skill reads; a session that cannot be told gets no tool. tool_search is refused in both modes (remote connectors). Mode from scope.json (hermes-auto install-guard <profile>)."
 author: Lukasz Piera
 hooks:

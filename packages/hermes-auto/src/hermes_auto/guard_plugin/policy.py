@@ -33,7 +33,7 @@ import subprocess
 import sys
 
 GUARD_NAME = "hermes-auto-guard"
-GUARD_VERSION = "2.2.0"
+GUARD_VERSION = "2.2.1"
 READ_ONLY_MODE, FIRST_TURN_MODE = "read_only", "first_turn"
 MODES = (READ_ONLY_MODE, FIRST_TURN_MODE)
 PROFILE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")  # bots.NAME
@@ -539,7 +539,10 @@ REFUSED_UNKNOWN = (
     "({why}), więc hermes-auto-guard wstrzymuje wszystkie narzędzia, dopóki odczyt się nie uda. Spróbuj ponownie "
     "za chwilę; jeśli to się powtarza, sprawdź katalog hermes-auto-guard/sessions i state.db tego profilu. "
     "(Not run: cannot tell whether this is an automatic third-party session; every tool is refused until it can.)")
-COMPRESSION_HOPS = 64
+# Safety bound for the lineage walk, not a policy limit: a real lineage ends long before it, and an ordinary
+# long-lived chat must never be refused merely for having been compressed many times. Only a cycle (or a
+# lineage beyond this bound) is incomplete.
+COMPRESSION_HOPS = 100_000
 # first_turn_state: an ordinary session (nothing refused), an automatic one without the user (first-turn rules),
 # or one that cannot be told (every tool refused, with the reason).
 OPEN, LOCKED, UNKNOWN = "open", "locked", "unknown"
