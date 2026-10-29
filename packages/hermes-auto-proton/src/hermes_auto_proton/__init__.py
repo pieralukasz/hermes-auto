@@ -187,7 +187,7 @@ class Proton:
                             continue
                         to = [address for _, address in getaddresses([str(sent.get("To", "")),
                                                                       str(sent.get("Cc", ""))]) if address]
-                        item["sent"].append({"ts": stamp, "to": to})
+                        item["sent"].append({"ts": stamp, "to": to, "id": ref})
         new_cursor = {"validity": validity, "uid": uids[-1] if uids else (cursor or {}).get("uid", uid_next - 1)}
         if since_ms is None:
             store.set_meta("source_backlog:proton", backlog)

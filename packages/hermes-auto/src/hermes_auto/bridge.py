@@ -19,6 +19,7 @@ from pathlib import Path
 GUARD_DIR = Path(__file__).with_name("guard_plugin")
 SHELL_META = set(";|&<>`$\n\r\\(){}")
 GOOGLE_API = "skills/productivity/google-workspace/scripts/google_api.py"
+PROTON_SEND = "hermes-auto-proton-send"
 REFUSAL_MARK = "hermes-auto-refusal:"
 TITLE_LIMIT = 100  # Hermes SessionDB.MAX_TITLE_LENGTH
 # Launch fields a run compares with the session's frozen creation request (`launch_request`).
@@ -743,24 +744,41 @@ GOOGLE_SENDS = {("gmail", "send"), ("gmail", "reply")}
 LITERAL_QUOTES = re.compile(r"'[^']*'|\"[^\"$`\\\\]*\"")
 
 
-def google_send_command(command):
-    """True only for one plain `python …/google_api.py gmail send|reply …` invocation.
-
-    The Google Workspace skill script is the only known sender (`gmail send` / `gmail reply`; both
-    print `{"status": "sent", "id": …, "threadId": …}`). Anything else (drafts, other tools, reads,
-    chained or substituted shell) is not a send this function recognises, so routing fails closed.
-    """
+def plain_tokens(command):
+    """The tokens of one plain command (literal quotes only, no shell metacharacters), else None."""
     import shlex
     text = str(command or "").strip()
     bare = LITERAL_QUOTES.sub("''", text)
     if not text or "'" in bare.replace("''", "") or '"' in bare or SHELL_META & set(bare):
-        return False
+        return None
     try:
-        tokens = shlex.split(text)
+        return shlex.split(text)
     except ValueError:
-        return False
+        return None
+
+
+def google_send_command(command):
+    """True only for one plain `python …/google_api.py gmail send|reply …` invocation.
+
+    The Google Workspace skill script sends Gmail (`gmail send` / `gmail reply`; both print
+    `{"status": "sent", "id": …, "threadId": …}`). Anything else (drafts, other tools, reads,
+    chained or substituted shell) is not a send this function recognises, so routing fails closed.
+    """
+    tokens = plain_tokens(command) or []
     return (len(tokens) >= 4 and re.fullmatch(r"python3?(\.\d+)?", Path(tokens[0]).name) is not None
             and tokens[1].endswith(GOOGLE_API) and (tokens[2], tokens[3]) in GOOGLE_SENDS)
+
+
+def proton_send_command(command):
+    """True only for one plain `hermes-auto-proton-send …` invocation (the Proton Bridge sender of the
+    hermes-auto-proton package). It prints the same receipt as Gmail, with the RFC Message-ID as `id`
+    and the thread root as `threadId`; a hand-written SMTP script is not recognised."""
+    tokens = plain_tokens(command) or []
+    return len(tokens) >= 2 and Path(tokens[0]).name == PROTON_SEND and "--help" not in tokens
+
+
+def send_command(command):
+    return google_send_command(command) or proton_send_command(command)
 
 
 def send_calls(tool_calls):
@@ -780,13 +798,13 @@ def send_calls(tool_calls):
         except ValueError:
             continue
         if (isinstance(arguments, dict) and not arguments.get("background")
-                and google_send_command(arguments.get("command"))):
+                and send_command(arguments.get("command"))):
             found.add(str(call["id"]))
     return found
 
 
 def send_receipt(content, thread_id, message_ids):
-    """True when a terminal result is exactly a successful Gmail send receipt for this thread
+    """True when a terminal result is exactly a successful send receipt (Gmail or Proton) for this thread
     (receipt threadId) or for one of the user's sent messages (receipt id)."""
     try:
         outer = json.loads(content or "")
