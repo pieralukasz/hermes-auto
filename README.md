@@ -139,7 +139,7 @@ hermes-auto source enable slack
 
 The first check records a baseline; only later messages open sessions.
 
-Unattended Slack/GitHub research uses explicit read-command grammars for trusted Slack, GitHub and Linear tools, plus the existing calendar/Todoist reads. Todoist accepts only explicit read options (no progress-output files or account switching); Linear issue reads require `--no-download`. It cannot execute local git or arbitrary web tools: repository configuration can run programs, and web URLs can transmit private context. Redacted private Slack items use the `private` profile with no executable tools. These restrictions apply only to automatic preparation; the user's later turn keeps the normal toolset.
+Unattended Slack/GitHub research uses explicit read-command grammars for trusted Slack, GitHub and Linear tools, plus the existing calendar/Todoist reads. Todoist accepts only explicit read options (no progress-output files or account switching); Linear issue reads require `--no-download`. It cannot execute local git or arbitrary web tools: repository configuration can run programs, and web URLs can transmit private context. Redacted private Slack items use the `private` profile with no executable tools. These restrictions apply only to automatic preparation; the user's later turn keeps the normal toolset. The session prompt names only the reads its read-only bot grants on that session's account (`bots.read_only` plus the `routes` provider), so a work-account session is not told to search Todoist, the calendar or past conversations; it reports findings and proposed points and names the bot to hand the matter to, which writes the draft.
 
 ## Push gateway (Gmail, Todoist)
 
