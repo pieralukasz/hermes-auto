@@ -4,12 +4,21 @@ Shared by the Hermes plugin (``__init__.py``, loaded by the gateway for the prof
 hermes-auto's bridge and tests. Pure Python, no Hermes imports at module level: the bridge loads this file by path
 and the tests import it.
 
-The boundary lives in the bot profile's own configuration: its `platform_toolsets` name only the `hermes-auto`
-toolset and `session_search`, `agent.disabled_toolsets` removes terminal, files, browser, web, delegation and the
-rest, and the gateway refuses a session that asks for more. Hermes Auto also freezes those toolsets when it
-creates a session. This plugin is enabled only in those profiles and applies to every session there (no
-per-session registry): the one read tool runs only commands its grammar proves to be reads, limited to the read
-families the profile was installed with (``scope.json``), and the ``pre_tool_call`` hook refuses any other tool.
+Two modes, chosen by ``scope.json`` in the profile's plugin directory:
+
+* ``read_only`` (default; the `inbox` profile): the boundary lives in the bot profile's own configuration: its
+  `platform_toolsets` name only the `hermes-auto` toolset and `session_search`, `agent.disabled_toolsets` removes
+  terminal, files, browser, web, delegation and the rest, and the gateway refuses a session that asks for more.
+  The plugin applies to every session there (no per-session registry): the one read tool runs only commands its
+  grammar proves to be reads, limited to the read families the profile was installed with, and the
+  ``pre_tool_call`` hook refuses any other tool. This also holds for a subagent Dolores runs as this profile
+  (``delegate_task`` with ``profile``): its turns run in this profile's scope, so this profile's hook guards them.
+* ``first_turn`` (Dolores' `default` profile): sessions hermes-auto registered before their first prompt
+  (``<home>/hermes-auto-guard/sessions/<session id>``) carry someone else's content. Until the user has written in
+  such a session, its turns (and the background review fork, which shares the session id) may only hand the
+  matter to the read-only subagent profile (``delegate_task``, every task with that ``profile``), search this
+  profile's conversations and read skills. Every other session of the profile is untouched. Fail-closed: a
+  registered session whose messages cannot be read stays locked.
 """
 from __future__ import annotations
 
@@ -17,11 +26,15 @@ import json
 import os
 import re
 import shlex
+import sqlite3
 import subprocess
 import sys
 
 GUARD_NAME = "hermes-auto-guard"
-GUARD_VERSION = "2.0.0"
+GUARD_VERSION = "2.1.0"
+READ_ONLY_MODE, FIRST_TURN_MODE = "read_only", "first_turn"
+MODES = (READ_ONLY_MODE, FIRST_TURN_MODE)
+PROFILE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")  # bots.NAME
 TOOLSET = "hermes-auto"
 READ_TOOL = "hermes_auto_read"
 SKILL_VIEW_TOOL = "hermes_auto_skill_view"
@@ -36,6 +49,9 @@ ALLOWED_TOOLS = frozenset(PLUGIN_TOOLS) | {"session_search"}
 MAIL, RESEARCH, PRIVATE, FULL = "mail", "research", "private", "full"
 DENY_PROFILES = (MAIL, RESEARCH, PRIVATE)
 PROFILES = DENY_PROFILES + (FULL,)
+# A third-party job in Dolores' profile (bots): her normal tools under the first_turn guard; the read-only
+# subagent profile reads.
+DELEGATE = "delegate"
 # Read families: which programs a profile's read tool may run.
 GOOGLE, TODOIST, GITHUB, LINEAR, SLACK = "google", "todoist", "github", "linear", "slack"
 FAMILIES = (GOOGLE, TODOIST, GITHUB, LINEAR, SLACK)
@@ -68,10 +84,17 @@ def families_for(profile):
 def valid_scope(data):
     """scope.json: {"version": 1, "reads": [families], "providers": {provider: {"reads": [...], "session_search":
     bool}}}. `reads` apply to sessions on any other account; a provider entry (e.g. a work account chosen by a
-    hermes-auto route) replaces them for sessions running on that provider."""
+    hermes-auto route) replaces them for sessions running on that provider.
+
+    Dolores' profile: {"version": 1, "mode": "first_turn", "reads": [], "subagent": "<read-only profile>"}: no
+    reads of its own and no providers; `subagent` is the only profile an automatic first turn may delegate to."""
     if not (isinstance(data, dict) and data.get("version") == 1 and isinstance(data.get("reads"), list)
-            and all(item in FAMILIES for item in data["reads"])):
+            and all(item in FAMILIES for item in data["reads"]) and data.get("mode", READ_ONLY_MODE) in MODES):
         return False
+    if data.get("mode") == FIRST_TURN_MODE:
+        subagent = data.get("subagent")
+        return (data["reads"] == [] and "providers" not in data and isinstance(subagent, str)
+                and bool(PROFILE_NAME.fullmatch(subagent)))
     providers = data.get("providers", {})
     return isinstance(providers, dict) and all(
         isinstance(name, str) and isinstance(spec, dict) and isinstance(spec.get("reads"), list)
@@ -460,6 +483,185 @@ def decide(tool_name, args, search=True):
         if names and names <= ALLOWED_TOOLS:
             return None  # Hermes unwraps the bridge and checks the real tool again before it runs
     return REFUSED_READ
+
+
+# --- first_turn: Dolores' automatic sessions ------------------------------------------------------------
+
+# Appended by the bridge to the automatic prompt (model text and transcript card): a user row carrying it is the
+# automation's own message, never the user's. Text inside a third party's message can only keep the lock.
+AUTO_TURN_MARK = "<!-- hermes-auto:auto-turn -->"
+REGISTRY = ("hermes-auto-guard", "sessions")
+SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,199}")
+# User rows Hermes writes itself with no display kind: notices and wake-ups (old rows), compaction handoffs.
+SYSTEM_PREFIXES = ("[IMPORTANT:", "[System", "[ASYNC", "[INTERNAL", "[CONTEXT COMPACTION", "[CONTEXT SUMMARY]",
+                   "[PRIOR CONTEXT", "[STILL IN PROGRESS")
+# Display kinds of rows a person typed: a normal message (NULL), a steer, a hidden composer send.
+HUMAN_KINDS = ("steer", "hidden")
+FIRST_TURN_TOOLS = frozenset({SKILL_VIEW_TOOL, SKILLS_LIST_TOOL}) | CATALOG_TOOLS
+REFUSED_FIRST_TURN = (
+    "Nie uruchomiono: to pierwsza, automatyczna tura sesji z treścią od osoby trzeciej. Teraz działa tylko "
+    "delegate_task z zadaniami `profile: \"{subagent}\"` (agent {subagent} czyta i przygotowuje sprawę), "
+    "session_search w tym profilu i odczyt skilli. Pełne narzędzia ruszą po pierwszej wiadomości Łukasza w tej "
+    "sesji. (Not run: automatic first turn; full tools after the user's first message.)")
+COMPRESSION_HOPS = 64
+
+
+def registry_dir(home):
+    return os.path.join(str(home), *REGISTRY)
+
+
+def valid_session_id(session_id):
+    return isinstance(session_id, str) and bool(SESSION_ID.fullmatch(session_id))
+
+
+def register_session(home, session_id, job_id=None):
+    """Mark a session of this profile as an automatic one with third-party content (before its first prompt)."""
+    from pathlib import Path
+    if not valid_session_id(session_id):
+        raise ValueError(f"invalid session id {session_id!r}")
+    directory = Path(registry_dir(home))
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = directory / session_id
+    temporary = directory / f".{session_id}.{os.getpid()}"
+    temporary.write_text(json.dumps({"job": job_id, "version": 1}) + "\n", encoding="utf-8")
+    os.replace(temporary, path)
+    return path
+
+
+def is_registered(home, session_id):
+    return valid_session_id(session_id) and os.path.isfile(os.path.join(registry_dir(home), session_id))
+
+
+def _ancestors(conn, session_id):
+    """The compression ancestors of a session (a continuation keeps its conversation's lock), oldest last."""
+    found, current = [], session_id
+    for _ in range(COMPRESSION_HOPS):
+        row = conn.execute("SELECT p.id, p.end_reason FROM sessions c JOIN sessions p ON p.id = c.parent_session_id "
+                           "WHERE c.id = ?", (current,)).fetchone()
+        if row is None or row[1] != "compression" or row[0] in found:
+            break
+        found.append(row[0])
+        current = row[0]
+    return found
+
+
+def human_row(content, api_content, kind, metadata, summary):
+    """Whether one user row was written by a person (see the module docstring for what counts)."""
+    if summary or (kind is not None and kind not in HUMAN_KINDS):
+        return False
+    if kind == "hidden" and metadata and "notification_category" in str(metadata):
+        return False  # a muted diagnostic wake
+    texts = [str(content or ""), str(api_content or "")]
+    if any(AUTO_TURN_MARK in text for text in texts):
+        return False
+    return not str(content or "").lstrip().startswith(SYSTEM_PREFIXES)
+
+
+def first_turn_locked(home, session_id):
+    """True while `session_id` is an automatic session (registered, or a compression continuation of one) in
+    which no person has written yet. Unregistered sessions are never locked; a registered one whose messages
+    cannot be read stays locked."""
+    if not valid_session_id(session_id):
+        return False
+    try:
+        if not os.listdir(registry_dir(home)):
+            return False
+    except OSError:
+        return False
+    registered = is_registered(home, session_id)
+    try:
+        conn = sqlite3.connect(f"file:{os.path.join(str(home), 'state.db')}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return registered
+    try:
+        try:
+            lineage = [session_id, *_ancestors(conn, session_id)]
+        except sqlite3.Error:
+            return registered
+        if not any(is_registered(home, sid) for sid in lineage):
+            return False
+        try:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
+            if not {"session_id", "role", "content", "display_kind"} <= columns:
+                return True
+            optional = [name if name in columns else "NULL" for name in
+                        ("api_content", "display_metadata", "_compressed_summary")]
+            marks = ",".join("?" for _ in lineage)
+            rows = conn.execute(
+                f"SELECT content, {optional[0]}, display_kind, {optional[1]}, {optional[2]} FROM messages "
+                f"WHERE session_id IN ({marks}) AND role = 'user'", lineage).fetchall()
+        except sqlite3.Error:
+            return True
+        return not any(human_row(*row) for row in rows)
+    finally:
+        conn.close()
+
+
+def bridged_calls(args):
+    """[(name, arguments)] of a `tool_call` bridge call, or None when its shape cannot be read."""
+    if not isinstance(args, dict):
+        return None
+    calls = args.get("calls")
+    if calls is None:
+        calls = [args]
+    if isinstance(calls, str):
+        try:
+            calls = json.loads(calls)
+        except ValueError:
+            return None
+    if isinstance(calls, dict):
+        calls = [calls]
+    if not isinstance(calls, list) or not calls:
+        return None
+    found = []
+    for call in calls:
+        if not isinstance(call, dict) or not isinstance(call.get("name"), str):
+            return None
+        arguments = call.get("arguments", {})
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments) if arguments.strip() else {}
+            except ValueError:
+                return None
+        found.append((call["name"], arguments))
+    return found
+
+
+def delegation_allowed(args, subagent):
+    """`delegate_task` that only hands work to `subagent`: `list`, or a spawn whose every task names that profile
+    (no top-level goal: Hermes would run it in this profile) and carries no local images."""
+    if not isinstance(args, dict):
+        return False
+    action = str(args.get("action") or "").strip().lower()
+    if action == "list":
+        return True
+    if action not in ("", "spawn") or args.get("images"):
+        return False
+    tasks = args.get("tasks")
+    if isinstance(tasks, str):
+        try:
+            tasks = json.loads(tasks)
+        except ValueError:
+            return False
+    return (isinstance(tasks, list) and bool(tasks)
+            and all(isinstance(task, dict) and task.get("profile") == subagent and not task.get("images")
+                    for task in tasks))
+
+
+def decide_first_turn(tool_name, args, subagent):
+    """The block message for one tool call in a locked automatic session of Dolores' profile, or None."""
+    allowed = None
+    if tool_name == "delegate_task":
+        allowed = delegation_allowed(args, subagent)
+    elif tool_name == "session_search":
+        allowed = own_profile_search(args)
+    elif tool_name in FIRST_TURN_TOOLS:
+        allowed = True
+    elif tool_name == "tool_call":
+        calls = bridged_calls(args)
+        allowed = bool(calls) and all(name != "tool_call" and decide_first_turn(name, arguments, subagent) is None
+                                      for name, arguments in calls)
+    return None if allowed else REFUSED_FIRST_TURN.format(subagent=subagent)
 
 
 # --- Skill reads (raw text: no template rendering, inline shell or dependency install) ---------------

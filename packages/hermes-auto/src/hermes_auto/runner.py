@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+from . import bots
 from .bots import choose as choose_bot
 from .finish import mark_open
 
@@ -14,17 +15,33 @@ def full_tools(job):
     return job["source"] == "todoist" or job["mode"] == "agent"
 
 
+def delegated(job, config):
+    """A third-party job whose session lives in Dolores (bots): her read-only subagent prepares it."""
+    from .triage import INTERNAL_SOURCES
+    return (bots.delegates(config) and not bots.is_read_only(config, job.get("profile"))
+            and job["source"] not in INTERNAL_SOURCES and not bots.full_tools(job))
+
+
 def prompt_for(job, config, retry=False):
-    from .triage import INTERNAL_SOURCES, internal_prompt, mail_session_prompt
+    from .triage import INTERNAL_SOURCES, delegation_note, delegator_prompt, internal_prompt, mail_session_prompt
     if job["source"] in INTERNAL_SOURCES:
-        return internal_prompt(job, config)
+        return internal_prompt(job, config) + delegation_note(job, config, comment=True)
     triaged = json.loads(job["payload"]).get("triage") if job["source"] != "todoist" else None
+    if delegated(job, config) and not retry:
+        # Third-party content in Dolores: her first turn hands it to the read-only subagent (guard: first_turn).
+        payload = json.loads(job["payload"])
+        return delegator_prompt(payload, (triaged or {}).get("reason", ""), config)
     if triaged and not retry:
         # New mail the sorter flagged: summary and reply draft, tools blocked for this step.
         return mail_session_prompt(json.loads(job["payload"]), triaged.get("reason", ""), config)
     if retry:
         base = ("The user explicitly requested continuation of the interrupted preparation. "
                 "Inspect this conversation, avoid repeating completed work, and finish the original request. ")
+        if delegated(job, config):
+            sub = bots.subagent(config)
+            return base + (f"Until the user writes here only delegate_task with profile \"{sub}\" works: if {sub} "
+                           "has not prepared the matter yet, hand it over as the first message says; then present "
+                           "its result in 1-3 sentences. Send or change nothing.")
         if job["source"] == "todoist":
             # The user's standing rule: tick off a Todoist task the agent actually finished.
             return base + ("Do not send, buy, publish or change other external records. If the task is now "
@@ -60,7 +77,7 @@ def prompt_for(job, config, retry=False):
                 "away (only this occurrence if it recurs) and read it back. If the result awaits my approval, "
                 "e.g. a draft to send, leave the task open.)")
         parts = [task.get("content") or job.get("title", ""), task.get("description") or "", note]
-        return "\n\n".join(part.strip() for part in parts if part and part.strip())
+        return "\n\n".join(part.strip() for part in parts if part and part.strip()) + delegation_note(job, config)
     if full:
         origin = ("The task title and description below are the user's own assignment; follow its rules."
                   if job["source"] == "todoist" else

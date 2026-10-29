@@ -104,10 +104,14 @@ class Hermes:
         if profile == bots.DEFAULT and not bots.enabled(self.config):
             return self.config
         spec = bots.read_only(self.config).get(profile)
-        return {**self.config, "hermes_home": bots.profile_home(self.config, profile),
-                "bot": {"name": profile, "read_only": spec is not None,
-                        "reads": sorted((spec or {}).get("reads") or []),
-                        "providers": (spec or {}).get("providers") or {}}}
+        bot = {"name": profile, "read_only": spec is not None, "reads": sorted((spec or {}).get("reads") or []),
+               "providers": (spec or {}).get("providers") or {}}
+        subagent = bots.subagent(self.config)
+        if profile == bots.settings(self.config).get("default", bots.DEFAULT) and subagent:
+            # Dolores: third-party sessions here need her first_turn guard and a ready read-only subagent.
+            sub = self.profile_config(subagent)
+            bot["subagent"] = {**sub["bot"], "home": sub["hermes_home"]}
+        return {**self.config, "hermes_home": bots.profile_home(self.config, profile), "bot": bot}
 
     def invoke(self, action, job=None, profile=None, **extra):
         """Run one bridge action. `profile`: the bot whose home it targets (default: the job's bot)."""
@@ -233,17 +237,25 @@ class Hermes:
         finally:
             shutil.rmtree(directory, ignore_errors=True)
 
+    def third_party_in_dolores(self, job):
+        """A job with someone else's content whose session lives in Dolores (bots): her subagent prepares it."""
+        return (bots.delegates(self.config) and not bots.is_read_only(self.config, bots.of(job))
+                and job.get("source") not in bots.INTERNAL_SOURCES and not bots.full_tools(job))
+
     def tools_of(self, job):
         """(full_tools, deny_tools) for a job's session: a job in a read-only bot never has full tools and always
-        has a read profile (an agent-labelled mail thread there reads like any other mail)."""
-        if bots.is_read_only(self.config, bots.of(job)):
+        has a read profile (an agent-labelled mail thread there reads like any other mail); a third-party job in
+        Dolores keeps its read profile too, which the bridge turns into her delegating launch."""
+        if bots.is_read_only(self.config, bots.of(job)) or self.third_party_in_dolores(job):
             return False, deny_mode(job) or True
         return full_tools(job), deny_mode(job)
 
     def budget(self, job):
-        # Slack sessions research before drafting (reads only), so they get the full agent budget.
+        # Slack sessions research before drafting (reads only), so they get the full agent budget; so does a
+        # matter Dolores hands to her subagent (bridge.launch_plan: the agent limits).
         key = ("agent_run_budget_seconds" if job and ((full_tools(job) and not job.get("deny_tools"))
-                                                      or deny_mode(job) in ("research", "slack"))
+                                                      or deny_mode(job) in ("research", "slack")
+                                                      or self.third_party_in_dolores(job))
                else "run_budget_seconds")
         return self.config[key]
 

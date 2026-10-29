@@ -1,10 +1,14 @@
-"""hermes-auto-guard: Hermes plugin of the read-only inbox bots (install: `hermes-auto install-guard`).
+"""hermes-auto-guard: Hermes plugin of hermes-auto's bots (install: `hermes-auto install-guard [profile]`).
 
-Enabled only in the profiles of those bots (e.g. `inbox`), never in Dolores' or a working bot's
-profile. Registers the `hermes-auto` toolset (one grammar-checked read command, raw skill reads) and a
-`pre_tool_call` hook that refuses every other tool in every session of that profile; the profile's own
-toolset configuration is the first layer. The read families come from `scope.json` beside the plugin in the
-profile's home, written at install; without it every read is refused.
+Registers the `hermes-auto` toolset (one grammar-checked read command, raw skill reads) and a `pre_tool_call`
+hook. What the hook allows comes from `scope.json` beside the plugin in the profile's home, written at install:
+
+* read-only bots (e.g. `inbox`, mode `read_only`): every other tool is refused in every session of the profile
+  (the profile's own toolset configuration is the first layer); the read families come from the scope, without
+  one every read is refused. A subagent Dolores runs as this profile is one of its sessions.
+* Dolores (`default`, mode `first_turn`): a session hermes-auto registered (third-party content) may, until the
+  user writes in it, only delegate to the read-only subagent profile, search this profile's conversations and read
+  skills; every other session is untouched. The read tool reads nothing here: the subagent reads.
 """
 from __future__ import annotations
 
@@ -51,25 +55,43 @@ def _provider(session_id):
     return provider if isinstance(provider, str) else None
 
 
-def _scope(session_id):
-    """(read families, session_search allowed) for this session: its own profile's scope (read from that profile's
-    plugin directory each call; one module may serve several profiles in one gateway) and its account."""
-    data = policy.load_scope(os.path.join(_home(), "plugins", policy.GUARD_NAME))
+def _installed():
+    """This profile's scope.json (read from the active profile's plugin directory on each call: one module may
+    serve several profiles in one gateway, and a delegated subagent runs in its own profile's scope)."""
+    return policy.load_scope(os.path.join(_home(), "plugins", policy.GUARD_NAME))
+
+
+def _scope(session_id, data=None):
+    """(read families, session_search allowed) for this session: its own profile's scope and its account."""
+    data = _installed() if data is None else data
+    if data and data.get("mode") == policy.FIRST_TURN_MODE:
+        return frozenset(), False
     return policy.session_scope(data, _provider(session_id) if data and data.get("providers") else "")
 
 
 def pre_tool_call(tool_name=None, args=None, session_id="", task_id="", **_):
-    """Refuse what a read-only bot may not run. An exception here is a refusal (Hermes fails a raising
+    """Refuse what this profile's mode does not allow. An exception here is a refusal (Hermes fails a raising
     pre_tool_call closed)."""
+    data = _installed()
+    sid = session_id or task_id
+    if data and data.get("mode") == policy.FIRST_TURN_MODE:
+        if not policy.first_turn_locked(_home(), sid):
+            return None
+        message = policy.decide_first_turn(tool_name, args, data["subagent"])
+        return {"action": "block", "message": message} if message else None
     search = True
     if tool_name == "session_search":
-        search = _scope(session_id or task_id)[1]
+        search = _scope(sid, data)[1]
     message = policy.decide(tool_name, args, search)
     return {"action": "block", "message": message} if message else None
 
 
 def read_tool(args, **kwargs):
-    families, _search = _scope(kwargs.get("session_id") or kwargs.get("task_id") or "")
+    data = _installed()
+    if data and data.get("mode") == policy.FIRST_TURN_MODE:
+        return policy.neutral(f"Not run: this profile reads nothing through hermes-auto; the {data['subagent']} "
+                              f"subagent does (delegate_task with profile \"{data['subagent']}\").")
+    families, _search = _scope(kwargs.get("session_id") or kwargs.get("task_id") or "", data)
     if not families:
         return policy.neutral("Not run: no reads for this session (no read scope installed for this bot, or none for "
                               "this account); reinstall it with `hermes-auto install-guard` if that is wrong.")

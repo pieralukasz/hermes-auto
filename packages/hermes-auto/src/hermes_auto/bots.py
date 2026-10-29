@@ -1,21 +1,26 @@
-"""Which bot (Hermes profile) a job's session lives in.
+"""Which bot (Hermes profile) a job's session lives in, and whom that bot delegates to.
 
 Bots are Hermes profiles served by the same multiplexed gateway (`gateway.multiplex_profiles`), each with its own
 memory, skills and tool configuration. `config.json` → `bots`:
 
     "bots": {
-      "default": "default",                      # briefs, plans, proposals and any task no rule names
-      "inbox": "inbox",                          # every matter written by someone else (mail, Slack, GitHub, Linear)
+      "default": "default",                      # Dolores: every automatic session lives here
+      "inbox": "inbox",                          # the read-only profile that prepares third-party matters
       "read_only": {"inbox": {"reads": ["google", "todoist", "github", "linear", "slack"]}},
       "rules": [{"match": {"source": "todoist", "projectId": "..."}, "profile": "tapin"}]
     }
 
-The model account is a separate choice: `routes` (e.g. TapIn's Slack, GitHub and Linear on the work account,
-Slack DMs on the private one) is frozen into the session at creation, whatever bot it lives in.
-Third-party content (mail, Slack, GitHub, Linear) only ever goes to a read-only bot: a rule naming another
-profile for it is ignored. A full-tools job (a Todoist task, a mail the user gave the agent label) goes to the
-first matching rule that names a working bot, else to `default`. Internal sources (brief, plans) go to `default`.
-Without a `bots` section everything stays in the default profile, as before bots existed.
+With bots every job (mail, Slack, GitHub, Linear, briefs, plans, Todoist tasks, "↩" replies, also replies to
+conversations of the old inbox sessions) opens its session in `bots.default`. Third-party content (mail, Slack,
+GitHub, Linear) is prepared there by a subagent: Dolores' first, automatic turn may only `delegate_task` with
+`profile: <bots.inbox>` (the guard plugin's `first_turn` mode, Hermes' `profile_routes` delegation backend), and
+that subagent runs under the read-only profile's own guard. Dolores gets her full tools once the user writes in
+the session. `bots.inbox` must be one of `bots.read_only` (its guard and read families).
+
+`rules` no longer move a session into another profile: a full-tools job (a Todoist task) matching a rule gets a
+note that the work belongs to that profile, which Dolores can hand over with `delegate_task` and `profile`. Rules
+never name a read-only profile. The model account is a separate choice: `routes` is frozen into the session at
+creation. Without a `bots` section everything stays in the default profile with the old bounded launches.
 """
 from __future__ import annotations
 
@@ -45,6 +50,18 @@ def is_read_only(config, profile):
     return profile in read_only(config)
 
 
+def subagent(config):
+    """The read-only profile Dolores hands third-party matters to (`bots.inbox`), or None without bots."""
+    if not enabled(config):
+        return None
+    return settings(config).get("inbox") or None
+
+
+def delegates(config):
+    """Whether third-party jobs run in Dolores and are prepared by her read-only subagent."""
+    return subagent(config) is not None
+
+
 def validate(config):
     bots = config.get("bots")
     if bots in (None, {}):
@@ -59,7 +76,7 @@ def validate(config):
         if not isinstance(spec, dict) or not isinstance(spec.get("reads"), list):
             raise ValueError(f"bots.read_only.{name} needs a reads list")
     if bots.get("inbox") not in ro:
-        raise ValueError("bots.inbox must be one of bots.read_only")
+        raise ValueError("bots.inbox (the subagent that prepares third-party matters) must be one of bots.read_only")
     if bots.get("default", DEFAULT) in ro:
         raise ValueError("bots.default cannot be a read-only bot")
     rules = bots.get("rules") or []
@@ -67,6 +84,8 @@ def validate(config):
                                               and rule["match"] and isinstance(rule.get("profile"), str)
                                               for rule in rules):
         raise ValueError("bots.rules must be a list of {match: {...}, profile}")
+    if any(rule["profile"] in ro for rule in rules):
+        raise ValueError("bots.rules name working profiles for delegated work, never a read-only bot")
     names += list(ro) + [rule["profile"] for rule in rules]
     for name in names:
         if not isinstance(name, str) or not NAME.fullmatch(name):
@@ -74,11 +93,18 @@ def validate(config):
 
 
 def profiles(config):
-    """Every profile the bots section names (default first)."""
+    """The profiles hermes-auto opens or prepares sessions in (Dolores first, then her subagent and any other
+    read-only bot whose older sessions may still be retried)."""
     bots = settings(config)
     names = [bots.get("default", DEFAULT), bots.get("inbox")] + list(read_only(config))
-    names += [rule["profile"] for rule in bots.get("rules") or []]
     return [name for name in dict.fromkeys(names) if name]
+
+
+def working_profiles(config):
+    """Profiles named by `rules`: where Dolores may delegate the work of a domain (e.g. TapIn, eCMR)."""
+    names = [rule["profile"] for rule in settings(config).get("rules") or []]
+    default = settings(config).get("default", DEFAULT)
+    return [name for name in dict.fromkeys(names) if name != default and not is_read_only(config, name)]
 
 
 def profile_home(config, profile):
@@ -101,33 +127,29 @@ def _payload(job):
 
 def full_tools(job):
     """With bots, only the user's own Todoist tasks run with full tools. A mail thread with the agent label still
-    carries other people's replies, so it goes to a read-only bot like any third-party matter (handing it to a
-    full bot is the user's own step: "Kontynuuj w Dolores")."""
+    carries other people's replies, so its subagent prepares it like any third-party matter."""
     return job["source"] == "todoist"
 
 
 def choose(job, config):
-    """The bot for a job that has no session yet. Read-only bots only ever receive third-party content."""
-    bots = settings(config)
-    if not bots:
+    """The bot for a job that has no session yet: Dolores (`bots.default`) for every job once bots are on. A reply
+    to a conversation of a read-only bot (`payload.bot`) opens there too; its context is still read from the
+    conversation's own profile (triage.redirect_followup)."""
+    if not enabled(config):
         return DEFAULT
-    default = bots.get("default", DEFAULT)
-    if job["source"] == "brief":
-        # The digest quotes senders, subjects and snippets written by other people: a read-only bot, never a
-        # session the user would continue with full tools by accident.
-        return bots.get("inbox") or default
-    if job["source"] in INTERNAL_SOURCES:
-        return default
-    payload = _payload(job)
-    third_party = not full_tools(job)
-    if third_party and is_read_only(config, payload.get("bot")):
-        return payload["bot"]  # a reply continues in the same bot as the conversation it answers
-    fields = {**payload, "source": job["source"]}
-    for rule in bots.get("rules") or []:
+    return settings(config).get("default", DEFAULT)
+
+
+def delegation_hint(job, config):
+    """The working profile a full-tools job belongs to (first matching rule), for its prompt; None otherwise.
+    Third-party content is never pointed at a working profile: only the read-only subagent prepares it."""
+    if not enabled(config) or not full_tools(job):
+        return None
+    fields = {**_payload(job), "source": job["source"]}
+    for rule in settings(config).get("rules") or []:
         if all(str(fields.get(key, "")).casefold() == str(value).casefold() for key, value in rule["match"].items()):
-            if is_read_only(config, rule["profile"]) == third_party:
-                return rule["profile"]
-    return bots.get("inbox") if third_party else default
+            return rule["profile"] if rule["profile"] in working_profiles(config) else None
+    return None
 
 
 def of(job):
@@ -135,4 +157,5 @@ def of(job):
     return job.get("profile") or DEFAULT
 
 
-__all__ = ["choose", "of", "profile_home", "profiles", "validate", "read_only", "is_read_only"]
+__all__ = ["choose", "of", "profile_home", "profiles", "validate", "read_only", "is_read_only", "subagent",
+           "delegates", "working_profiles", "delegation_hint"]

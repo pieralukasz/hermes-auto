@@ -326,12 +326,13 @@ def parser():
     commands = root.add_subparsers(dest="command", required=True)
     commands.add_parser("init", help="Create configuration and durable state once")
     commands.add_parser("doctor", help="Check the Hermes API bridge without an LLM call")
-    install = commands.add_parser("install-guard", help="Copy the hermes-auto-guard plugin and its read scope into "
-                                  "each read-only bot's profile (does not enable or load it)")
-    install.add_argument("profile", nargs="?", help="Read-only bot profile (default: every one in config.json)")
-    reload = commands.add_parser("guard-reload", help="Ask the running Hermes gateway to reload one read-only "
-                                 "bot's plugins (only that profile; loads hermes-auto-guard without a restart)")
-    reload.add_argument("profile", nargs="?", help="Read-only bot profile (default: every one in config.json)")
+    install = commands.add_parser("install-guard", help="Copy the hermes-auto-guard plugin and its scope into each "
+                                  "read-only bot's profile (read_only) and Dolores' (first_turn); does not enable "
+                                  "or load it")
+    install.add_argument("profile", nargs="?", help="Bot profile, e.g. inbox or default (default: all of them)")
+    reload = commands.add_parser("guard-reload", help="Ask the running Hermes gateway to reload one bot's plugins "
+                                 "(only that profile; loads hermes-auto-guard without a restart)")
+    reload.add_argument("profile", nargs="?", help="Bot profile, e.g. inbox or default (default: all of them)")
     commands.add_parser("status", help="Show jobs, source errors and pause state")
     events = commands.add_parser("events", help="Read-only: the sorter's latest decisions, newest first (JSON)")
     events.add_argument("--limit", type=int, default=200)
@@ -411,20 +412,29 @@ def dispatch(args, home, config, store):
         print(f"{args.name}: {args.action}d")
     elif command == "install-guard":
         from . import bots, guard
+        from .guard_plugin import policy
         targets = bots.read_only(config)
         if not targets:
             raise ValueError("No read-only bots in config.json `bots.read_only`; the guard belongs only there")
-        for name in [args.profile] if args.profile else sorted(targets):
-            if name not in targets:
-                raise ValueError(f"{name!r} is not a read-only bot in config.json")
+        delegator = bots.settings(config).get("default", bots.DEFAULT) if bots.delegates(config) else None
+        names = sorted(targets) + ([delegator] if delegator else [])
+        for name in [args.profile] if args.profile else names:
+            if name not in names:
+                raise ValueError(f"{name!r} is neither a read-only bot nor Dolores (bots.default) in config.json")
             profile_home = bots.profile_home(config, name)
             if not (Path(profile_home) / "config.yaml").is_file():
                 raise ValueError(f"Profile {name!r} does not exist; create it first (hermes profile create {name})")
+            if name == delegator:
+                # Dolores: the first_turn mode, delegating only to her read-only subagent until the user writes.
+                guard.install(profile_home, [], mode=policy.FIRST_TURN_MODE, subagent=bots.subagent(config))
+                print(guard.activation_steps(name, profile_home, policy.FIRST_TURN_MODE, bots.subagent(config)))
+                continue
             guard.install(profile_home, targets[name].get("reads") or [], targets[name].get("providers"))
             print(guard.activation_steps(name, profile_home))
     elif command == "guard-reload":
         from . import bots
-        names = [args.profile] if args.profile else sorted(bots.read_only(config))
+        names = [args.profile] if args.profile else sorted(bots.read_only(config)) + (
+            [bots.settings(config).get("default", bots.DEFAULT)] if bots.delegates(config) else [])
         print(json.dumps({name: Hermes(config, home).invoke("reload_plugins", profile=name) for name in names},
                          indent=2))
     elif command == "doctor":
