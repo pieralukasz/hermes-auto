@@ -103,7 +103,8 @@ def skill_view_tool(args, **kwargs):
 
 def skills_list_tool(args, **kwargs):
     from tools.skills_tool import skills_list
-    return skills_list(category=(args or {}).get("category") or None, task_id=kwargs.get("task_id"))
+    result = skills_list(category=(args or {}).get("category") or None, task_id=kwargs.get("task_id"))
+    return policy.redact_urls(result) if isinstance(result, str) else result
 
 
 READ_SCHEMA = {

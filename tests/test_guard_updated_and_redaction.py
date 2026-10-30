@@ -92,6 +92,13 @@ def test_the_quoted_comparison_runs_as_one_argument(monkeypatch):
     (f"https://x-access-token:{SECRET}@github.com/acme/app.git", "https://x-access-token:REDACTED@github.com/acme/app.git"),
     (f'<a href="https://x.example.test/p?a=1&amp;signature={SECRET}&amp;b=2">',
      '<a href="https://x.example.test/p?a=1&amp;signature=REDACTED&amp;b=2">'),
+    (f"Linkhttps://files.example.test/a?token={SECRET}", "Linkhttps://files.example.test/a?token=REDACTED"),
+    (f'{{"u":"https:\\/\\/x.test\\/?token=\\/{SECRET}\\/x\\u0026a=1"}}',
+     '{"u":"https:\\/\\/x.test\\/?token=REDACTED\\u0026a=1"}'),
+    (f"https://x.test/?token=AAA%26{SECRET}&a=1", "https://x.test/?token=REDACTED&a=1"),
+    (f"https://x.test/?token=AAA;{SECRET}&a=1", "https://x.test/?token=REDACTED&a=1"),
+    (f"https://x.test/?auth_token={SECRET}&jwt={SECRET}", "https://x.test/?auth_token=REDACTED&jwt=REDACTED"),
+    (f"https://{SECRET}0123456789@github.com/acme/app.git", "https://REDACTED@github.com/acme/app.git"),
     (f"https://www.redirect.test/url?q=https%3A%2F%2Fx.test%2Fa%3Ftoken%3D{SECRET}%26sa%3DD&usg=1",
      "https://www.redirect.test/url?q=https%3A%2F%2Fx.test%2Fa%3Ftoken%3DREDACTED%26sa%3DD&usg=1"),
 ])
@@ -104,6 +111,7 @@ def test_credentials_in_urls_are_redacted_and_the_link_stays_recognisable(text, 
     "token=abc outside any URL, key: value, signature=keep",
     "https://x.example.test/search?keyword=a&monkey=b&tokens=c&ref=main",
     "https://host.example.test:8443/path?a=1",
+    "ssh://git@github.com/acme/app.git and https://me@example.test/x",
     "https://x.example.test/p?key=",
     "",
 ])
@@ -139,6 +147,29 @@ def test_redaction_happens_before_the_output_is_cut(monkeypatch):
     assert SECRET[:6] not in output and "truncated" in output
 
 
+def test_redaction_stays_fast_and_bounded_on_large_or_hostile_output(monkeypatch):
+    import time
+    hostile = "a." * 200_000 + "a+" * 200_000 + "a:" * 200_000  # no `://`: an unbounded scheme scan is quadratic
+    started = time.monotonic()
+    assert policy.redact_urls(hostile) == hostile
+    huge = (f"https://raw.githubusercontent.com/acme/app/main/a.ts?token={SECRET}\n") * 200_000  # ~15 MB
+    monkeypatch.setattr(policy.subprocess, "run", lambda argv, **kw: SimpleNamespace(
+        returncode=0, stdout=huge, stderr=""))
+    output = json.loads(policy.run_read("gh api repos/acme/app/contents/a.ts", "research"))["output"]
+    assert time.monotonic() - started < 5
+    assert SECRET not in output and output.endswith("narrow the query]")
+    assert len(output) < policy.OUTPUT_LIMIT + 200
+
+
+def test_output_shortened_only_by_redaction_is_not_marked_truncated(monkeypatch):
+    long_secret = "S" * 400
+    text = "x" * (policy.OUTPUT_LIMIT - 100) + f"\nhttps://files.example.test/a?sig={long_secret}\n"
+    monkeypatch.setattr(policy.subprocess, "run", lambda argv, **kw: SimpleNamespace(
+        returncode=0, stdout=text, stderr=""))
+    output = json.loads(policy.run_read("gh api repos/acme/app/contents/a.ts", "research"))["output"]
+    assert output.endswith("?sig=REDACTED\n") and "truncated" not in output
+
+
 def test_a_raw_skill_read_is_redacted_too(tmp_path):
     skill = tmp_path / "skills" / "demo"
     (skill / "references").mkdir(parents=True)
@@ -148,6 +179,28 @@ def test_a_raw_skill_read_is_redacted_too(tmp_path):
     ref = json.loads(policy.read_skill_text(skill / "SKILL.md", "references/a.md"))
     assert main["content"] == "Feed: https://shop.example.test/feed?token=REDACTED\n"
     assert ref["content"] == "https://maps.example.test/x?key=REDACTED\n"
+
+
+def test_a_skill_url_at_the_read_bound_is_dropped_not_shown_in_part(tmp_path):
+    skill = tmp_path / "skills" / "demo"
+    skill.mkdir(parents=True)
+    # Secrets long enough that redaction pulls text from past the read bound into view.
+    filler = "".join(f"https://files.example.test/{n}?sig={'S' * 300}\n" for n in range(40))
+    head = filler + "y" * (policy.SKILL_TEXT_LIMIT + policy.REDACT_MARGIN - len(filler) - 30)
+    (skill / "SKILL.md").write_text(head + f"https://user:{SECRET}{SECRET}@git.example.test/r.git\n" + "z" * 50,
+                                    encoding="utf-8")
+    content = json.loads(policy.read_skill_text(skill / "SKILL.md"))["content"]
+    assert "SSSS" not in content and SECRET[:5] not in content and "truncated" in content
+
+
+def test_skills_list_output_is_redacted(monkeypatch):
+    import sys
+    fake = SimpleNamespace(skills_list=lambda category=None, task_id=None: json.dumps(
+        {"skills": [{"name": "demo", "description": f"feed https://shop.example.test/f?token={SECRET}"}]}))
+    monkeypatch.setitem(sys.modules, "tools", SimpleNamespace(skills_tool=fake))
+    monkeypatch.setitem(sys.modules, "tools.skills_tool", fake)
+    result = plugin.skills_list_tool({})
+    assert SECRET not in result and "?token=REDACTED" in result
 
 
 def test_guard_version_is_the_same_in_code_and_manifest():

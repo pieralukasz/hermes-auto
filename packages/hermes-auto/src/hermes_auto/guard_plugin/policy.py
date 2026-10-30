@@ -910,11 +910,13 @@ def read_skill_text(skill_md, file_path=None):
             return neutral(f"Not found in this skill: {relative}.")
     try:
         with open(target, encoding="utf-8", errors="replace") as stream:
-            text = stream.read(SKILL_TEXT_LIMIT + 1)
+            text = stream.read(SKILL_TEXT_LIMIT + REDACT_MARGIN + 1)
     except OSError as exc:
         return neutral(f"Could not read the skill file ({exc.__class__.__name__}).")
-    text = redact_urls(text)  # a skill may note a signed link or a keyed endpoint; the turn needs no credential
-    if len(text) > SKILL_TEXT_LIMIT:
+    # A skill may note a signed link or a keyed endpoint; the turn needs no credential. Read past the limit, so the
+    # cut below cannot split a URL from its credential (see run_read).
+    text, cut = redact_head(text, SKILL_TEXT_LIMIT)
+    if cut or len(text) > SKILL_TEXT_LIMIT:
         text = text[:SKILL_TEXT_LIMIT] + f"\n[... truncated at {SKILL_TEXT_LIMIT} characters]"
     result = {"success": True, "path": target, "content": text}
     if not file_path:
@@ -965,21 +967,32 @@ def read_env():
 # upload links, Azure SAS (`sig`), API keys. The value is replaced; scheme, host, path and the other parameters
 # stay, so the link is still recognisable (and useless).
 REDACTED = "REDACTED"
-SECRET_PARAMS = ("token", "access_token", "refresh_token", "id_token", "client_secret", "api_key", "apikey", "key",
+REDACT_MARGIN = 8192
+SECRET_PARAMS = ("token", "access_token", "refresh_token", "id_token", "auth_token", "jwt", "client_secret", "api_key",
+                 "apikey", "key",
                  "sig", "signature", "password", "x-amz-signature", "x-amz-credential", "x-amz-security-token",
                  "x-goog-signature", "x-goog-credential")
 # A URL as it appears in plain text, in JSON (`\/` and `\u0026` escapes), in HTML (`&amp;`) or percent-encoded
 # inside another URL's parameter (a redirect or tracking link: `%3Ftoken%3D...%26`).
 _URL_CHAR = r"(?:[^\s\"'<>`\\]|\\/|\\u0026|\\u003[dD])"
-_URL = re.compile(rf"(?i)\b[a-z][a-z0-9+.-]*:(?:\\?/){{2}}{_URL_CHAR}+")
-_URL_PARAM = re.compile(r"(?i)((?:\\u0026|&amp;|%%3F|%%26|%%23|[?&;#])(?:%s)(?:=|%%3D|\\u003d))"
-                        r"((?:(?!%%26|%%23)[^&#;\s\"'<>`\\])+)" % "|".join(re.escape(name) for name in SECRET_PARAMS))
-# A password in the URL's user info (`https://user:secret@host`, a git remote with a token).
-_URL_USERINFO = re.compile(r"(?i)^([a-z][a-z0-9+.-]*:(?:\\?/){2}[^/@:\s\\]*:)([^/@\s\\]+)(@)")
+# The scheme is bounded (an unbounded one makes the scan quadratic on text like `a.a.a...` without `://`) and
+# needs no word boundary (a link glued to the word before it, `Linkhttps://...`, is still found).
+_URL = re.compile(rf"(?i)[a-z][a-z0-9+.-]{{0,31}}:(?:\\?/){{2}}{_URL_CHAR}+")
+_NAMES = "|".join(re.escape(name) for name in SECRET_PARAMS)
+# A plain parameter's value runs to the next `&`/`#` (a JSON `\/` inside it included); one inside a percent-encoded
+# URL runs to the next encoded separator. Both err on the long side.
+_URL_PARAM = re.compile(rf"(?i)((?:\\u0026|&amp;|[?&;#])(?:{_NAMES})(?:=|\\u003d))((?:\\/|[^&#\s\"'<>`\\])+)")
+_URL_PARAM_ENCODED = re.compile(rf"(?i)((?:%3F|%26|%23)(?:{_NAMES})%3D)((?:(?!%26|%23)[^&#\s\"'<>`\\])+)")
+# A password in the URL's user info (`https://user:secret@host`, a git remote with a token), and an http(s) user
+# name long enough to be a token itself (`https://<token>@github.com/...`; `git@`, `me@` stay).
+_URL_USERINFO = re.compile(r"(?i)^([a-z][a-z0-9+.-]{0,31}:(?:\\?/){2}[^/@:\s\\]*:)([^/@\s\\]+)(@)")
+_URL_TOKEN_USER = re.compile(r"(?i)^(https?:(?:\\?/){2})([A-Za-z0-9_.~%+-]{20,})(@)")
 
 
 def _redact_url(match):
     url = _URL_PARAM.sub(lambda m: m.group(1) + REDACTED, match.group(0))
+    url = _URL_PARAM_ENCODED.sub(lambda m: m.group(1) + REDACTED, url)
+    url = _URL_TOKEN_USER.sub(lambda m: m.group(1) + REDACTED + m.group(3), url)
     return _URL_USERINFO.sub(lambda m: m.group(1) + REDACTED + m.group(3), url)
 
 
@@ -987,6 +1000,22 @@ def redact_urls(text):
     """`text` with the values of credential parameters (SECRET_PARAMS, any case) and user-info passwords in its
     URLs replaced by REDACTED. Text outside URLs is left alone."""
     return _URL.sub(_redact_url, text) if text else (text or "")
+
+
+def redact_head(text, limit):
+    """(`text` redacted and bounded for a cut at `limit`, whether more text followed). Only the first `limit` +
+    REDACT_MARGIN characters are scanned, however large the text; a URL running into that bound is dropped, since
+    its credential may lie past it."""
+    bound = limit + REDACT_MARGIN
+    more = len(text) > bound
+    head = text[:bound]
+    if more:
+        last = None
+        for last in _URL.finditer(head):
+            pass
+        if last is not None and last.end() == len(head):
+            head = head[:last.start()]
+    return redact_urls(head), more
 
 
 UNQUOTED_COMPARISON = ("Quote a value with < or > in single quotes (no shell runs it, but the command may not "
@@ -1013,7 +1042,9 @@ def run_read(command, profile, *, timeout=COMMAND_TIMEOUT, cwd=None, chat=None):
     output = done.stdout or ""
     if done.stderr.strip():
         output += ("\n" if output else "") + "[stderr]\n" + done.stderr
-    output = redact_urls(output)  # before the cut, so a cut cannot split a URL from its credential
-    if len(output) > OUTPUT_LIMIT:
+    # Redact before the cut, so the cut cannot split a URL from its credential; only what can be shown (plus a
+    # margin for a URL running over the limit) is scanned, however large the output.
+    output, cut = redact_head(output, OUTPUT_LIMIT)
+    if cut or len(output) > OUTPUT_LIMIT:
         output = output[:OUTPUT_LIMIT] + f"\n[... truncated at {OUTPUT_LIMIT} characters; narrow the query]"
     return json.dumps({"output": output, "exit_code": done.returncode}, ensure_ascii=False)
