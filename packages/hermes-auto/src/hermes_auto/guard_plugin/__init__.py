@@ -114,9 +114,10 @@ READ_SCHEMA = {
         "--json`, `td task view id:ID --json`, `td project list`), calendar and Gmail reads via the Google "
         "Workspace skill script (`python3 ~/.hermes/skills/productivity/google-workspace/scripts/google_api.py "
         "calendar list --start ... --end ...`, `... gmail search \"query\"`, `... gmail get ID`), Slack MCP reads, "
-        "`gh` reads (pr/issue view/list, `gh api` GET), `linear` reads, and in a chat session that chat's history "
+        "`gh` reads (pr/issue view/list, `gh search prs --owner ORG --updated '>=2026-10-01'`: a value with < or > "
+        "goes in single quotes; `gh api` GET), `linear` reads, and in a chat session that chat's history "
         "(`imsg history --chat-id N --json`, `hermes-auto-matrix history ROOM`). Anything else is refused with a "
-        "note. "
+        "note. Credentials in URLs of the output (token, signature, key and similar parameters) read REDACTED. "
         "In an automatic first turn this is how you read; sending and writing wait for the user."),
     "parameters": {"type": "object", "properties": {
         "command": {"type": "string", "description": "One plain read command."}}, "required": ["command"]},

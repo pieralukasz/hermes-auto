@@ -183,6 +183,7 @@ def test_the_scope_file_keeps_its_format():
     assert "imessage" not in policy.FAMILIES and "matrix" not in policy.FAMILIES
 
 
-def test_guard_version_is_3_0_2_in_code_and_manifest():
+def test_chat_reads_ship_from_guard_3_0_2_on_in_code_and_manifest():
     manifest = (Path(plugin.__file__).parent / "plugin.yaml").read_text()
-    assert policy.GUARD_VERSION == "3.0.2" and 'version: "3.0.2"' in manifest
+    version = tuple(int(part) for part in policy.GUARD_VERSION.split("."))
+    assert version >= (3, 0, 2) and f'version: "{policy.GUARD_VERSION}"' in manifest

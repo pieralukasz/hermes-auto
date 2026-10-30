@@ -33,7 +33,7 @@ import subprocess
 import sys
 
 GUARD_NAME = "hermes-auto-guard"
-GUARD_VERSION = "3.0.2"
+GUARD_VERSION = "3.0.3"
 FIRST_TURN_MODE = "first_turn"
 SCOPE_VERSION = 2
 TOOLSET = "hermes-auto"
@@ -289,9 +289,9 @@ GH_READS = {
                                            "--label", "-l", "--assignee", "-a", "--search", "-S", "--milestone",
                                            "-m", "--mention")),
     ("search", "prs"): grammar((), ("--repo", "-R", "--owner", "--limit", "-L", "--state", "--author", "--label",
-                                    "--json", "--sort", "--order", "--language")),
+                                    "--json", "--sort", "--order", "--language", "--updated")),
     ("search", "issues"): grammar((), ("--repo", "-R", "--owner", "--limit", "-L", "--state", "--author",
-                                       "--label", "--json", "--sort", "--order", "--language")),
+                                       "--label", "--json", "--sort", "--order", "--language", "--updated")),
     ("search", "code"): grammar((), ("--repo", "-R", "--owner", "--limit", "-L", "--language", "--filename",
                                      "--extension", "--json")),
     ("search", "commits"): grammar((), ("--repo", "-R", "--owner", "--limit", "-L", "--author", "--json")),
@@ -311,9 +311,18 @@ GH_JQ_FILTERS = frozenset({".content | @base64d", ".content|@base64d", ".[].file
                            ".[].body", ".[] | .body"})
 
 
+# A `gh search --updated` value: one date or date-time, optionally after a comparison, or a range with `..` (an
+# open end is `*`), as GitHub's search syntax takes it. gh pastes the value into the query (`updated:<value>`), so
+# nothing else (no space, no further qualifier, no option) may ride along.
+GH_DATE = r"[0-9]{4}-[0-9]{2}-[0-9]{2}(?:T[0-9]{2}:[0-9]{2}(?::[0-9]{2})?(?:Z|[+-][0-9]{2}:[0-9]{2})?)?"
+GH_DATE_FILTER = re.compile(rf"(?:[<>]=?)?{GH_DATE}|{GH_DATE}\.\.(?:{GH_DATE}|\*)|\*\.\.{GH_DATE}")
+
+
 def gh_value(option, value):
     if option in ("--repo", "-R"):
         return bool(GH_REPO.fullmatch(value))
+    if option == "--updated":
+        return bool(GH_DATE_FILTER.fullmatch(value))
     if option in ("--jq", "-q"):
         return " ".join(value.split()) in GH_JQ_FILTERS
     return "://" not in value
@@ -904,6 +913,7 @@ def read_skill_text(skill_md, file_path=None):
             text = stream.read(SKILL_TEXT_LIMIT + 1)
     except OSError as exc:
         return neutral(f"Could not read the skill file ({exc.__class__.__name__}).")
+    text = redact_urls(text)  # a skill may note a signed link or a keyed endpoint; the turn needs no credential
     if len(text) > SKILL_TEXT_LIMIT:
         text = text[:SKILL_TEXT_LIMIT] + f"\n[... truncated at {SKILL_TEXT_LIMIT} characters]"
     result = {"success": True, "path": target, "content": text}
@@ -949,12 +959,49 @@ def read_env():
     return {**os.environ, "HERMES_HOME": os.path.expanduser("~/.hermes")}
 
 
+# --- Credentials in URLs -------------------------------------------------------------------------------
+# Read output reaches the model (and every copy of the transcript). Signed links carry their credential in the
+# query: raw.githubusercontent.com `download_url`s of private repos (`?token=`), S3/GCS presigned URLs, Linear
+# upload links, Azure SAS (`sig`), API keys. The value is replaced; scheme, host, path and the other parameters
+# stay, so the link is still recognisable (and useless).
+REDACTED = "REDACTED"
+SECRET_PARAMS = ("token", "access_token", "refresh_token", "id_token", "client_secret", "api_key", "apikey", "key",
+                 "sig", "signature", "password", "x-amz-signature", "x-amz-credential", "x-amz-security-token",
+                 "x-goog-signature", "x-goog-credential")
+# A URL as it appears in plain text, in JSON (`\/` and `\u0026` escapes), in HTML (`&amp;`) or percent-encoded
+# inside another URL's parameter (a redirect or tracking link: `%3Ftoken%3D...%26`).
+_URL_CHAR = r"(?:[^\s\"'<>`\\]|\\/|\\u0026|\\u003[dD])"
+_URL = re.compile(rf"(?i)\b[a-z][a-z0-9+.-]*:(?:\\?/){{2}}{_URL_CHAR}+")
+_URL_PARAM = re.compile(r"(?i)((?:\\u0026|&amp;|%%3F|%%26|%%23|[?&;#])(?:%s)(?:=|%%3D|\\u003d))"
+                        r"((?:(?!%%26|%%23)[^&#;\s\"'<>`\\])+)" % "|".join(re.escape(name) for name in SECRET_PARAMS))
+# A password in the URL's user info (`https://user:secret@host`, a git remote with a token).
+_URL_USERINFO = re.compile(r"(?i)^([a-z][a-z0-9+.-]*:(?:\\?/){2}[^/@:\s\\]*:)([^/@\s\\]+)(@)")
+
+
+def _redact_url(match):
+    url = _URL_PARAM.sub(lambda m: m.group(1) + REDACTED, match.group(0))
+    return _URL_USERINFO.sub(lambda m: m.group(1) + REDACTED + m.group(3), url)
+
+
+def redact_urls(text):
+    """`text` with the values of credential parameters (SECRET_PARAMS, any case) and user-info passwords in its
+    URLs replaced by REDACTED. Text outside URLs is left alone."""
+    return _URL.sub(_redact_url, text) if text else (text or "")
+
+
+UNQUOTED_COMPARISON = ("Quote a value with < or > in single quotes (no shell runs it, but the command may not "
+                       "look like a redirect), e.g. gh search prs --owner ORG --updated '>=2026-10-01'.")
+
+
 def run_read(command, profile, *, timeout=COMMAND_TIMEOUT, cwd=None, chat=None):
-    """Run one read command (no shell) and return the tool result JSON."""
+    """Run one read command (no shell) and return the tool result JSON, with credentials in URLs redacted."""
     argv = read_argv(command, profile, chat)
     if argv is None:
+        hint = ""
+        if set("<>") & set(re.sub(r"'[^']*'", "''", str(command or ""))):
+            hint = " " + UNQUOTED_COMPARISON
         return neutral(REFUSED_READ + " This command is not one of the allowed reads (one plain command, "
-                       "no pipes or redirects; see the session's first message for the commands).")
+                       "no pipes or redirects; see the session's first message for the commands)." + hint)
     try:
         done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
                               cwd=cwd or os.path.expanduser("~"), errors="replace",
@@ -966,6 +1013,7 @@ def run_read(command, profile, *, timeout=COMMAND_TIMEOUT, cwd=None, chat=None):
     output = done.stdout or ""
     if done.stderr.strip():
         output += ("\n" if output else "") + "[stderr]\n" + done.stderr
+    output = redact_urls(output)  # before the cut, so a cut cannot split a URL from its credential
     if len(output) > OUTPUT_LIMIT:
         output = output[:OUTPUT_LIMIT] + f"\n[... truncated at {OUTPUT_LIMIT} characters; narrow the query]"
     return json.dumps({"output": output, "exit_code": done.returncode}, ensure_ascii=False)
