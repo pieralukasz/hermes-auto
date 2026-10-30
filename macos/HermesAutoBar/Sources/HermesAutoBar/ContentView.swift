@@ -77,30 +77,45 @@ struct ContentView: View {
     }
 
     private var header: some View {
-        HStack(alignment: .top, spacing: 10) {
-            OverallBadge(overall: model.overall)
-            VStack(alignment: .leading, spacing: 3) {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
                 Text("Hermes Auto").font(.headline)
-                Text(subtitle).font(.callout)
+                Spacer()
+                headerActions
+            }
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                OverallBadge(overall: model.overall)
+                Text(subtitle).font(.callout).foregroundStyle(Color.secondaryText)
+                Spacer(minLength: 8)
                 if let last = model.status?.health?.lastCheck {
-                    Text("Last check: \(relativeTime(last, now: model.now))")
+                    Text("Checked \(relativeTime(last, now: model.now))")
                         .font(.caption).foregroundStyle(Color.secondaryText)
+                        .lineLimit(1).layoutPriority(1)
                 }
             }
-            Spacer(minLength: 4)
+        }
+        .padding(.horizontal, 16).padding(.vertical, 12)
+    }
+
+    private var headerActions: some View {
+        HStack(spacing: 4) {
             if model.busyAction != nil { ProgressView().controlSize(.small) }
             if let status = model.status {
                 Button {
                     model.perform(status.paused ? .resume : .pause, label: "pause")
                 } label: {
-                    Image(systemName: status.paused ? "play" : "pause").frame(width: 24, height: 24)
+                    Image(systemName: status.paused ? "play" : "pause")
+                        .frame(width: 28, height: 28).contentShape(Rectangle())
                 }
                 .accessibilityLabel(status.paused ? "Resume automation" : "Pause automation")
                 .help(status.paused ? "Resume automation" : "Pause new sessions. Existing sessions keep running.")
                 .disabled(model.busyAction != nil)
             }
-            Button { Task { await model.refresh() } } label: { Image(systemName: "arrow.clockwise").frame(width: 24, height: 24) }
-                .accessibilityLabel("Refresh status").help("Refresh status")
+            Button { Task { await model.refresh() } } label: {
+                Image(systemName: "arrow.clockwise")
+                    .frame(width: 28, height: 28).contentShape(Rectangle())
+            }
+            .accessibilityLabel("Refresh status").help("Refresh status")
             Menu {
                 if !inWindow {
                     Button("Open in Window") { openWindow(id: "main"); NSApp.activate() }
@@ -111,10 +126,14 @@ struct ContentView: View {
                 }
                 Divider()
                 Button("Quit Hermes Auto Bar") { NSApp.terminate(nil) }
-            } label: { Image(systemName: "ellipsis").frame(width: 24, height: 24) }
-                .menuIndicator(.hidden).fixedSize().accessibilityLabel("More options")
+            } label: {
+                Image(systemName: "ellipsis").frame(width: 28, height: 28).contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden)
+            .frame(width: 28, height: 28).accessibilityLabel("More options").help("More options")
         }
-        .buttonStyle(.borderless).controlSize(.regular).padding(16)
+        .font(.system(size: 13, weight: .medium))
+        .buttonStyle(.plain).controlSize(.regular)
     }
 
     private var subtitle: String {
@@ -132,8 +151,8 @@ struct ContentView: View {
 struct OverallBadge: View {
     var overall: Overall
     var body: some View {
-        Image(systemName: symbol(overall)).font(.title2)
-            .foregroundStyle(color).frame(width: 28).accessibilityHidden(true)
+        Image(systemName: symbol(overall)).font(.callout)
+            .foregroundStyle(color).frame(width: 14).accessibilityHidden(true)
     }
     private var color: Color {
         switch overall {
