@@ -29,8 +29,8 @@ Design: native system typography and disclosures, a vertical reading order, neut
 state only. Problems are the focal point, group spacing separates domains, and source-to-result text connects
 history entries to sessions (ENERGY 1 / RHYTHM 2 / MOTION 1). No custom fonts, artwork or decorative motion.
 The interface is English; source messages and task titles retain their original language. Source icons align
-with section headings, labels and expanded details share a 28-point inset, and disclosure chevrons sit on the
-right. Separators begin at the text column instead of extending into a second nested indentation.
+with section headings and disclosure chevrons sit on the right. Expanded history uses the full section width,
+without an extra container inset; event text keeps only the space needed for its own disclosure chevron.
 
 The header pauses and resumes the automation. A check in progress holds the CLI lock; an action waits for it
 (up to 120 s), then **Retry**, **New session** and **Create session** create the session at once (its run continues in

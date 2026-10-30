@@ -19,7 +19,6 @@ struct ConnectionDisclosureStyle: DisclosureGroupStyle {
             .accessibilityValue(configuration.isExpanded ? "Expanded" : "Collapsed")
             if configuration.isExpanded {
                 configuration.content
-                    .padding(.leading, 28)
                     .padding(.top, 4)
                     .padding(.bottom, 14)
             }
