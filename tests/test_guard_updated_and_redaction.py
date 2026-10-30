@@ -99,6 +99,11 @@ def test_the_quoted_comparison_runs_as_one_argument(monkeypatch):
     (f"https://x.test/?token=AAA;{SECRET}&a=1", "https://x.test/?token=REDACTED&a=1"),
     (f"https://x.test/?auth_token={SECRET}&jwt={SECRET}", "https://x.test/?auth_token=REDACTED&jwt=REDACTED"),
     (f"https://{SECRET}0123456789@github.com/acme/app.git", "https://REDACTED@github.com/acme/app.git"),
+    (f"https://{SECRET}0123456789:x-oauth-basic@host.test/r.git", "https://REDACTED:REDACTED@host.test/r.git"),
+    (f"Linkhttps://{SECRET}0123456789@host.test/", "Linkhttps://REDACTED@host.test/"),
+    (f"https://x.test/?token=AAA\\u003d{SECRET}\\u0026a=1", "https://x.test/?token=REDACTED\\u0026a=1"),
+    (f"https://x.test/?token=\\u003d{SECRET}", "https://x.test/?token=REDACTED"),
+    (f"https://user:{SECRET}\\u003dTAIL@host.test/", "https://user:REDACTED@host.test/"),
     (f"https://www.redirect.test/url?q=https%3A%2F%2Fx.test%2Fa%3Ftoken%3D{SECRET}%26sa%3DD&usg=1",
      "https://www.redirect.test/url?q=https%3A%2F%2Fx.test%2Fa%3Ftoken%3DREDACTED%26sa%3DD&usg=1"),
 ])
@@ -112,6 +117,7 @@ def test_credentials_in_urls_are_redacted_and_the_link_stays_recognisable(text, 
     "https://x.example.test/search?keyword=a&monkey=b&tokens=c&ref=main",
     "https://host.example.test:8443/path?a=1",
     "ssh://git@github.com/acme/app.git and https://me@example.test/x",
+    "https://a-very-long-host-name.example.test?email=someone@example.test",
     "https://x.example.test/p?key=",
     "",
 ])
@@ -191,6 +197,17 @@ def test_a_skill_url_at_the_read_bound_is_dropped_not_shown_in_part(tmp_path):
                                     encoding="utf-8")
     content = json.loads(policy.read_skill_text(skill / "SKILL.md"))["content"]
     assert "SSSS" not in content and SECRET[:5] not in content and "truncated" in content
+
+
+@pytest.mark.parametrize("cut", ["\\", "\\u", "\\u0", "\\u00", "\\u003"])
+def test_a_url_cut_inside_an_escape_at_the_bound_is_dropped(cut):
+    limit = policy.OUTPUT_LIMIT
+    filler = "https://x.test/?token=" + "Z" * 10000 + "\n"  # shrinks by ~10 000 characters when redacted
+    url = f"https://user:{SECRET}\\u003dTAIL@host.test/"
+    start = limit + policy.REDACT_MARGIN - url.index("\\") - len(cut)
+    text = filler + " " * (start - len(filler)) + url + " " * 100
+    head, more = policy.redact_head(text, limit)
+    assert more and SECRET[:5] not in head
 
 
 def test_skills_list_output_is_redacted(monkeypatch):

@@ -974,26 +974,36 @@ SECRET_PARAMS = ("token", "access_token", "refresh_token", "id_token", "auth_tok
                  "x-goog-signature", "x-goog-credential")
 # A URL as it appears in plain text, in JSON (`\/` and `\u0026` escapes), in HTML (`&amp;`) or percent-encoded
 # inside another URL's parameter (a redirect or tracking link: `%3Ftoken%3D...%26`).
-_URL_CHAR = r"(?:[^\s\"'<>`\\]|\\/|\\u0026|\\u003[dD])"
+_ESC = r"\\u[0-9a-fA-F]{4}"  # a JSON \uXXXX escape: one character of the URL
+_URL_CHAR = rf"(?:[^\s\"'<>`\\]|\\/|{_ESC})"
 # The scheme is bounded (an unbounded one makes the scan quadratic on text like `a.a.a...` without `://`) and
 # needs no word boundary (a link glued to the word before it, `Linkhttps://...`, is still found).
 _URL = re.compile(rf"(?i)[a-z][a-z0-9+.-]{{0,31}}:(?:\\?/){{2}}{_URL_CHAR}+")
 _NAMES = "|".join(re.escape(name) for name in SECRET_PARAMS)
-# A plain parameter's value runs to the next `&`/`#` (a JSON `\/` inside it included); one inside a percent-encoded
-# URL runs to the next encoded separator. Both err on the long side.
-_URL_PARAM = re.compile(rf"(?i)((?:\\u0026|&amp;|[?&;#])(?:{_NAMES})(?:=|\\u003d))((?:\\/|[^&#\s\"'<>`\\])+)")
-_URL_PARAM_ENCODED = re.compile(rf"(?i)((?:%3F|%26|%23)(?:{_NAMES})%3D)((?:(?!%26|%23)[^&#\s\"'<>`\\])+)")
-# A password in the URL's user info (`https://user:secret@host`, a git remote with a token), and an http(s) user
-# name long enough to be a token itself (`https://<token>@github.com/...`; `git@`, `me@` stay).
-_URL_USERINFO = re.compile(r"(?i)^([a-z][a-z0-9+.-]{0,31}:(?:\\?/){2}[^/@:\s\\]*:)([^/@\s\\]+)(@)")
-_URL_TOKEN_USER = re.compile(r"(?i)^(https?:(?:\\?/){2})([A-Za-z0-9_.~%+-]{20,})(@)")
+# A plain parameter's value runs to the next `&`/`#` (escaped ones too); a JSON `\/` or any other escape inside it
+# is part of it. One inside a percent-encoded URL runs to the next encoded separator. Both err on the long side.
+_VALUE = r"(?:\\/|\\u(?!0026|0023)[0-9a-fA-F]{4}|[^&#\s\"'<>`\\])+"
+_URL_PARAM = re.compile(rf"(?i)((?:\\u0026|\\u0023|&amp;|[?&;#])(?:{_NAMES})(?:=|\\u003d))({_VALUE})")
+_URL_PARAM_ENCODED = re.compile(
+    rf"(?i)((?:%3F|%26|%23)(?:{_NAMES})%3D)((?:(?!%26|%23|\\u0026|\\u0023)(?:\\/|{_ESC}|[^&#\s\"'<>`\\]))+)")
+# User info: a password (`https://user:secret@host`, a git remote with a token) and a user name long enough to be a
+# token itself (`https://<token>@github.com/...`, `https://<token>:x-oauth-basic@...`); `git@`, `me@` stay.
+_URL_USERINFO = re.compile(rf"(?i)^([a-z][a-z0-9+.-]{{0,31}}:(?:\\?/){{2}})((?:{_ESC}|[^/@:?#\s\\])*)"
+                           rf"(?::((?:{_ESC}|[^/@?#\s\\])+))?@")
+TOKEN_USER_LENGTH = 20
+
+
+def _redact_userinfo(match):
+    user, password = match.group(2), match.group(3)
+    if len(user) >= TOKEN_USER_LENGTH:
+        user = REDACTED
+    return match.group(1) + user + (":" + REDACTED if password else "") + "@"
 
 
 def _redact_url(match):
     url = _URL_PARAM.sub(lambda m: m.group(1) + REDACTED, match.group(0))
     url = _URL_PARAM_ENCODED.sub(lambda m: m.group(1) + REDACTED, url)
-    url = _URL_TOKEN_USER.sub(lambda m: m.group(1) + REDACTED + m.group(3), url)
-    return _URL_USERINFO.sub(lambda m: m.group(1) + REDACTED + m.group(3), url)
+    return _URL_USERINFO.sub(_redact_userinfo, url, count=1)
 
 
 def redact_urls(text):
@@ -1013,7 +1023,8 @@ def redact_head(text, limit):
         last = None
         for last in _URL.finditer(head):
             pass
-        if last is not None and last.end() == len(head):
+        # Also one ending just short of the bound: an escape (`\u003d`) cut in half ends the match early.
+        if last is not None and len(head) - last.end() <= 6:
             head = head[:last.start()]
     return redact_urls(head), more
 
